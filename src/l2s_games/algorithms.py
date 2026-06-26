@@ -8,17 +8,6 @@ field. To add your own, copy a class, implement ``.step``, and register it in
 import torch
 
 
-def jacobian(v, z, eps=1e-6):
-    """Numerical Jacobian of v at a single point z (shape (2,))."""
-    z = torch.as_tensor(z, dtype=torch.float32)
-    J = torch.zeros((2, 2))
-    for i in range(2):
-        dz = torch.zeros(2)
-        dz[i] = eps
-        J[:, i] = (v(z + dz) - v(z - dz)) / (2 * eps)
-    return J
-
-
 class SimGD:
     """Simultaneous gradient descent (explicit Euler on v)."""
 
@@ -92,7 +81,7 @@ class Consensus:
 
     def step(self, z, v):
         g = v(z)
-        J = jacobian(v, z)
+        J = torch.func.jacrev(v)(z)
         return z + self.h * (g - self.gamma * (J.T @ g))
 
 

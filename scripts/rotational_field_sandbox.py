@@ -20,8 +20,10 @@ The field lives in ``l2s_games.envs.toy`` and the algorithms in
 import matplotlib.pyplot as plt
 import torch
 
-from l2s_games.algorithms import ALGORITHMS, jacobian
+from l2s_games.algorithms import ALGORITHMS
+from l2s_games.dynamics import simulate
 from l2s_games.envs.toy import rotational_field
+from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
 # --------------------------------------------------------------------------
 # CONFIG -- edit me
@@ -47,48 +49,17 @@ COMPARE = ["simgd", "altgd", "extragradient", "optimistic", "momentum", "consens
 
 
 # --------------------------------------------------------------------------
-# Simulation
-# --------------------------------------------------------------------------
-def simulate(field, algo, z0, n_steps):
-    z = torch.as_tensor(z0, dtype=torch.float32)
-    traj = [z.clone()]
-    for _ in range(n_steps):
-        z = torch.as_tensor(algo.step(z, field), dtype=torch.float32)
-        if not torch.isfinite(z).all():  # blew up
-            break
-        z = torch.clamp(z, -1e6, 1e6)
-        traj.append(z.clone())
-    return torch.stack(traj)
-
-
-# --------------------------------------------------------------------------
 # Plotting
 # --------------------------------------------------------------------------
 def plot_phase(ax, field, traj, title, lim=2.0, grid=21):
-    xs = torch.linspace(-lim, lim, grid)
-    X, Y = torch.meshgrid(xs, xs, indexing="xy")
-    V = field(torch.stack([X, Y], dim=-1))
-    U, W = V[..., 0], V[..., 1]
-    mag = torch.hypot(U, W) + 1e-9
-    ax.quiver(
-        X, Y, U / mag, W / mag, mag, cmap="viridis", alpha=0.6, scale=30, width=0.004, pivot="mid"
-    )
-    traj = traj.numpy()
-    ax.plot(traj[:, 0], traj[:, 1], "-", color="crimson", lw=1.2, alpha=0.9)
-    ax.plot(traj[0, 0], traj[0, 1], "o", color="crimson", ms=6)
-    ax.plot(0, 0, "k*", ms=11)
-    ax.set_xlim(-lim, lim)
-    ax.set_ylim(-lim, lim)
-    ax.set_aspect("equal")
-    ax.set_title(title, fontsize=11)
-    ax.set_xlabel(r"$\theta$")
-    ax.set_ylabel(r"$\psi$")
+    plot_field_quiver(ax, field, lim=lim, grid=grid, title=title)
+    overlay_trajectory(ax, traj)
 
 
 def main():
     field = rotational_field(OMEGA, DAMP_FLOOR, DAMP_WALL, WELL_ANGLE, CURL_NONLIN)
 
-    eig = torch.linalg.eigvals(jacobian(field, torch.zeros(2)))
+    eig = torch.linalg.eigvals(torch.func.jacrev(field)(torch.zeros(2)))
     eig = torch.round(eig.real, decimals=4) + 1j * torch.round(eig.imag, decimals=4)
     print("Field Jacobian eigenvalues at origin:", eig)
 

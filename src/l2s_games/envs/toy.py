@@ -34,3 +34,19 @@ def rotational_field(omega=1.0, damp_floor=0.0, damp_wall=0.0, well_angle=-45.0,
         return torch.stack([v_rot_th + v_well_th, v_rot_ps + v_well_ps], dim=-1)
 
     return v
+
+
+def make_field(params, ranges, well_angle=45.0, curl_nonlin=0.0):
+    """Build a ``rotational_field`` from a normalized instance vector.
+
+    ``params`` is a length-3 tensor in ``[0, 1]`` giving (omega, damp_floor,
+    damp_wall) in normalized coordinates. ``ranges`` is a matching sequence of
+    ``(low, high)`` pairs that linearly maps each normalized entry to its field
+    argument. The caller (the training script) owns the range values; this
+    function is the single place that turns an instance vector into a field.
+    """
+    params = torch.as_tensor(params, dtype=torch.float32)
+    omega, damp_floor, damp_wall = (
+        low + params[i] * (high - low) for i, (low, high) in enumerate(ranges)
+    )
+    return rotational_field(omega, damp_floor, damp_wall, well_angle, curl_nonlin)
