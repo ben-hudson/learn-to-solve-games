@@ -213,9 +213,8 @@ data/
 *.png
 lightning_logs/
 
-# just a symlink to README.md
 CLAUDE.md
-.claude/settings.local.json
+.claude/
 
 wandb/
 milascripts/

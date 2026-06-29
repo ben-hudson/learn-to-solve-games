@@ -1,18 +1,17 @@
 """
 train_field_mlp.py
 
-Train a simple MLP to predict the rotational vector field from
-``rotational_field_sandbox.py`` -- but amortized over a *family* of fields. The
-MLP maps ``(coordinates, instance params) -> field value at that coordinate``, so
-one network represents every parametrization in the family.
+Train a simple MLP to predict a game's operator field -- amortized over a *family*
+of games chosen with ``--game``. The MLP maps ``(coordinates, instance params) ->
+operator value at that coordinate``, so one network represents every parametrization
+in the family.
 
-An *instance* is a normalized vector ``p in [0, 1]^k`` selecting (omega,
-damp_floor, damp_wall); ``--ranges`` maps it to field arguments. ``curl_nonlin``
-and ``well_angle`` are fixed inside ``make_field``. We then compare the learned
-model to the analytic field, both as a field (quiver + error) and as a dynamical
-system (the same algorithms rolled out on each).
+An *instance* is a normalized vector ``u in [0, 1]^k`` selecting one game; the game's
+parameter ranges map it to real values (see ``data.denormalize``). For a 2D-domain
+game we compare the learned model to the analytic operator, both as a field (quiver +
+error) and as a dynamical system (the same algorithms rolled out on each).
 
-    python scripts/train_field_mlp.py --epochs 60 --hidden 128 128
+    python scripts/train_field_mlp.py --game rps --epochs 60 --hidden 128 128
 """
 
 import argparse
@@ -23,10 +22,12 @@ import torch
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.data import build_dataset
+from l2s_games.data import build_dataset, denormalize
 from l2s_games.dynamics import simulate
-from l2s_games.envs.toy import make_field
-from l2s_games.models import FieldLitModule, FieldMLP, conditioned_field
+from l2s_games.envs import GAMES, make_game
+from torchvision.ops import MLP
+
+from l2s_games.models import FieldLitModule, conditioned_field
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
 
@@ -38,21 +39,14 @@ def build_parser():
         description=__doc__,
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    # dataset
+    # game + dataset
+    p.add_argument("--game", choices=list(GAMES), default="toy", help="game family to learn")
+    p.add_argument("--n-actions", type=int, default=3, help="actions per population (symmetric game)")
     p.add_argument("--n-instances", type=int, default=256, help="training instances")
     p.add_argument("--n-val-instances", type=int, default=64, help="validation instances")
     p.add_argument("--n-test-instances", type=int, default=64, help="held-out test instances")
     p.add_argument("--points-per-instance", type=int, default=256, help="samples per instance")
-    p.add_argument("--lim", type=float, default=2.0, help="points sampled in [-lim, lim]^2")
     p.add_argument("--seed", type=int, default=None, help="global seed (None -> random)")
-    p.add_argument(
-        "--ranges",
-        type=float,
-        nargs=6,
-        default=[0.0, 1.0, 0.0, 1.0, 0.0, 1.0],
-        metavar=("OMEGA_LO", "OMEGA_HI", "FLOOR_LO", "FLOOR_HI", "WALL_LO", "WALL_HI"),
-        help="(low high) range per varying param: omega, damp_floor, damp_wall",
-    )
     # model + training
     p.add_argument("--hidden", type=int, nargs="+", default=[128, 128], help="hidden layer widths")
     p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
@@ -61,7 +55,7 @@ def build_parser():
     # dynamics comparison (same knobs as the sandbox)
     p.add_argument("--h", type=float, default=0.1, help="algorithm step size")
     p.add_argument("--n-steps", type=int, default=400, help="iterations per trajectory")
-    p.add_argument("--z0", type=float, nargs=2, default=[1.0, 1.0], help="starting iterate")
+    p.add_argument("--z0", type=float, nargs="+", default=None, help="starting iterate (default: 0.5*lim)")
     p.add_argument(
         "--algorithms",
         nargs="+",
@@ -82,20 +76,20 @@ def relative_error(model, test_ds):
     return (torch.linalg.norm(preds - targets) / torch.linalg.norm(targets)).item()
 
 
-def sample_test_instance(test_ds):
-    """Pick a random held-out instance (the param slice of a random example)."""
+def sample_test_instance(test_ds, game):
+    """Pick a random held-out instance (the normalized param slice of a random example)."""
     inputs = test_ds.tensors[0]
     idx = torch.randint(len(inputs), (1,)).item()
-    return inputs[idx, 2:]  # columns 2: are the instance params
+    return inputs[idx, game.domain_dim:]  # columns after the point are the instance params
 
 
 # --------------------------------------------------------------------------
 # Plots
 # --------------------------------------------------------------------------
-def plot_field_comparison(true_field, learned_field, instance, lim, grid=21):
+def plot_field_comparison(true_field, learned_field, names, instance, lim, grid=21):
     fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4))
-    omega, floor, wall = instance.tolist()
-    fig.suptitle(f"held-out instance: omega={omega:.2f}, floor={floor:.2f}, wall={wall:.2f}", fontsize=12)
+    summary = ", ".join(f"{name}={value:.2f}" for name, value in zip(names, instance.tolist()))
+    fig.suptitle(f"held-out instance: {summary}", fontsize=12)
     plot_field_quiver(axes[0], true_field, lim=lim, grid=grid, title="true field")
     plot_field_quiver(axes[1], learned_field, lim=lim, grid=grid, title="learned field")
 
@@ -138,19 +132,22 @@ def plot_dynamics_comparison(true_field, learned_field, algorithms, h, z0, n_ste
 # --------------------------------------------------------------------------
 def main(args):
     L.seed_everything(args.seed)
-    ranges = list(zip(args.ranges[::2], args.ranges[1::2]))
+    game = make_game(args.game, n_actions=args.n_actions) if args.game == "symmetric" else make_game(args.game)
     train_ds, val_ds, test_ds = build_dataset(
+        game,
         args.n_instances,
         args.n_val_instances,
         args.n_test_instances,
         args.points_per_instance,
-        args.lim,
-        ranges,
     )
     print(f"train examples: {len(train_ds)}   " f"val examples: {len(val_ds)}   test examples: {len(test_ds)}")
 
     # train the model; train/val loss is shown on the progress bar
-    model = FieldMLP(in_dim=2 + len(ranges), out_dim=2, hidden=tuple(args.hidden))
+    model = MLP(
+        in_channels=game.domain_dim + game.n_params,
+        hidden_channels=[*args.hidden, game.domain_dim],
+        activation_layer=torch.nn.Tanh,
+    )
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="cpu",
@@ -167,16 +164,24 @@ def main(args):
 
     print(f"test relative error = {relative_error(model, test_ds):.4%}")
 
-    p_eval = sample_test_instance(test_ds)
-    omega, floor, wall = p_eval.tolist()
-    print(f"eval instance (normalized omega, floor, wall) = ({omega:.3f}, {floor:.3f}, {wall:.3f})")
+    p_eval = sample_test_instance(test_ds, game)
+    summary = ", ".join(f"{name}={value:.3f}" for name, value in zip(game.param_names, p_eval.tolist()))
+    print(f"eval instance (normalized) = ({summary})")
 
-    true_field = make_field(p_eval, ranges)
+    real = denormalize(game.ranges, p_eval)
+
+    def true_field(z):
+        return game.operator(real, z)
+
     learned_field = conditioned_field(model, p_eval)
+    z0 = args.z0 if args.z0 is not None else [0.5 * game.lim] * game.domain_dim
 
-    plot_field_comparison(true_field, learned_field, p_eval, args.lim)
-    plot_dynamics_comparison(true_field, learned_field, args.algorithms, args.h, args.z0, args.n_steps, args.lim)
-    plt.show()
+    if game.domain_dim == 2:
+        plot_field_comparison(true_field, learned_field, game.param_names, p_eval, game.lim)
+        plot_dynamics_comparison(true_field, learned_field, args.algorithms, args.h, z0, args.n_steps, game.lim)
+        plt.show()
+    else:
+        print(f"domain_dim={game.domain_dim}; skipping 2D comparison plots")
 
 
 if __name__ == "__main__":

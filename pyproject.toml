@@ -13,6 +13,7 @@ dependencies = [
     "numpy",
     "matplotlib",
     "lightning",
+    "torchvision"
 ]
 
 [tool.setuptools.packages.find]

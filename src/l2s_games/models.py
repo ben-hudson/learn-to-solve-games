@@ -5,28 +5,6 @@ import torch
 from torch import nn
 
 
-class FieldMLP(nn.Module):
-    """A simple MLP regressing the field value at a point for an instance.
-
-    Input is ``[x, y, p0, ...]`` (``in_dim`` features), output is the field
-    vector ``[v_x, v_y]``. ``nn.Linear`` broadcasts over leading dimensions, so
-    a single example and a batch both work.
-    """
-
-    def __init__(self, in_dim=5, out_dim=2, hidden=(64, 64), activation=nn.Tanh):
-        super().__init__()
-        layers = []
-        prev = in_dim
-        for width in hidden:
-            layers += [nn.Linear(prev, width), activation()]
-            prev = width
-        layers.append(nn.Linear(prev, out_dim))
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.net(x)
-
-
 class FieldLitModule(L.LightningModule):
     """Wraps a field model in an MSE-regression Lightning training step."""
 
@@ -57,7 +35,7 @@ def conditioned_field(model, params):
 
     The returned function accepts a point ``(2,)`` or grid ``(..., 2)``,
     appends the instance ``params``, and runs ``model`` -- so a trained
-    ``FieldMLP`` becomes a drop-in field for ``simulate`` / quiver plotting.
+    field ``MLP`` becomes a drop-in field for ``simulate`` / quiver plotting.
     It is grad-transparent, so ``torch.func.jacrev`` can differentiate it;
     callers that only need values are responsible for their own ``no_grad`` /
     ``detach``.
