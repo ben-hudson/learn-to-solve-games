@@ -6,10 +6,11 @@ of games chosen with ``--game``. The MLP maps ``(coordinates, instance params) -
 operator value at that coordinate``, so one network represents every parametrization
 in the family.
 
-An *instance* is a normalized vector ``u in [0, 1]^k`` selecting one game; the game's
-parameter ranges map it to real values (see ``data.denormalize``). For a 2D-domain
-game we compare the learned model to the analytic operator, both as a field (quiver +
-error) and as a dynamical system (the same algorithms rolled out on each).
+An *instance* is one real-unit ``params`` value drawn from the family. Inputs and targets
+are standardized by a normalizer fit on the train split (see ``data.Normalizer``); the
+learned field is mapped back to real units for comparison. For a 2D-domain game we compare
+the learned model to the analytic operator, both as a field (quiver + error) and as a
+dynamical system (the same algorithms rolled out on each).
 
     python scripts/train_field_mlp.py --game rps --epochs 60 --hidden 128 128
 """
@@ -22,7 +23,7 @@ import torch
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.data import build_dataset, denormalize
+from l2s_games.data import build_dataset
 from l2s_games.dynamics import simulate
 from l2s_games.envs import GAMES, make_game
 from torchvision.ops import MLP
@@ -69,26 +70,21 @@ def build_parser():
 # --------------------------------------------------------------------------
 # Metrics
 # --------------------------------------------------------------------------
-def relative_error(model, test_ds):
+def relative_error(model, test_ds, normalizer):
+    """Relative error in real units (predictions and targets de-standardized)."""
     inputs, targets = test_ds.tensors
     with torch.no_grad():
-        preds = model(inputs)
+        preds = normalizer.target.inverse_transform(model(inputs))
+    targets = normalizer.target.inverse_transform(targets)
     return (torch.linalg.norm(preds - targets) / torch.linalg.norm(targets)).item()
-
-
-def sample_test_instance(test_ds, game):
-    """Pick a random held-out instance (the normalized param slice of a random example)."""
-    inputs = test_ds.tensors[0]
-    idx = torch.randint(len(inputs), (1,)).item()
-    return inputs[idx, game.domain_dim:]  # columns after the point are the instance params
 
 
 # --------------------------------------------------------------------------
 # Plots
 # --------------------------------------------------------------------------
-def plot_field_comparison(true_field, learned_field, names, instance, lim, grid=21):
+def plot_field_comparison(true_field, learned_field, instance, lim, grid=21):
     fig, axes = plt.subplots(1, 3, figsize=(13.5, 4.4))
-    summary = ", ".join(f"{name}={value:.2f}" for name, value in zip(names, instance.tolist()))
+    summary = ", ".join(f"p{i}={value:.2f}" for i, value in enumerate(instance.tolist()))
     fig.suptitle(f"held-out instance: {summary}", fontsize=12)
     plot_field_quiver(axes[0], true_field, lim=lim, grid=grid, title="true field")
     plot_field_quiver(axes[1], learned_field, lim=lim, grid=grid, title="learned field")
@@ -133,7 +129,10 @@ def plot_dynamics_comparison(true_field, learned_field, algorithms, h, z0, n_ste
 def main(args):
     L.seed_everything(args.seed)
     game = make_game(args.game, n_actions=args.n_actions) if args.game == "symmetric" else make_game(args.game)
-    train_ds, val_ds, test_ds = build_dataset(
+    if not hasattr(game, "domain_dim"):
+        print(f"'{args.game}' is not a flat game; the MLP trainer needs the GNN path (follow-up).")
+        return
+    (train_ds, val_ds, test_ds), normalizer = build_dataset(
         game,
         args.n_instances,
         args.n_val_instances,
@@ -162,22 +161,20 @@ def main(args):
         DataLoader(val_ds, batch_size=args.batch),
     )
 
-    print(f"test relative error = {relative_error(model, test_ds):.4%}")
+    print(f"test relative error = {relative_error(model, test_ds, normalizer):.4%}")
 
-    p_eval = sample_test_instance(test_ds, game)
-    summary = ", ".join(f"{name}={value:.3f}" for name, value in zip(game.param_names, p_eval.tolist()))
-    print(f"eval instance (normalized) = ({summary})")
-
-    real = denormalize(game.ranges, p_eval)
+    params = game.sample_params()
+    summary = ", ".join(f"p{i}={value:.3f}" for i, value in enumerate(params.tolist()))
+    print(f"eval instance (real units) = ({summary})")
 
     def true_field(z):
-        return game.operator(real, z)
+        return game.operator(params, z)
 
-    learned_field = conditioned_field(model, p_eval)
+    learned_field = conditioned_field(model, game, params, normalizer)
     z0 = args.z0 if args.z0 is not None else [0.5 * game.lim] * game.domain_dim
 
     if game.domain_dim == 2:
-        plot_field_comparison(true_field, learned_field, game.param_names, p_eval, game.lim)
+        plot_field_comparison(true_field, learned_field, params, game.lim)
         plot_dynamics_comparison(true_field, learned_field, args.algorithms, args.h, z0, args.n_steps, game.lim)
         plt.show()
     else:

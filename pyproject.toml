@@ -9,11 +9,12 @@ description = "Learn to solve games."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "torch>=2.0",
-    "numpy",
-    "matplotlib",
     "lightning",
-    "torchvision"
+    "matplotlib",
+    "numpy",
+    "torch_geometric",
+    "torch>=2.0",
+    "torchvision",
 ]
 
 [tool.setuptools.packages.find]

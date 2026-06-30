@@ -30,22 +30,20 @@ class FieldLitModule(L.LightningModule):
         return torch.optim.Adam(self.model.parameters(), lr=self.lr)
 
 
-def conditioned_field(model, params):
-    """Return a plain field callable ``v(z)`` for a fixed instance.
+def conditioned_field(model, family, params, normalizer):
+    """Return a plain field callable ``v(z)`` for a fixed instance, in real units.
 
-    The returned function accepts a point ``(2,)`` or grid ``(..., 2)``,
-    appends the instance ``params``, and runs ``model`` -- so a trained
-    field ``MLP`` becomes a drop-in field for ``simulate`` / quiver plotting.
-    It is grad-transparent, so ``torch.func.jacrev`` can differentiate it;
-    callers that only need values are responsible for their own ``no_grad`` /
-    ``detach``.
+    The family builds the model input from ``(params, z)`` (the conditioning seam, so
+    this works for both the flat and graph representations); ``v`` normalizes that input,
+    runs ``model``, and maps the prediction back to real units -- making a trained field
+    model a drop-in field for ``simulate`` / quiver plotting. It is grad-transparent, so
+    ``torch.func.jacrev`` can differentiate it; value-only callers handle their own
+    ``no_grad`` / ``detach``.
     """
-    params = torch.as_tensor(params, dtype=torch.float32)
 
     def v(z):
         z = torch.as_tensor(z, dtype=torch.float32)
-        broadcast_params = params.expand(*z.shape[:-1], params.shape[-1])
-        features = torch.cat([z, broadcast_params], dim=-1)
-        return model(features)
+        normalized_input = normalizer.input.transform(family.model_input(params, z))
+        return normalizer.target.inverse_transform(model(normalized_input))
 
     return v

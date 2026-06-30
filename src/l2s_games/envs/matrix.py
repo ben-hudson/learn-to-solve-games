@@ -16,7 +16,11 @@ from abc import abstractmethod
 
 import torch
 
-from l2s_games.envs.base import Game
+from l2s_games.envs.base import (
+    VariationalInequalityFamily,
+    concat_conditioning,
+    sample_uniform,
+)
 
 
 def helmert_basis(n):
@@ -35,7 +39,7 @@ def helmert_basis(n):
     return basis
 
 
-class MatrixGame(Game):
+class MatrixGame(VariationalInequalityFamily):
     """Abstract normal-form game charted on a product of simplex tangent spaces."""
 
     def __init__(self, n_actions, lim, weight_range):
@@ -50,8 +54,23 @@ class MatrixGame(Game):
     def domain_dim(self):
         return self._domain_dim
 
-    def sample_points(self, n):
+    @property
+    def n_params(self):
+        return len(self.ranges)
+
+    def sample_params(self):
+        return sample_uniform(self.ranges)
+
+    def sample_domain(self, params, n):
         return (2 * torch.rand(n, self.domain_dim) - 1) * self.lim
+
+    def model_input(self, params, points):
+        return concat_conditioning(points, params)
+
+    @property
+    @abstractmethod
+    def ranges(self):
+        """``(low, high)`` sampling range for each real parameter."""
 
     @abstractmethod
     def payoff_matrices(self, params):

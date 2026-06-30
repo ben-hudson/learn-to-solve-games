@@ -11,7 +11,7 @@ simultaneous gradient descent is vanilla GAN training. Near a Nash equilibrium
 the field is dominated by a rotational (antisymmetric) component -- that is what
 makes naive GD spiral outward instead of converging.
 
-The field lives in ``l2s_games.envs.toy`` and the algorithms in
+The field lives in ``l2s_games.games.toy`` and the algorithms in
 ``l2s_games.algorithms``. Edit the CONFIG block and run:
 
     python scripts/rotational_field_sandbox.py
@@ -77,7 +77,7 @@ def main():
     axes = axes.ravel()
     for ax, name in zip(axes, names):
         plot_phase(ax, field, trajs[name], name)
-    for ax in axes[len(names):]:
+    for ax in axes[len(names) :]:
         ax.axis("off")
     fig.suptitle(
         rf"Field: $\omega$={OMEGA}, floor={DAMP_FLOOR}, wall={DAMP_WALL}, "

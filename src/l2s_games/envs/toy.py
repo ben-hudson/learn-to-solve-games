@@ -1,6 +1,10 @@
 import torch
 
-from l2s_games.envs.base import Game, ParamSpec
+from l2s_games.envs.base import (
+    VariationalInequalityFamily,
+    concat_conditioning,
+    sample_uniform,
+)
 
 
 def rotational_field(omega=1.0, damp_floor=0.0, damp_wall=0.0, well_angle=-45.0, curl_nonlin=0.0):
@@ -38,28 +42,33 @@ def rotational_field(omega=1.0, damp_floor=0.0, damp_wall=0.0, well_angle=-45.0,
     return v
 
 
-class RotationalFieldGame(Game):
-    """The ``rotational_field`` family as a game: (omega, damp_floor, damp_wall)."""
+class RotationalFieldGame(VariationalInequalityFamily):
+    """The ``rotational_field`` family as a VI: ``(omega, damp_floor, damp_wall)``."""
 
     def __init__(self, lim=2.0, well_angle=45.0, curl_nonlin=0.0, ranges=((0.0, 1.0),) * 3):
         self.lim = lim
         self.well_angle = well_angle
         self.curl_nonlin = curl_nonlin
-        self._ranges = ranges
+        self.ranges = list(ranges)
 
     @property
     def domain_dim(self):
         return 2
 
     @property
-    def param_specs(self):
-        names = ("omega", "damp_floor", "damp_wall")
-        return tuple(ParamSpec(name, low, high) for name, (low, high) in zip(names, self._ranges))
+    def n_params(self):
+        return len(self.ranges)
+
+    def sample_params(self):
+        return sample_uniform(self.ranges)
 
     def operator(self, params, points):
         omega, damp_floor, damp_wall = params
         field = rotational_field(omega, damp_floor, damp_wall, self.well_angle, self.curl_nonlin)
         return field(points)
 
-    def sample_points(self, n):
+    def sample_domain(self, params, n):
         return (2 * torch.rand(n, self.domain_dim) - 1) * self.lim
+
+    def model_input(self, params, points):
+        return concat_conditioning(points, params)

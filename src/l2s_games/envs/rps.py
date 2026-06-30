@@ -10,7 +10,6 @@ chart origin -- the rock-paper-scissors structure, for any number of actions.
 
 import torch
 
-from l2s_games.envs.base import ParamSpec
 from l2s_games.envs.matrix import MatrixGame
 
 
@@ -27,9 +26,8 @@ class SymmetricZeroSumGame(MatrixGame):
         self.entries = _upper_triangle_indices(n_actions)
 
     @property
-    def param_specs(self):
-        low, high = self.weight_range
-        return tuple(ParamSpec(f"w_{i}{j}", low, high) for i, j in self.entries)
+    def ranges(self):
+        return [self.weight_range] * len(self.entries)
 
     def payoff_matrices(self, params):
         params = torch.as_tensor(params, dtype=torch.float32)
