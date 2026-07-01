@@ -16,11 +16,8 @@ from abc import abstractmethod
 
 import torch
 
-from l2s_games.envs.base import (
-    VariationalInequalityFamily,
-    concat_conditioning,
-    sample_uniform,
-)
+from l2s_games.envs.base import VariationalInequalityFamily, sample_uniform
+from l2s_games.transforms import ConcatConditioning
 
 
 def helmert_basis(n):
@@ -64,8 +61,12 @@ class MatrixGame(VariationalInequalityFamily):
     def sample_domain(self, params, n):
         return (2 * torch.rand(n, self.domain_dim) - 1) * self.lim
 
-    def model_input(self, params, points):
-        return concat_conditioning(points, params)
+    def model_input(self, params, point):
+        return {"point": point, "params": params}
+
+    @property
+    def transform(self):
+        return ConcatConditioning()
 
     @property
     @abstractmethod

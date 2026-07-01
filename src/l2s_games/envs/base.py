@@ -7,11 +7,22 @@ projection onto the feasible set, and a domain sampler. Operators are plain-torc
 functions of ``(params, points)`` so ``torch.func.jacrev`` differentiates them
 (``Consensus`` and any Jacobian method depend on this).
 
-The family also owns the *conditioning* seam: ``model_input(params, points)``
-builds whatever the field model consumes -- a flat ``[point | params]`` tensor for
-the MLP path, a batched graph for the GNN path -- and ``collate_fn`` batches
-examples accordingly. Keeping this on the family lets the dataset, training loop,
-and dynamics stay blind to the representation.
+The family owns the *conditioning* through three representation seams, so the dataset, training
+loop, and dynamics stay blind to whether an instance is a flat vector or a graph:
+
+- ``model_input(params, point)`` -- the **raw input item** carrying one domain point, *before*
+  featurization: ``{"point", "params"}`` for a flat game, a PyG ``Data`` with ``.cost`` set for
+  traffic.
+- ``transform`` -- a per-item callable that builds ``feats`` (and any structure the model needs)
+  from the raw item, applied **lazily on every ``__getitem__``**. Default: identity. Featurization
+  lives in ``transforms.py`` precisely so it can run lazily and nothing is cached -- see the note
+  there. Flat games override it with ``ConcatConditioning``; traffic with a graph ``Compose``.
+- ``collate_fn(items)`` -- batches a list of transformed input items into the model's input.
+  Default: ``torch.utils.data.default_collate`` (stacks the flat ``{feats}`` dicts); traffic
+  overrides it with a dense stack of its single-topology graphs.
+
+Operators are plain-torch functions of ``(params, points)`` so ``torch.func.jacrev`` differentiates
+them (``Consensus`` and any Jacobian method depend on this).
 """
 
 from abc import ABC, abstractmethod
@@ -19,6 +30,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 import torch
+from torch.utils.data import default_collate
 
 
 def sample_uniform(ranges):
@@ -28,12 +40,8 @@ def sample_uniform(ranges):
     return low + (high - low) * torch.rand(len(ranges))
 
 
-def concat_conditioning(points, params):
-    """Flat model input: append the instance ``params`` to every point."""
-    points = torch.as_tensor(points, dtype=torch.float32)
-    params = torch.as_tensor(params, dtype=torch.float32)
-    conditioning = params.expand(*points.shape[:-1], params.shape[-1])
-    return torch.cat([points, conditioning], dim=-1)
+def _identity(item):
+    return item
 
 
 class VariationalInequalityFamily(ABC):
@@ -52,17 +60,19 @@ class VariationalInequalityFamily(ABC):
         """``(n, ...)`` feasible points for the instance ``params``."""
 
     @abstractmethod
-    def model_input(self, params, points):
-        """Build the field model's input -- the conditioning seam (flat tensor or graph)."""
+    def model_input(self, params, point):
+        """Build the **raw** input item carrying one domain point -- the conditioning seam."""
+
+    @property
+    def transform(self):
+        """Per-item callable that builds ``feats`` from a raw item (default: identity)."""
+        return _identity
+
+    collate_fn = staticmethod(default_collate)
 
     def project(self, params, points):
         """Project ``points`` onto the feasible set (default: unconstrained)."""
         return points
-
-    @property
-    def collate_fn(self):
-        """DataLoader collation for this representation (default: tensor stacking)."""
-        return None
 
 
 @dataclass(frozen=True)

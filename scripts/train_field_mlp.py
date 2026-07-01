@@ -23,12 +23,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.data import build_dataset
+from l2s_games.data import build_dataset, collate_examples
 from l2s_games.dynamics import simulate
 from l2s_games.envs import GAMES, make_game
-from torchvision.ops import MLP
-
-from l2s_games.models import FieldLitModule, conditioned_field
+from l2s_games.models import MLPFieldModel, conditioned_field
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
 
@@ -70,12 +68,12 @@ def build_parser():
 # --------------------------------------------------------------------------
 # Metrics
 # --------------------------------------------------------------------------
-def relative_error(model, test_ds, normalizer):
+def relative_error(model, test_ds, normalizer, collate):
     """Relative error in real units (predictions and targets de-standardized)."""
-    inputs, targets = test_ds.tensors
+    inputs, targets = collate([test_ds[i] for i in range(len(test_ds))])
     with torch.no_grad():
-        preds = normalizer.target.inverse_transform(model(inputs))
-    targets = normalizer.target.inverse_transform(targets)
+        preds = normalizer.inverse_target(model(inputs))
+    targets = normalizer.inverse_target(targets)
     return (torch.linalg.norm(preds - targets) / torch.linalg.norm(targets)).item()
 
 
@@ -142,10 +140,11 @@ def main(args):
     print(f"train examples: {len(train_ds)}   " f"val examples: {len(val_ds)}   test examples: {len(test_ds)}")
 
     # train the model; train/val loss is shown on the progress bar
-    model = MLP(
-        in_channels=game.domain_dim + game.n_params,
-        hidden_channels=[*args.hidden, game.domain_dim],
-        activation_layer=torch.nn.Tanh,
+    model = MLPFieldModel(
+        in_features=game.domain_dim + game.n_params,
+        hidden=args.hidden,
+        out_features=game.domain_dim,
+        lr=args.lr,
     )
     trainer = L.Trainer(
         max_epochs=args.epochs,
@@ -155,13 +154,14 @@ def main(args):
         enable_checkpointing=False,
         enable_model_summary=False,
     )
+    collate = collate_examples(game)
     trainer.fit(
-        FieldLitModule(model, args.lr),
-        DataLoader(train_ds, batch_size=args.batch, shuffle=True),
-        DataLoader(val_ds, batch_size=args.batch),
+        model,
+        DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate),
+        DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
     )
 
-    print(f"test relative error = {relative_error(model, test_ds, normalizer):.4%}")
+    print(f"test relative error = {relative_error(model, test_ds, normalizer, collate):.4%}")
 
     params = game.sample_params()
     summary = ", ".join(f"p{i}={value:.3f}" for i, value in enumerate(params.tolist()))
