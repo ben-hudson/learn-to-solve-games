@@ -79,8 +79,10 @@ class GraphormerFieldModel(FieldModel):
     embedding-table sizes are fixed at construction, inferred from a representative structure.
     """
 
-    def __init__(self, n_feats, in_degree, out_degree, spd, lr, dim=64, n_heads=4, n_layers=4, dim_ff=128, dropout=0.0):
-        super().__init__(lr)
+    def __init__(
+        self, n_feats, in_degree, out_degree, spd, lr, dim=64, n_heads=4, n_layers=4, dim_ff=128, dropout=0.0, **kwargs
+    ):
+        super().__init__(lr, **kwargs)
         self.edge_embedding = torch.nn.Linear(n_feats, dim)
         self.backbone = GraphormerBackbone(
             dim,

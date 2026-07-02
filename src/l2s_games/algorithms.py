@@ -81,8 +81,11 @@ class Consensus:
 
     def step(self, z, v):
         g = v(z)
-        J = torch.func.jacrev(v)(z)
-        return z + self.h * (g - self.gamma * (J.T @ g))
+        # J^T v = grad(0.5 * ||v||^2); computing it as a gradient (not the full Jacobian) is O(n)
+        # and shape-agnostic, so it also works on a batched iterate z [B, E] -- the per-instance
+        # Jacobians stay decoupled because the batched field has no cross-instance coupling.
+        consensus_term = torch.func.grad(lambda x: 0.5 * (v(x) ** 2).sum())(z)
+        return z + self.h * (g - self.gamma * consensus_term)
 
 
 ALGORITHMS = {

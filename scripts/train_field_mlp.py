@@ -23,9 +23,10 @@ import torch
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
+from l2s_games.callbacks import EquilibriumRolloutCallback
 from l2s_games.data import build_dataset, collate_examples
 from l2s_games.dynamics import simulate
-from l2s_games.envs import GAMES, make_game
+from l2s_games.envs import make_game
 from l2s_games.models import MLPFieldModel, conditioned_field
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
@@ -39,7 +40,7 @@ def build_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     # game + dataset
-    p.add_argument("--game", choices=list(GAMES), default="toy", help="game family to learn")
+    p.add_argument("--game", choices=["rps", "symmetric"], default="rps", help="matrix game family to learn")
     p.add_argument("--n-actions", type=int, default=3, help="actions per population (symmetric game)")
     p.add_argument("--n-instances", type=int, default=256, help="training instances")
     p.add_argument("--n-val-instances", type=int, default=64, help="validation instances")
@@ -58,23 +59,12 @@ def build_parser():
     p.add_argument(
         "--algorithms",
         nargs="+",
-        default=list(ALGORITHMS),
+        default=["simgd", "extragradient", "optimistic", "momentum", "consensus"],
         choices=list(ALGORITHMS),
-        help="algorithms to compare",
+        help="algorithms for the validation residual sweep and the single-instance dynamics plots "
+        "(altgd is excluded by default -- its 2-player split is invalid for a batched [B, d] iterate)",
     )
     return p
-
-
-# --------------------------------------------------------------------------
-# Metrics
-# --------------------------------------------------------------------------
-def relative_error(model, test_ds, normalizer, collate):
-    """Relative error in real units (predictions and targets de-standardized)."""
-    inputs, targets = collate([test_ds[i] for i in range(len(test_ds))])
-    with torch.no_grad():
-        preds = normalizer.inverse_target(model(inputs))
-    targets = normalizer.inverse_target(targets)
-    return (torch.linalg.norm(preds - targets) / torch.linalg.norm(targets)).item()
 
 
 # --------------------------------------------------------------------------
@@ -127,9 +117,6 @@ def plot_dynamics_comparison(true_field, learned_field, algorithms, h, z0, n_ste
 def main(args):
     L.seed_everything(args.seed)
     game = make_game(args.game, n_actions=args.n_actions) if args.game == "symmetric" else make_game(args.game)
-    if not hasattr(game, "domain_dim"):
-        print(f"'{args.game}' is not a flat game; the MLP trainer needs the GNN path (follow-up).")
-        return
     (train_ds, val_ds, test_ds), normalizer = build_dataset(
         game,
         args.n_instances,
@@ -145,7 +132,11 @@ def main(args):
         hidden=args.hidden,
         out_features=game.domain_dim,
         lr=args.lr,
+        normalizer=normalizer,
     )
+    # Each validation epoch sweeps the algorithms, rolling out the learned field batched over the
+    # held-out instances and logging the analytic residual at the endpoint per algorithm.
+    rollouts = [EquilibriumRolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="cpu",
@@ -153,6 +144,8 @@ def main(args):
         logger=False,
         enable_checkpointing=False,
         enable_model_summary=False,
+        callbacks=rollouts,
+        inference_mode=False,  # validation rolls out consensus, whose grad term needs autograd
     )
     collate = collate_examples(game)
     trainer.fit(
@@ -160,8 +153,6 @@ def main(args):
         DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate),
         DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
     )
-
-    print(f"test relative error = {relative_error(model, test_ds, normalizer, collate):.4%}")
 
     params = game.sample_params()
     summary = ", ".join(f"p{i}={value:.3f}" for i, value in enumerate(params.tolist()))

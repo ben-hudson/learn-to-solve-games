@@ -6,9 +6,10 @@ each road edge's features ``[cost, free_flow_time, capacity, b, power, +4 demand
 the line-graph structure to the per-edge operator value ``costs - bpr(demand_flow(-costs))`` -- so
 one network represents the operator across a family of noised SiouxFalls instances.
 
-After training it builds the learned field with ``conditioned_field`` and rolls out projected
-extragradient on it, checking that the learned-field dynamics converge near the analytic
-equilibrium (solved with torchdeq for reference).
+Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
+every algorithm in ``--algos`` -- the analytic residual ``||costs - bpr(demand_flow(-costs))||`` at
+the endpoint of a projected rollout of that algorithm on the learned field. The whole val batch of
+instances is solved at once (see ``FieldModel.batched_field`` / ``MarkovTrafficEquilibrium.operator``).
 
     python scripts/train_field_gnn.py --epochs 30
 """
@@ -16,17 +17,15 @@ equilibrium (solved with torchdeq for reference).
 import argparse
 
 import lightning as L
-import torch
 from torch.utils.data import DataLoader
 
-from traffic_equilibrium_sandbox import sioux_falls_base_graph, solve_equilibrium
+from traffic_equilibrium_sandbox import sioux_falls_base_graph
 
 from l2s_games.algorithms import ALGORITHMS
+from l2s_games.callbacks import EquilibriumRolloutCallback
 from l2s_games.data import build_dataset, collate_examples
-from l2s_games.dynamics import simulate
-from l2s_games.envs import bind
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
-from l2s_games.models import GraphormerFieldModel, conditioned_field
+from l2s_games.models import GraphormerFieldModel
 
 
 def build_parser():
@@ -48,20 +47,17 @@ def build_parser():
     p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
     p.add_argument("--epochs", type=int, default=30, help="training epochs")
     p.add_argument("--batch", type=int, default=32, help="minibatch size")
-    # dynamics check
-    p.add_argument("--algo", choices=list(ALGORITHMS), default="simgd", help="rollout algorithm")
+    # validation equilibrium sweep (rollout on the learned field, per algorithm)
+    p.add_argument(
+        "--algos",
+        nargs="+",
+        choices=list(ALGORITHMS),
+        default=["simgd", "extragradient", "optimistic", "momentum", "consensus"],
+        help="dynamics algorithms swept in validation (altgd is a 2-player flat-game algo, excluded)",
+    )
     p.add_argument("--h", type=float, default=0.05, help="algorithm step size (damped fixed point)")
     p.add_argument("--n-steps", type=int, default=300, help="iterations for the rollout")
     return p
-
-
-def relative_error(model, test_ds, normalizer, collate):
-    """Relative error in real units (predictions and targets de-standardized)."""
-    inputs, targets = collate([test_ds[i] for i in range(len(test_ds))])
-    with torch.no_grad():
-        preds = normalizer.inverse_target(model(inputs))
-    targets = normalizer.inverse_target(targets)
-    return (torch.linalg.norm(preds - targets) / torch.linalg.norm(targets)).item()
 
 
 def main(args):
@@ -80,6 +76,7 @@ def main(args):
         out_degree=sample["out_degree"],
         spd=sample["spd"],
         lr=args.lr,
+        normalizer=normalizer,
         dim=args.dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -87,6 +84,9 @@ def main(args):
         dropout=args.dropout,
     )
     collate = collate_examples(family)
+    # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
+    # logs the analytic residual at the endpoint (plus val_mse / val_rel_err).
+    rollouts = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="cpu",
@@ -94,31 +94,14 @@ def main(args):
         logger=False,
         enable_checkpointing=False,
         enable_model_summary=False,
+        callbacks=rollouts,
+        inference_mode=False,  # validation rolls out consensus, whose jacrev needs autograd
     )
     trainer.fit(
         model,
         DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate),
         DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
     )
-    print(f"test relative error = {relative_error(model, test_ds, normalizer, collate):.4%}")
-
-    # Learned-vs-analytic dynamics on a held-out instance.
-    model.eval()
-    graph = family.sample_params()
-    vi = bind(family, graph)
-    analytic_eq, _ = solve_equilibrium(vi, graph.free_flow_time)
-    learned_field = conditioned_field(model, family, graph, normalizer)
-    traj = simulate(
-        lambda c: -learned_field(c),
-        ALGORITHMS[args.algo](args.h),
-        graph.free_flow_time.clone(),
-        args.n_steps,
-        project=lambda c: family.project(graph, c),
-    )
-    learned_eq = traj[-1]
-    print(f"learned-field rollout ({len(traj)} steps):")
-    print(f"  analytic residual at endpoint ||r|| = {vi.operator(learned_eq).norm():.4e}")
-    print(f"  mean rel. distance to analytic equilibrium = {((learned_eq - analytic_eq).abs() / analytic_eq).mean():.2%}")
 
 
 if __name__ == "__main__":

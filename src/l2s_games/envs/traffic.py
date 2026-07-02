@@ -28,7 +28,6 @@ from l2s_games.transforms import traffic_field_transform
 
 _NOISED_ATTRS = ("free_flow_time", "capacity", "demand")
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
-_DENSE_KEYS = ("feats", "in_degree", "out_degree", "spd")
 
 
 def bpr(free_flow_time, flow, capacity, b, power):
@@ -72,10 +71,11 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return graph
 
     def _demand_flow(self, edge_index, rewards, sink_node_mask, demand):
-        """Aggregate route-choice edge flows over destinations for given link rewards ``(1, E)``.
+        """Aggregate route-choice edge flows over destinations for given link rewards ``(B, E)``.
 
-        Rewards are expanded to a real per-destination axis ``(1, N, E)`` rather than broadcast,
-        so the implicit gradient flows through ``expand`` (a sum) and stays finite.
+        Rewards are expanded to a real per-destination axis ``(B, N, E)`` rather than broadcast,
+        so the implicit gradient flows through ``expand`` (a sum) and stays finite. The leading
+        ``B`` axis lets the solver handle a whole batch of instances jointly.
         """
         n_dest = sink_node_mask.size(self.dest_dim)
         rewards = rewards.unsqueeze(-1).expand(*rewards.shape, n_dest).movedim(-1, self.dest_dim)
@@ -83,28 +83,52 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         _, edge_flows, _ = self.route_choice.get_flows(edge_index, probs, demand)
         return edge_flows.sum(dim=self.dest_dim)
 
-    def _single_operator(self, graph, costs):
-        """Residual for one cost vector ``(E,)`` -> ``(E,)``."""
-        flat = costs.reshape(1, -1)  # (1, E): the route-choice solver needs a leading batch dim
-        demand_flow = self._demand_flow(
-            graph.edge_index, -flat, graph.sink_node_mask.unsqueeze(0), graph.demand.unsqueeze(0)
-        )
-        implied_cost = bpr(graph.free_flow_time, demand_flow, graph.capacity, graph.b, graph.power)
-        return (flat - implied_cost).reshape(costs.shape)
+    @staticmethod
+    def _to_batch(value, batch_size, base_rank):
+        """Broadcast a per-instance attribute of rank ``base_rank`` to a leading batch dim if it lacks one."""
+        if value.dim() == base_rank:
+            value = value.unsqueeze(0).expand(batch_size, *([-1] * base_rank))
+        return value
 
-    def operator(self, graph, costs):
+    def operator(self, params, costs):
         """Cost-space equilibrium residual ``costs - bpr(demand_flow(-costs))`` (zero at equilibrium).
 
-        ``costs`` is one cost vector ``(E,)`` (dynamics) or a batch ``(k, E)`` (data generation);
-        the batch is looped, since each is an independent route-choice solve.
+        ``params`` exposes the physical topology under ``edge_index`` (``[2, E]``) plus the per-edge
+        BPR attrs and OD ``demand`` -- satisfied natively by a raw instance graph, and by the dense
+        model batch once ``params_from_batch`` has pointed ``edge_index`` at the stashed physical
+        topology. Per-edge attrs of a single instance (rank 1 / 2) are broadcast over the cost batch
+        so the route-choice solver solves every row jointly. ``costs`` is ``[B, E]`` (one cost vector
+        per instance) or a bare ``[E]`` vector (a batch of one, squeezed back on return).
         """
         costs = torch.as_tensor(costs, dtype=torch.float32)
-        if costs.dim() == 1:
-            return self._single_operator(graph, costs)
-        return torch.stack([self._single_operator(graph, c) for c in costs])
+        # TODO(remove): the bare-[E] path (this `single` flag and the `squeeze(0)` on return) is only
+        # hit by the sandbox's single-instance dynamics. The training pipeline (dataset gen + the
+        # validation sweep) always passes batched costs, so this can go once the sandbox is dropped.
+        single = costs.dim() == 1
+        costs = costs.unsqueeze(0) if single else costs
+        batch_size = costs.shape[0]
+        free_flow_time, capacity, b, power = (self._to_batch(params[name], batch_size, 1) for name in _EDGE_ATTRS)
+        demand = self._to_batch(params["demand"], batch_size, 2)
+        sink_node_mask = self._to_batch(params["sink_node_mask"], batch_size, 2)
+        demand_flow = self._demand_flow(params["edge_index"], -costs, sink_node_mask, demand)
+        residual = costs - bpr(free_flow_time, demand_flow, capacity, b, power)
+        return residual.squeeze(0) if single else residual
 
-    def project(self, graph, costs):
-        return torch.clamp(torch.as_tensor(costs, dtype=torch.float32), min=graph.free_flow_time)
+    def project(self, params, costs):
+        # Subscript access works for both a single graph and the dense batch dict (validation sweep).
+        return torch.clamp(torch.as_tensor(costs, dtype=torch.float32), min=params["free_flow_time"])
+
+    def params_from_batch(self, batch):
+        """The operator's params, extracted from the dense model batch.
+
+        The batch's own ``edge_index`` is the line graph (the Graphormer's topology); point
+        ``edge_index`` at the stashed physical topology so the batch satisfies the operator's
+        contract, matching a raw instance graph. Per-edge attrs are read through as-is.
+        """
+        return {**batch, "edge_index": batch["physical_edge_index"]}
+
+    def initial_point(self, batch):
+        return batch["free_flow_time"]
 
     def sample_domain(self, graph, n):
         return graph.free_flow_time * (1.0 + torch.rand(n, graph.num_edges))
@@ -124,13 +148,34 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return traffic_field_transform()
 
     @staticmethod
+    def batched_field_input(batch, costs, normalizer):
+        """Splice a batch of costs ``[B, E]`` into the dense batch's inputs for the learned field.
+
+        The domain point is the cost, which lives in ``feats`` column 0 (see ``BuildTrafficEdgeData``).
+        Standardization is per-column affine, so overwriting that column with the standardized cost is
+        exact; concatenation (not in-place assignment) keeps it jacrev-transparent. The remaining
+        (static) feature columns and the line-graph structure are reused as-is.
+        """
+        costs = torch.as_tensor(costs, dtype=torch.float32)
+        standardized_cost = (costs - normalizer.input.mean[0]) / normalizer.input.std[0]
+        feats = torch.cat([standardized_cost.unsqueeze(-1), batch["feats"][..., 1:]], dim=-1)
+        return {**batch, "feats": feats}
+
+    @staticmethod
     def collate_fn(items):
-        """Dense-batch same-topology line graphs: stack per-node tensors, share ``edge_index``.
+        """Dense-batch same-topology line graphs: stack every per-item tensor, share the topologies.
 
         The Graphormer uses dense attention over one fixed topology, so a batch is stacked tensors
-        ``{feats [B,E,k], in_degree [B,E], out_degree [B,E], spd [B,E,E]}`` plus the shared
-        ``edge_index`` -- not a PyG sparse ``Batch``.
+        ``{feats [B,E,k], in_degree [B,E], out_degree [B,E], spd [B,E,E], ...}`` plus the shared
+        (line-graph) ``edge_index`` -- not a PyG sparse ``Batch``. Every other tensor attribute is
+        stacked, so the real-unit BPR/demand params survive -- the batched analytic operator needs
+        them. Both topologies (``edge_index`` and the physical ``physical_edge_index``) are identical
+        across the batch, so they are shared un-stacked rather than copied ``B`` times.
         """
-        batch = {key: torch.stack([item[key] for item in items]) for key in _DENSE_KEYS}
-        batch["edge_index"] = items[0].edge_index
+        shared = ("edge_index", "physical_edge_index")  # one topology across the batch -- store once
+        batch = {key: items[0][key] for key in shared}
+        for key in items[0].keys():
+            value = items[0][key]
+            if key not in shared and isinstance(value, torch.Tensor):
+                batch[key] = torch.stack([item[key] for item in items])
         return batch

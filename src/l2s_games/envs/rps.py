@@ -30,12 +30,17 @@ class SymmetricZeroSumGame(MatrixGame):
         return [self.weight_range] * len(self.entries)
 
     def payoff_matrices(self, params):
+        """Antisymmetric payoff matrix from the strict-upper-triangle weights.
+
+        ``params`` is ``[n_params]`` (one instance) or ``[B, n_params]`` (a batch of instances); the
+        leading ``...`` axes carry through, giving ``[n, n]`` or ``[B, n, n]``.
+        """
         params = torch.as_tensor(params, dtype=torch.float32)
         size = self.n_actions[0]
-        matrix = torch.zeros(size, size)
-        for weight, (i, j) in zip(params, self.entries):
-            matrix[i, j] = weight
-            matrix[j, i] = -weight
+        matrix = torch.zeros(*params.shape[:-1], size, size)
+        for k, (i, j) in enumerate(self.entries):
+            matrix[..., i, j] = params[..., k]
+            matrix[..., j, i] = -params[..., k]
         return (matrix,)
 
     def operator(self, params, points):
@@ -43,13 +48,15 @@ class SymmetricZeroSumGame(MatrixGame):
 
         Recentering on the Nash makes the constant term vanish, so the operator is the
         antisymmetric linear map ``B^T A B`` for any antisymmetric ``A`` and any number
-        of actions: zero at the chart origin, rotational everywhere.
+        of actions: zero at the chart origin, rotational everywhere. Works on a single point
+        ``[d]``, a grid/data-gen batch ``[N, d]`` (one instance), or a per-instance batch ``[B, d]``
+        with batched ``params [B, n_params]`` (the validation sweep), broadcasting the generator.
         """
         points = torch.as_tensor(points, dtype=torch.float32)
         (matrix,) = self.payoff_matrices(params)
         basis = self.bases[0]
         generator = basis.T @ matrix @ basis
-        return points @ generator.T
+        return (generator @ points.unsqueeze(-1)).squeeze(-1)
 
 
 class RockPaperScissors2D(SymmetricZeroSumGame):

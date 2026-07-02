@@ -68,6 +68,30 @@ class MatrixGame(VariationalInequalityFamily):
     def transform(self):
         return ConcatConditioning()
 
+    # --- batched validation-sweep seams ------------------------------------------------------------
+    # The flat convention: feats = [point | params], the point in the leading ``domain_dim`` columns,
+    # equilibrium at the chart origin.
+
+    def params_from_batch(self, batch):
+        return batch["params"]
+
+    def batched_field_input(self, batch, point, normalizer):
+        """Splice a batch of domain points into the dense batch's model input for the learned field.
+
+        The point occupies the leading ``domain_dim`` feature columns; standardization is per-column
+        affine, so overwriting those columns with the standardized point is exact. Concatenation
+        (not in-place assignment) keeps it jacrev-transparent; the trailing (params) columns are
+        reused as-is.
+        """
+        point = torch.as_tensor(point, dtype=torch.float32)
+        standardized = (point - normalizer.input.mean[: self.domain_dim]) / normalizer.input.std[: self.domain_dim]
+        feats = torch.cat([standardized, batch["feats"][..., self.domain_dim :]], dim=-1)
+        return {**batch, "feats": feats}
+
+    def initial_point(self, batch):
+        """Rollout start for the validation sweep: a fixed non-equilibrium point ``[B, domain_dim]``."""
+        return 0.5 * self.lim * torch.ones_like(batch["feats"][..., : self.domain_dim])
+
     @property
     @abstractmethod
     def ranges(self):

@@ -32,7 +32,9 @@ class ConcatConditioning:
         point = torch.as_tensor(item["point"], dtype=torch.float32)
         params = torch.as_tensor(item["params"], dtype=torch.float32)
         conditioning = params.expand(*point.shape[:-1], params.shape[-1])
-        return {"feats": torch.cat([point, conditioning], dim=-1)}
+        # Keep the raw params alongside feats so the collated batch can supply per-instance params
+        # to the analytic operator during the validation equilibrium sweep.
+        return {"feats": torch.cat([point, conditioning], dim=-1), "params": params}
 
 
 def demand_edge_features(graph):
@@ -41,6 +43,8 @@ def demand_edge_features(graph):
     For edge ``i -> j``: total demand originating at ``i``, total demand destined for ``j``, the
     direct ``i -> j`` demand, and the reverse ``j -> i`` demand.
     """
+    # TODO: I think we are probably duplicating some features
+    # for example when we have edges i->j and j->i we duplicate the demand[i, j] and demand [j, i] feats
     i, j = graph.edge_index
     demand = graph.demand  # demand[dest, origin]
     return torch.stack(
@@ -62,6 +66,9 @@ class BuildTrafficEdgeData(BaseTransform):
         bpr_attrs = torch.stack([getattr(data, attr) for attr in _EDGE_ATTRS], dim=-1)
         static = torch.cat([bpr_attrs, demand_edge_features(data)], dim=-1)
         data.feats = torch.cat([cost.unsqueeze(-1), static], dim=-1)
+        # LineGraph (next in the pipeline) overwrites edge_index with the line-graph adjacency, so
+        # stash the physical edge_index -- the batched analytic operator needs it to solve route choice.
+        data.physical_edge_index = data.edge_index.clone()
         return data
 
 

@@ -74,6 +74,23 @@ class VariationalInequalityFamily(ABC):
         """Project ``points`` onto the feasible set (default: unconstrained)."""
         return points
 
+    # --- batched validation-sweep seams ------------------------------------------------------------
+    # ``params_from_batch`` / ``batched_field_input`` / ``initial_point`` build the per-family inputs
+    # the equilibrium rollout consumes from a dense collated batch. There is no universal default (a
+    # flat game and a graph batch splice points differently), so each family implements its own.
+
+    @abstractmethod
+    def params_from_batch(self, batch):
+        """The per-instance params a dense collated batch feeds to ``operator`` in validation."""
+
+    @abstractmethod
+    def batched_field_input(self, batch, point, normalizer):
+        """Splice a batch of domain points into the dense batch's model input for the learned field."""
+
+    @abstractmethod
+    def initial_point(self, batch):
+        """Rollout start for the validation equilibrium sweep."""
+
 
 @dataclass(frozen=True)
 class VariationalInequality:
