@@ -1,35 +1,34 @@
 """
 Each algorithm carries its own state and exposes ``.step(z, v) -> z_next``,
-where ``z`` is the current iterate (shape ``(2,)``) and ``v`` is the vector
-field. To add your own, copy a class, implement ``.step``, and register it in
+where ``z`` is the current iterate (any shape) and ``v`` is the vector field.
+To add your own, copy a class, implement ``.step``, and register it in
 ``ALGORITHMS``.
 """
 
 import torch
 
 
-class SimGD:
-    """Simultaneous gradient descent (explicit Euler on v)."""
+def _identity(z):
+    return z
 
-    def __init__(self, h):
+
+class SimpleProjection:
+    """Basic projection method for a variational inequality: a forward step along the field,
+    then a projection back onto the feasible set -- ``z <- project(z + h v(z))``.
+
+    ``project`` defaults to the identity (unconstrained), where this is exactly plain forward
+    Euler on ``v`` -- the "simultaneous gradient descent" step in the two-player framing, with
+    no simultaneity to speak of for a single-operator VI. As a VI solver it converges on
+    (co)monotone operators like the traffic equilibrium residual, but not on purely rotational
+    fields such as RPS. When rolled out through ``simulate``, the feasible-set projection can be
+    supplied there instead and ``project`` left at its default."""
+
+    def __init__(self, h, project=None):
         self.h = h
+        self.project = project if project is not None else _identity
 
     def step(self, z, v):
-        return z + self.h * v(z)
-
-
-class AltGD:
-    """Alternating gradient descent: update theta, then psi with the new theta."""
-
-    def __init__(self, h, n_disc=1):
-        self.h, self.n_disc = h, n_disc
-
-    def step(self, z, v):
-        th, ps = z
-        th = th + self.h * v(torch.stack([th, ps]))[0]  # generator update
-        for _ in range(self.n_disc):  # discriminator update(s)
-            ps = ps + self.h * v(torch.stack([th, ps]))[1]
-        return torch.stack([th, ps])
+        return self.project(z + self.h * v(z))
 
 
 class ExtraGradient:
@@ -89,8 +88,7 @@ class Consensus:
 
 
 ALGORITHMS = {
-    "simgd": lambda h: SimGD(h),
-    "altgd": lambda h: AltGD(h, n_disc=1),
+    "projection": lambda h: SimpleProjection(h),
     "extragradient": lambda h: ExtraGradient(h),
     "optimistic": lambda h: Optimistic(h),
     "momentum": lambda h: Momentum(h, beta=0.9),

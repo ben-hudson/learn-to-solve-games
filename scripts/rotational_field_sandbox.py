@@ -45,7 +45,7 @@ N_STEPS = 400  # iterations per trajectory
 Z0 = (1.0, 1.0)  # starting iterate (red dot)
 
 # which algorithms to compare (keys into ALGORITHMS)
-COMPARE = ["simgd", "altgd", "extragradient", "optimistic", "momentum", "consensus"]
+COMPARE = ["projection", "extragradient", "optimistic", "momentum", "consensus"]
 
 
 # --------------------------------------------------------------------------

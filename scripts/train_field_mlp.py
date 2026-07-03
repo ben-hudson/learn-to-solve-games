@@ -59,10 +59,9 @@ def build_parser():
     p.add_argument(
         "--algorithms",
         nargs="+",
-        default=["simgd", "extragradient", "optimistic", "momentum", "consensus"],
+        default=["projection", "extragradient", "optimistic", "momentum", "consensus"],
         choices=list(ALGORITHMS),
-        help="algorithms for the validation residual sweep and the single-instance dynamics plots "
-        "(altgd is excluded by default -- its 2-player split is invalid for a batched [B, d] iterate)",
+        help="algorithms for the validation residual sweep and the single-instance dynamics plots",
     )
     return p
 
