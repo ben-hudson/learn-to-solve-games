@@ -63,4 +63,9 @@ class FieldModel(L.LightningModule):
         self.log("val_rel_err", self._rel_err(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size)
 
     def configure_optimizers(self):
-        return torch.optim.Adam(self.parameters(), lr=self.lr)
+        # Cosine-anneal to ~0 over training: a flat lr=1e-3 bounces near convergence, so late epochs
+        # never tighten the fit (the overfit isolation only reached ~0.05 train_rel_err once the step
+        # budget was large -- annealing gets there in far fewer epochs).
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.lr)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=self.trainer.max_epochs)
+        return {"optimizer": optimizer, "lr_scheduler": scheduler}

@@ -51,7 +51,12 @@ def build_parser():
     )
     # the operator is heavy-tailed (BPR blows up at low costs); clip the standardized target to
     # +-this many sigma so a few outliers don't dominate the MSE fit -- the equilibrium F=0 is kept.
-    p.add_argument("--target-clip", type=float, default=3.0, help="cap the real-unit field's L2 norm, direction-preserving (0 disables)")
+    p.add_argument(
+        "--target-clip",
+        type=float,
+        default=300.0,
+        help="cap the real-unit field's L2 norm, direction-preserving (0 disables)",
+    )
     # model
     p.add_argument("--dim", type=int, default=64, help="Graphormer hidden dim")
     p.add_argument("--n-heads", type=int, default=4, help="attention heads")
@@ -67,7 +72,7 @@ def build_parser():
         "--algos",
         nargs="*",
         choices=list(ALGORITHMS),
-        default=["projection"],
+        default=[],
         help="dynamics algorithms swept in validation (pass none for fast field-only training)",
     )
     # h=0.05 sits above the stability threshold for the stiffer instances -- simGD then oscillates

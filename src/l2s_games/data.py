@@ -136,14 +136,17 @@ def _examples_for_instances(family, instances, points_per_instance):
 def _fit_normalizer(family, examples, target_clip):
     """Fit feats/target standardizers on the (transformed) train examples.
 
-    Standardizers are fit on the **unclipped** targets; ``target_clip`` bounds the real-unit field
-    norm and is applied at transform time (see ``NormClip`` / ``Normalizer.clip_field``).
+    The target standardizer is fit on the **clipped** targets -- the same tensor the model regresses
+    (``transform_target`` standardizes ``clip(y)``), so the fitted std matches the target's true
+    dynamic range. Fitting on the unclipped targets instead lets the heavy BPR tail inflate std, so
+    the clipped target divides down to ~0 and the model gets no signal.
     """
     transform = family.transform
     feats = torch.stack([transform(_clone(raw))["feats"] for raw, _ in examples])
     targets = torch.stack([target for _, target in examples])
     clip = NormClip(target_clip) if target_clip else None
-    return Normalizer(Standardizer.fit(feats), Standardizer.fit(targets), clip)
+    clipped_targets = clip(targets) if clip else targets
+    return Normalizer(Standardizer.fit(feats), Standardizer.fit(clipped_targets), clip)
 
 
 def build_dataset(family, n_train, n_val, n_test, points_per_instance, target_clip=None):

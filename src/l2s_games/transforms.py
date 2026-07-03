@@ -83,6 +83,18 @@ class BuildTrafficEdgeData(BaseTransform):
     Reads the domain point off ``data.cost`` and the BPR/demand attributes off the (physical) graph,
     so it must run **before** ``LineGraph`` replaces ``edge_index``. Recomputed on every call -- the
     static edge features are never cached.
+
+    NOTE (well-posedness, revisit): the 4 demand features (``demand_edge_features``) are a *lossy*
+    per-edge summary of the full OD matrix, but the route-choice flow -- and hence the operator target
+    -- depends on the full per-destination demand. Since ``sample_params`` noises every OD entry
+    independently, instances with the same 4-feature summary can have different targets, so the
+    regression may be under-determined (an irreducible error floor). A diagnostic that held demand
+    fixed did NOT lower train_rel_err (~0.60 either way), but that is inconclusive: train error is
+    currently floored by a *different* (optimization/capacity) bottleneck that would mask any
+    demand-induced floor. Revisit once the model can fit a well-posed problem to low train error --
+    then re-run fixed-vs-noised demand to see whether this encoding imposes its own ceiling. If so,
+    the fix is a richer demand conditioning (e.g. full per-node origin/destination demand vectors),
+    not more training.
     """
 
     def forward(self, data):
