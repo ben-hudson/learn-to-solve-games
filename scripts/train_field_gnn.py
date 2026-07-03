@@ -6,15 +6,21 @@ each road edge's features ``[cost, free_flow_time, capacity, b, power, +4 demand
 the line-graph structure to the per-edge operator value ``costs - bpr(demand_flow(-costs))`` -- so
 one network represents the operator across a family of noised SiouxFalls instances.
 
+Training data is **streamed**: every step draws a fresh instance (one cost point each), solving the
+operator for its target inside ``DataLoader`` workers -- so the model sees unbounded instance
+diversity rather than a fixed set (see ``data.build_streaming_dataset`` / ``StreamingFieldDataset``).
+The normalizer is fit once on a fixed bootstrap set (``--n-instances``); validation/test stay fixed.
+
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
 every algorithm in ``--algos`` -- the analytic residual ``||costs - bpr(demand_flow(-costs))||`` at
 the endpoint of a projected rollout of that algorithm on the learned field. The whole val batch of
 instances is solved at once (see ``FieldModel.batched_field`` / ``MarkovTrafficEquilibrium.operator``).
 
-    python scripts/train_field_gnn.py --epochs 30
+    python scripts/train_field_gnn.py --num-workers 4
 """
 
 import argparse
+import functools
 
 import lightning as L
 import torch
@@ -25,7 +31,7 @@ from traffic_equilibrium_sandbox import sioux_falls_base_graph
 
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.callbacks import EquilibriumRolloutCallback
-from l2s_games.data import build_dataset, collate_examples
+from l2s_games.data import build_streaming_dataset, collate_examples
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.models import GraphormerFieldModel
 
@@ -35,10 +41,13 @@ torch.set_float32_matmul_precision("medium")
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # dataset (each sample is a route-choice solve, so keep points-per-instance modest)
-    p.add_argument("--n-instances", type=int, default=64, help="training instances")
-    p.add_argument("--n-val-instances", type=int, default=16, help="validation instances")
-    p.add_argument("--n-test-instances", type=int, default=16, help="held-out test instances")
-    p.add_argument("--points-per-instance", type=int, default=32, help="cost samples per instance")
+    # Training streams fresh instances on the fly (one point each); --n-instances only sizes the fixed
+    # bootstrap set the normalizer is fit on (and the epoch length, see limit_train_batches below).
+    p.add_argument("--n-instances", type=int, default=64, help="bootstrap instances (fit normalizer; size epoch)")
+    p.add_argument("--n-val-instances", type=int, default=16, help="validation instances (fixed)")
+    p.add_argument("--n-test-instances", type=int, default=16, help="held-out test instances (fixed)")
+    p.add_argument("--points-per-instance", type=int, default=32, help="cost samples per fixed (bootstrap/val/test) instance")
+    p.add_argument("--num-workers", type=int, default=4, help="streaming dataloader workers (0 = serial; changes the stream)")
     p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
     p.add_argument("--seed", type=int, default=0, help="global seed")
     # domain coverage (see MarkovTrafficEquilibrium.sample_domain): samples fill the path from the
@@ -96,25 +105,32 @@ def build_parser():
 
 
 def main(args):
-    L.seed_everything(args.seed)
-    family = MarkovTrafficEquilibrium(
+    # workers=True makes Lightning seed each streaming dataloader worker distinctly & reproducibly.
+    L.seed_everything(args.seed, workers=True)
+    # A picklable factory (base graph + floats) the streaming dataset ships to each worker, which
+    # builds its own family + route-choice solver lazily -- nothing solver-related is pickled. The
+    # main process also needs one live family for collate_fn and the validation rollout callbacks.
+    family_factory = functools.partial(
+        MarkovTrafficEquilibrium,
         sioux_falls_base_graph(),
         noise_scale=args.noise_scale,
         equilibrium_margin=args.equilibrium_margin,
         equilibrium_spread=args.equilibrium_spread,
     )
-    (train_ds, val_ds, test_ds), normalizer = build_dataset(
-        family,
+    family = family_factory()
+    (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_dataset(
+        family_factory,
         args.n_instances,
         args.n_val_instances,
         args.n_test_instances,
         args.points_per_instance,
         target_clip=args.target_clip or None,
     )
-    print(f"train examples: {len(train_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
+    print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
-    # Size the model from one transformed example (line-graph structure + feature width).
-    sample, _ = train_ds[0]
+    # Size the model from one transformed bootstrap example (line-graph structure + feature width);
+    # the train stream is iterable, so it cannot be indexed.
+    sample, _ = bootstrap_ds[0]
     model = GraphormerFieldModel(
         n_feats=sample["feats"].shape[-1],
         in_degree=sample["in_degree"],
@@ -156,11 +172,20 @@ def main(args):
         callbacks=rollouts + [early_stop],
         gradient_clip_val=args.gradient_clip_val,
         check_val_every_n_epoch=args.val_every_n_epochs,
+        # The train stream is unbounded (no __len__), so cap the epoch; keep it ~the old fixed-set size
+        # so the epoch-based cosine schedule stays meaningful.
+        limit_train_batches=max(1, (args.n_instances * args.points_per_instance) // args.batch),
         inference_mode="consensus" not in args.algos,  # only consensus' rollout jacrev needs autograd in validation
     )
     trainer.fit(
         model,
-        DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate),
+        DataLoader(
+            train_ds,
+            batch_size=args.batch,
+            num_workers=args.num_workers,
+            persistent_workers=args.num_workers > 0,
+            collate_fn=collate,
+        ),
         DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
     )
 

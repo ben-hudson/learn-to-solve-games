@@ -16,11 +16,12 @@ to 0 rather than dividing by zero. Reproducibility is via ``lightning.seed_every
 call site.
 """
 
+import functools
 from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset, default_collate
+from torch.utils.data import Dataset, IterableDataset, default_collate
 
 from l2s_games.transforms import NormClip
 
@@ -81,6 +82,18 @@ def _clone(item):
     return item.clone() if hasattr(item, "clone") else dict(item)
 
 
+def _normalize_example(raw, target, transform, normalizer):
+    """Featurize a raw item and standardize its feats + target -- the one place that shape lives.
+
+    Clones the raw item, applies the family ``transform`` (builds ``feats`` fresh), then standardizes
+    ``feats`` and clip-then-standardizes the target. Shared by the map-style ``FieldDataset`` and the
+    streaming ``StreamingFieldDataset`` so both featurize/normalize identically.
+    """
+    item = transform(_clone(raw))
+    item["feats"] = normalizer.input.transform(item["feats"])
+    return item, normalizer.transform_target(target)
+
+
 class FieldDataset(Dataset):
     """Lazily featurize + normalize raw ``(input item, target)`` examples.
 
@@ -98,9 +111,12 @@ class FieldDataset(Dataset):
 
     def __getitem__(self, index):
         raw, target = self.examples[index]
-        item = self.transform(_clone(raw))
-        item["feats"] = self.normalizer.input.transform(item["feats"])
-        return item, self.normalizer.transform_target(target)
+        return _normalize_example(raw, target, self.transform, self.normalizer)
+
+
+def _collate_examples(family_collate_fn, pairs):
+    inputs, targets = zip(*pairs)
+    return family_collate_fn(list(inputs)), default_collate(list(targets))
 
 
 def collate_examples(family):
@@ -108,29 +124,29 @@ def collate_examples(family):
 
     Returns the ``(inputs, target)`` tuple ``FieldModel`` trains on. For flat games ``collate_fn``
     is ``default_collate``, so this reduces to stacking dicts; traffic overrides it with a dense
-    graph stack.
+    graph stack. Returns a picklable ``functools.partial`` (not a closure) so the streaming train
+    loader's workers can pickle it; ``family.collate_fn`` is a staticmethod, picklable by reference
+    and free of the route-choice solver.
     """
+    return functools.partial(_collate_examples, family.collate_fn)
 
-    def collate(pairs):
-        inputs, targets = zip(*pairs)
-        return family.collate_fn(list(inputs)), default_collate(list(targets))
 
-    return collate
+def _solve_instance(family, params, points_per_instance):
+    """The ``(raw input item, target)`` examples for one instance: sample points, solve the operator.
+
+    The operator (an expensive route-choice solve for traffic) is run **once, jointly for all points**
+    of the instance, then sliced per point. Shared by the eager ``_examples_for_instances`` and the
+    streaming generator (which calls it with ``points_per_instance=1``).
+    """
+    points = family.sample_domain(params, points_per_instance)
+    with torch.no_grad():
+        targets = family.operator(params, points)
+    return [(family.model_input(params, points[j]), targets[j]) for j in range(len(points))]
 
 
 def _examples_for_instances(family, instances, points_per_instance):
-    """A list of ``(raw input item, target)`` examples over instances.
-
-    Targets are the operator values -- computed **once** here (an expensive route-choice solve for
-    traffic), never in the lazy transform.
-    """
-    examples = []
-    for params in instances:
-        points = family.sample_domain(params, points_per_instance)
-        with torch.no_grad():
-            targets = family.operator(params, points)
-        examples.extend((family.model_input(params, points[j]), targets[j]) for j in range(len(points)))
-    return examples
+    """A flat list of ``(raw input item, target)`` examples over instances."""
+    return [example for params in instances for example in _solve_instance(family, params, points_per_instance)]
 
 
 def _fit_normalizer(family, examples, target_clip):
@@ -163,3 +179,50 @@ def build_dataset(family, n_train, n_val, n_test, points_per_instance, target_cl
     normalizer = _fit_normalizer(family, splits[0], target_clip)
     datasets = tuple(FieldDataset(split, family.transform, normalizer) for split in splits)
     return datasets, normalizer
+
+
+class StreamingFieldDataset(IterableDataset):
+    """Infinite stream of freshly-sampled instances: one fresh instance -> one normalized example.
+
+    Each step samples a new instance, one domain point, solves the operator for the target, and yields
+    the same normalized ``(item, target)`` a ``FieldDataset`` would -- so every example is a distinct
+    parametrization and minibatches are maximally diverse. Holds a picklable ``family_factory`` (not a
+    live family) and builds the family -- hence its route-choice solver -- **lazily inside each worker
+    process** on first iteration, so nothing solver-related is pickled across the worker boundary.
+    Reproducible per-worker streams come from ``lightning.seed_everything(seed, workers=True)`` at the
+    call site (the Trainer installs the per-worker seeding); this dataset owns no seeding of its own.
+    """
+
+    def __init__(self, family_factory, normalizer):
+        self.family_factory = family_factory
+        self.normalizer = normalizer
+
+    def __iter__(self):
+        # Built once per __iter__ (~once per worker per epoch), not per sample; the per-epoch rebuild
+        # is cheap relative to a full epoch of solves.
+        family = self.family_factory()
+        transform = family.transform
+        while True:
+            (raw, target), = _solve_instance(family, family.sample_params(), 1)
+            yield _normalize_example(raw, target, transform, self.normalizer)
+
+
+def build_streaming_dataset(family_factory, n_bootstrap, n_val, n_test, points_per_instance, target_clip=None):
+    """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
+
+    The normalizer (+clip) is fit once on a fixed **bootstrap** set of freshly-solved instances, then
+    frozen and shared with the stream and the fixed val/test splits -- preserving the fit-on-a-fixed-
+    sample invariant while training draws unbounded fresh instances. Val/test stay pre-solved so their
+    metrics are stable across epochs. Pair with ``collate_examples(family)`` for the DataLoaders.
+    """
+    family = family_factory()
+    bootstrap, val, test = (
+        _examples_for_instances(family, [family.sample_params() for _ in range(n)], points_per_instance)
+        for n in (n_bootstrap, n_val, n_test)
+    )
+    normalizer = _fit_normalizer(family, bootstrap, target_clip)
+    train_ds = StreamingFieldDataset(family_factory, normalizer)
+    val_ds, test_ds = (FieldDataset(split, family.transform, normalizer) for split in (val, test))
+    # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
+    bootstrap_ds = FieldDataset(bootstrap, family.transform, normalizer)
+    return (train_ds, val_ds, test_ds, bootstrap_ds), normalizer
