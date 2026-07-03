@@ -22,6 +22,8 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset, default_collate
 
+from l2s_games.transforms import NormClip
+
 
 @dataclass(frozen=True)
 class Standardizer:
@@ -51,6 +53,24 @@ class Normalizer:
 
     input: Standardizer
     target: Standardizer
+    clip: NormClip | None = None
+
+    def clip_field(self, y):
+        """Norm-clip a **real-unit** field (identity when clipping is disabled)."""
+        return y if self.clip is None else self.clip(y)
+
+    def transform_target(self, y):
+        """Clip the real-unit target's norm, then standardize it.
+
+        The traffic operator is heavy-tailed: at low costs (near the free-flow-time floor) BPR's
+        power term makes the residual blow up to ~100× the typical magnitude, so a handful of
+        outliers dominate an MSE fit. Clipping the field's *norm* (see ``NormClip``) saturates those
+        blow-ups without rotating the field, so the model learns the operator's true direction; the
+        equilibrium ``F = 0`` is untouched. The clip is applied in real units *before* standardizing
+        so it is a scalar scaling of the field -- de-standardizing at inference recovers that same
+        direction.
+        """
+        return self.target.transform(self.clip_field(y))
 
     def inverse_target(self, y):
         return self.target.inverse_transform(y)
@@ -80,7 +100,7 @@ class FieldDataset(Dataset):
         raw, target = self.examples[index]
         item = self.transform(_clone(raw))
         item["feats"] = self.normalizer.input.transform(item["feats"])
-        return item, self.normalizer.target.transform(target)
+        return item, self.normalizer.transform_target(target)
 
 
 def collate_examples(family):
@@ -113,15 +133,20 @@ def _examples_for_instances(family, instances, points_per_instance):
     return examples
 
 
-def _fit_normalizer(family, examples):
-    """Fit feats/target standardizers on the (transformed) train examples."""
+def _fit_normalizer(family, examples, target_clip):
+    """Fit feats/target standardizers on the (transformed) train examples.
+
+    Standardizers are fit on the **unclipped** targets; ``target_clip`` bounds the real-unit field
+    norm and is applied at transform time (see ``NormClip`` / ``Normalizer.clip_field``).
+    """
     transform = family.transform
     feats = torch.stack([transform(_clone(raw))["feats"] for raw, _ in examples])
     targets = torch.stack([target for _, target in examples])
-    return Normalizer(Standardizer.fit(feats), Standardizer.fit(targets))
+    clip = NormClip(target_clip) if target_clip else None
+    return Normalizer(Standardizer.fit(feats), Standardizer.fit(targets), clip)
 
 
-def build_dataset(family, n_train, n_val, n_test, points_per_instance):
+def build_dataset(family, n_train, n_val, n_test, points_per_instance, target_clip=None):
     """Train/val/test ``FieldDataset``s plus the fitted ``Normalizer``.
 
     The normalizer is fit on the train split and shared with all three, so val/test contribute no
@@ -132,6 +157,6 @@ def build_dataset(family, n_train, n_val, n_test, points_per_instance):
         _examples_for_instances(family, [family.sample_params() for _ in range(n)], points_per_instance)
         for n in (n_train, n_val, n_test)
     ]
-    normalizer = _fit_normalizer(family, splits[0])
+    normalizer = _fit_normalizer(family, splits[0], target_clip)
     datasets = tuple(FieldDataset(split, family.transform, normalizer) for split in splits)
     return datasets, normalizer

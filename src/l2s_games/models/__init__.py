@@ -28,6 +28,9 @@ def conditioned_field(model, family, params, normalizer):
         item = family.transform(family.model_input(params, z))
         item["feats"] = normalizer.input.transform(item["feats"])
         prediction = model(family.collate_fn([item])).squeeze(0)
+        # No norm clip here: the field must stay jacrev-transparent for Consensus / quiver, but
+        # NormClip (a BaseTransform) copy-copies its input and breaks jacrev. Clipping the training
+        # target already teaches the model the reduced-range, correctly-directed field.
         return normalizer.target.inverse_transform(prediction)
 
     return v

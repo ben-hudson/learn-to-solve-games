@@ -8,7 +8,9 @@ fresh per access -- so nothing is cached. Flat games gain nothing from laziness 
 shape for uniformity; their ``feats`` are cheap to rebuild.
 
 Normalization is deliberately *not* a transform: it fits on the train split and must invert at
-inference, so it lives on ``data.Normalizer`` and is applied by the agnostic dataset layer.
+inference, so it lives on ``data.Normalizer`` and is applied by the agnostic dataset layer. The
+*stateless* target clip (``NormClip``), by contrast, has nothing to fit and applies identically
+everywhere, so it *is* a transform and lives here.
 """
 
 import scipy.sparse.csgraph
@@ -18,6 +20,28 @@ from torch_geometric.transforms import BaseTransform, Compose, LineGraph
 from torch_geometric.utils import degree
 
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
+
+
+class NormClip(BaseTransform):
+    """Direction-preserving L2-norm clip of a real-unit field.
+
+    Scales a field ``f`` by ``min(1, max_norm / ‖f‖)`` over the last (field) axis, capping its
+    magnitude at ``max_norm`` while leaving its direction -- and the equilibrium ``f = 0`` --
+    untouched. Unlike a per-component clamp it never rotates the field, so a model trained on the
+    clipped target learns the operator's true direction even in the heavy-tailed blow-up regions.
+
+    Stateless (nothing to fit), so it is a plain transform. Applied only to grad-free tensors (the
+    training target and the ``rel_err`` metric): ``BaseTransform.__call__`` copy-copies its input,
+    which breaks ``jacrev``, so it must not sit in the inference field path.
+    """
+
+    def __init__(self, max_norm):
+        super().__init__()
+        self.max_norm = max_norm
+
+    def forward(self, f):
+        norm = torch.linalg.norm(f, dim=-1, keepdim=True).clamp(min=1e-12)  # safe denom at f = 0
+        return f * (self.max_norm / norm).clamp(max=1.0)
 
 
 class ConcatConditioning:

@@ -34,9 +34,24 @@ def build_parser():
     p.add_argument("--n-instances", type=int, default=64, help="training instances")
     p.add_argument("--n-val-instances", type=int, default=16, help="validation instances")
     p.add_argument("--n-test-instances", type=int, default=16, help="held-out test instances")
-    p.add_argument("--points-per-instance", type=int, default=16, help="cost samples per instance")
+    p.add_argument("--points-per-instance", type=int, default=32, help="cost samples per instance")
     p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
     p.add_argument("--seed", type=int, default=0, help="global seed")
+    # domain coverage (see MarkovTrafficEquilibrium.sample_domain): samples fill the path from the
+    # free-flow-time start up to the base network's reference equilibrium, widened by the margin so
+    # the perturbed instances' equilibria stay bracketed -- no per-instance equilibrium solve.
+    p.add_argument(
+        "--equilibrium-margin",
+        type=float,
+        default=2.5,
+        help="widen the reference-equilibrium ceiling to bracket perturbations",
+    )
+    p.add_argument(
+        "--equilibrium-spread", type=float, default=0.2, help="multiplicative spread off the fft->equilibrium path"
+    )
+    # the operator is heavy-tailed (BPR blows up at low costs); clip the standardized target to
+    # +-this many sigma so a few outliers don't dominate the MSE fit -- the equilibrium F=0 is kept.
+    p.add_argument("--target-clip", type=float, default=3.0, help="cap the real-unit field's L2 norm, direction-preserving (0 disables)")
     # model
     p.add_argument("--dim", type=int, default=64, help="Graphormer hidden dim")
     p.add_argument("--n-heads", type=int, default=4, help="attention heads")
@@ -50,21 +65,34 @@ def build_parser():
     # validation equilibrium sweep (rollout on the learned field, per algorithm)
     p.add_argument(
         "--algos",
-        nargs="+",
+        nargs="*",
         choices=list(ALGORITHMS),
-        default=["simgd", "extragradient", "optimistic", "momentum", "consensus"],
-        help="dynamics algorithms swept in validation (altgd is a 2-player flat-game algo, excluded)",
+        default=["projection"],
+        help="dynamics algorithms swept in validation (pass none for fast field-only training)",
     )
-    p.add_argument("--h", type=float, default=0.05, help="algorithm step size (damped fixed point)")
-    p.add_argument("--n-steps", type=int, default=300, help="iterations for the rollout")
+    # h=0.05 sits above the stability threshold for the stiffer instances -- simGD then oscillates
+    # at a ~8e-2 residual floor even on the true operator; h=0.02/1000 converges to ~1e-6 on every
+    # val instance, so the learned-field residual is measured against a reachable target.
+    p.add_argument("--h", type=float, default=0.02, help="algorithm step size (damped fixed point)")
+    p.add_argument("--n-steps", type=int, default=1000, help="iterations for the rollout")
     return p
 
 
 def main(args):
     L.seed_everything(args.seed)
-    family = MarkovTrafficEquilibrium(sioux_falls_base_graph(), noise_scale=args.noise_scale)
+    family = MarkovTrafficEquilibrium(
+        sioux_falls_base_graph(),
+        noise_scale=args.noise_scale,
+        equilibrium_margin=args.equilibrium_margin,
+        equilibrium_spread=args.equilibrium_spread,
+    )
     (train_ds, val_ds, test_ds), normalizer = build_dataset(
-        family, args.n_instances, args.n_val_instances, args.n_test_instances, args.points_per_instance
+        family,
+        args.n_instances,
+        args.n_val_instances,
+        args.n_test_instances,
+        args.points_per_instance,
+        target_clip=args.target_clip or None,
     )
     print(f"train examples: {len(train_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
@@ -85,7 +113,8 @@ def main(args):
     )
     collate = collate_examples(family)
     # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
-    # logs the analytic residual at the endpoint (plus val_mse / val_rel_err).
+    # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
+    # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
     rollouts = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
     trainer = L.Trainer(
         max_epochs=args.epochs,
@@ -95,7 +124,7 @@ def main(args):
         enable_checkpointing=False,
         enable_model_summary=False,
         callbacks=rollouts,
-        inference_mode=False,  # validation rolls out consensus, whose jacrev needs autograd
+        inference_mode="consensus" not in args.algos,  # only consensus' rollout jacrev needs autograd in validation
     )
     trainer.fit(
         model,

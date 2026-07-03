@@ -28,6 +28,7 @@ from l2s_games.transforms import traffic_field_transform
 
 _NOISED_ATTRS = ("free_flow_time", "capacity", "demand")
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
+_REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost/flow, when present
 
 
 def bpr(free_flow_time, flow, capacity, b, power):
@@ -40,7 +41,8 @@ def _canonicalize(graph):
     graph = graph.clone()
     edge_index, order = coalesce(graph.edge_index, torch.arange(graph.num_edges), num_nodes=graph.num_nodes)
     graph.edge_index = edge_index
-    for attr in _EDGE_ATTRS:
+    reference_attrs = tuple(attr for attr in _REFERENCE_ATTRS if attr in graph)
+    for attr in _EDGE_ATTRS + reference_attrs:
         setattr(graph, attr, getattr(graph, attr)[order])
     return graph
 
@@ -48,10 +50,24 @@ def _canonicalize(graph):
 class MarkovTrafficEquilibrium(VariationalInequalityFamily):
     """Family of single-graph traffic equilibria, varied by noising a base graph."""
 
-    def __init__(self, base_graph, noise_scale=0.2, noise_type="normal"):
+    def __init__(
+        self,
+        base_graph,
+        noise_scale=0.2,
+        noise_type="normal",
+        equilibrium_margin=2.5,
+        equilibrium_spread=0.2,
+    ):
         self.base_graph = _canonicalize(base_graph)
         self.noise_scale = noise_scale
         self.noise_type = noise_type
+        # Domain sampling must span the whole path the rollout traverses -- from the free-flow-time
+        # start up to the equilibrium. Rather than solve each instance's equilibrium, anchor the top
+        # of that range at the base network's shipped reference equilibrium cost (``Cost``), widened
+        # by ``equilibrium_margin`` so the bounded parameter perturbations' equilibria stay bracketed
+        # by one fixed ceiling shared across every instance. See sample_domain.
+        self.reference_equilibrium = self.base_graph.Cost * equilibrium_margin
+        self.equilibrium_spread = equilibrium_spread
         self.dest_dim = -2
         # ift=True gives exact implicit-function-theorem gradients through the value/flow linear
         # solves. (The analytic operator's full Jacobian is blocked by a NaN in route_choice's
@@ -131,7 +147,20 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return batch["free_flow_time"]
 
     def sample_domain(self, graph, n):
-        return graph.free_flow_time * (1.0 + torch.rand(n, graph.num_edges))
+        """Feasible cost points spanning the whole path from the free-flow-time start to equilibrium.
+
+        The rollout starts at ``free_flow_time`` and converges to the equilibrium, so training must
+        cover that entire segment -- not just a ball around either end. Each point interpolates from
+        the instance's ``free_flow_time`` toward the fixed ``reference_equilibrium`` ceiling by a
+        scalar reach in ``[0, 1]`` (so the samples fill the path rather than a high-dimensional box),
+        with multiplicative noise spreading points off the line. Costs are clamped to the feasible
+        floor ``free_flow_time``.
+        """
+        fft = graph.free_flow_time
+        reach = torch.rand(n, 1)
+        line = fft + reach * (self.reference_equilibrium - fft)
+        spread = 1.0 + self.equilibrium_spread * torch.randn(n, graph.num_edges)
+        return torch.clamp(line * spread, min=fft)
 
     def model_input(self, graph, cost):
         """Raw input item: the instance graph with the domain point attached as ``.cost``.
