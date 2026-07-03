@@ -17,6 +17,8 @@ instances is solved at once (see ``FieldModel.batched_field`` / ``MarkovTrafficE
 import argparse
 
 import lightning as L
+import torch
+from lightning.pytorch.callbacks import EarlyStopping
 from torch.utils.data import DataLoader
 
 from traffic_equilibrium_sandbox import sioux_falls_base_graph
@@ -26,6 +28,8 @@ from l2s_games.callbacks import EquilibriumRolloutCallback
 from l2s_games.data import build_dataset, collate_examples
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.models import GraphormerFieldModel
+
+torch.set_float32_matmul_precision("medium")
 
 
 def build_parser():
@@ -58,15 +62,23 @@ def build_parser():
         help="cap the real-unit field's L2 norm, direction-preserving (0 disables)",
     )
     # model
-    p.add_argument("--dim", type=int, default=64, help="Graphormer hidden dim")
+    p.add_argument("--dim", type=int, default=128, help="Graphormer hidden dim")
     p.add_argument("--n-heads", type=int, default=4, help="attention heads")
     p.add_argument("--n-layers", type=int, default=4, help="encoder layers")
     p.add_argument("--dim-ff", type=int, default=128, help="feed-forward dim")
-    p.add_argument("--dropout", type=float, default=0.0, help="dropout")
-    # training
-    p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
-    p.add_argument("--epochs", type=int, default=30, help="training epochs")
+    p.add_argument("--dropout", type=float, default=0.2, help="dropout")
+    # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
+    p.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate")
+    p.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay")
+    p.add_argument("--start-factor", type=float, default=0.01, help="linear warmup start factor")
+    p.add_argument("--warmup-epochs", type=int, default=50, help="linear warmup epochs (must be < --epochs)")
+    p.add_argument("--cosine-annealing", type=int, default=1, help="cosine-anneal after warmup (0 disables)")
+    p.add_argument("--gradient-clip-val", type=float, default=1.0, help="gradient-norm clip value")
+    p.add_argument("--epochs", type=int, default=400, help="training epochs")
     p.add_argument("--batch", type=int, default=32, help="minibatch size")
+    # early stopping on the field relative error (no MAPE here -- we regress the operator field)
+    p.add_argument("--patience-epochs", type=int, default=40, help="early-stopping patience in epochs")
+    p.add_argument("--val-every-n-epochs", type=int, default=1, help="run validation every N epochs")
     # validation equilibrium sweep (rollout on the learned field, per algorithm)
     p.add_argument(
         "--algos",
@@ -110,6 +122,10 @@ def main(args):
         spd=sample["spd"],
         lr=args.lr,
         normalizer=normalizer,
+        weight_decay=args.weight_decay,
+        start_factor=args.start_factor,
+        warmup_epochs=args.warmup_epochs,
+        cosine_annealing=bool(args.cosine_annealing),
         dim=args.dim,
         n_heads=args.n_heads,
         n_layers=args.n_layers,
@@ -121,6 +137,15 @@ def main(args):
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
     # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
     rollouts = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
+    # Stop when the field relative error stops improving; tolerant like the source setup (a rollout
+    # can log a non-finite residual without aborting the run).
+    early_stop = EarlyStopping(
+        monitor="val_rel_err",
+        mode="min",
+        patience=max(1, args.patience_epochs // args.val_every_n_epochs),
+        check_finite=False,
+        strict=False,
+    )
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="cpu",
@@ -128,7 +153,9 @@ def main(args):
         logger=False,
         enable_checkpointing=False,
         enable_model_summary=False,
-        callbacks=rollouts,
+        callbacks=rollouts + [early_stop],
+        gradient_clip_val=args.gradient_clip_val,
+        check_val_every_n_epoch=args.val_every_n_epochs,
         inference_mode="consensus" not in args.algos,  # only consensus' rollout jacrev needs autograd in validation
     )
     trainer.fit(
