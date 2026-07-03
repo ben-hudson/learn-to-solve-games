@@ -21,10 +21,13 @@ instances is solved at once (see ``FieldModel.batched_field`` / ``MarkovTrafficE
 
 import argparse
 import functools
+import os
 
 import lightning as L
 import torch
+import wandb
 from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from traffic_equilibrium_sandbox import sioux_falls_base_graph
@@ -88,6 +91,15 @@ def build_parser():
     # early stopping on the field relative error (no MAPE here -- we regress the operator field)
     p.add_argument("--patience-epochs", type=int, default=40, help="early-stopping patience in epochs")
     p.add_argument("--val-every-n-epochs", type=int, default=1, help="run validation every N epochs")
+    # logging (ported from markov-traffic-eq/scripts/self_supervised.py)
+    p.add_argument(
+        "--logger",
+        choices=["wandb", "csv"],
+        default="wandb",
+        help="where to log metrics ('csv' writes to {SCRATCH or .}/csvlogs and skips wandb)",
+    )
+    p.add_argument("--exp", type=str, default=None, help="experiment name (wandb group)")
+    p.add_argument("--debug", action="store_true", help="run a single train/val batch for quick sanity checking")
     # validation equilibrium sweep (rollout on the learned field, per algorithm)
     p.add_argument(
         "--algos",
@@ -162,11 +174,23 @@ def main(args):
         check_finite=False,
         strict=False,
     )
+    save_dir = os.getenv("SCRATCH", ".")
+    if args.debug:
+        logger = None
+    elif args.logger == "wandb":
+        logger = WandbLogger(
+            experiment=wandb.init(project="learn-to-solve-games", group=args.exp, config=vars(args), dir=save_dir),
+            save_dir=save_dir,
+        )
+    else:
+        logger = CSVLogger(save_dir=save_dir)
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="cpu",
         num_sanity_val_steps=0,
-        logger=False,
+        logger=logger,
+        default_root_dir=save_dir,
+        fast_dev_run=args.debug,
         enable_checkpointing=False,
         enable_model_summary=False,
         callbacks=rollouts + [early_stop],

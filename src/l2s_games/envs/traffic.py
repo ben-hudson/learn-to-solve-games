@@ -26,7 +26,7 @@ from torch_geometric.utils import coalesce
 from l2s_games.envs.base import VariationalInequalityFamily
 from l2s_games.transforms import traffic_field_transform
 
-_NOISED_ATTRS = ("free_flow_time", "capacity", "demand")
+_NOISED_ATTRS = ("free_flow_time", "capacity")  # TODO: add demand back in once everything is working
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
 _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost/flow, when present
 

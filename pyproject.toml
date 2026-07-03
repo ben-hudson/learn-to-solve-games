@@ -15,6 +15,7 @@ dependencies = [
     "torch_geometric",
     "torch~=2.8.0",
     "torchvision",
+    "wandb",
 ]
 
 [tool.setuptools.packages.find]
