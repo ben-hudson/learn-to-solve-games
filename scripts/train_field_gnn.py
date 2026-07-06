@@ -30,12 +30,10 @@ from lightning.pytorch.callbacks import EarlyStopping
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
-from traffic_equilibrium_sandbox import sioux_falls_base_graph
-
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.callbacks import EquilibriumRolloutCallback
 from l2s_games.data import build_streaming_dataset, collate_examples
-from l2s_games.envs.traffic import MarkovTrafficEquilibrium
+from l2s_games.envs.traffic import MarkovTrafficEquilibrium, sioux_falls_base_graph
 from l2s_games.models import GraphormerFieldModel
 
 torch.set_float32_matmul_precision("medium")

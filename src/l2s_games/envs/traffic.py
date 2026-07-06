@@ -19,16 +19,42 @@ Graphormer consumes -- **fresh on every access, nothing cached** -- and ``collat
 single-topology graphs into a dense batch.
 """
 
+from urllib.parse import urljoin
+
+import tntp
 import torch
 from route_choice import MarkovRouteChoice
-from torch_geometric.utils import coalesce
+from torch_geometric.utils import coalesce, from_networkx
 
 from l2s_games.envs.base import VariationalInequalityFamily
 from l2s_games.transforms import traffic_field_transform
 
+SIOUX_FALLS = "https://raw.githubusercontent.com/bstabler/TransportationNetworks/refs/heads/master/SiouxFalls/"
+
 _NOISED_ATTRS = ("free_flow_time", "capacity")  # TODO: add demand back in once everything is working
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
 _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost/flow, when present
+
+
+def sioux_falls_base_graph(scaling=1000.0):
+    """Sioux Falls as a PyG graph: BPR params, OD demand, sink mask, and reference costs (``Cost``)."""
+    node_df = tntp.read_node_file(urljoin(SIOUX_FALLS, "SiouxFalls_node.tntp"), index_col="Node", x_col="X", y_col="Y", crs="wgs84")
+    net_df = tntp.read_net_file(urljoin(SIOUX_FALLS, "SiouxFalls_net.tntp"), crs="wgs84")
+    flow_df = tntp.read_flow_file(urljoin(SIOUX_FALLS, "SiouxFalls_flow.tntp"), u_col="From", v_col="To")
+    flow_df = flow_df.rename(columns={"From": "init_node", "To": "term_node"})
+    net_df = net_df.merge(flow_df, on=["init_node", "term_node"])  # adds the reference Cost column
+    network = tntp.convert_to_networkx(node_df, net_df)
+    node_list = list(network.nodes)
+    demand_table = tntp.read_demand_file(urljoin(SIOUX_FALLS, "SiouxFalls_trips.tntp")).reindex(index=node_list, columns=node_list)
+
+    graph = from_networkx(network)
+    graph.free_flow_time = graph.free_flow_time.float()
+    graph.capacity = graph.capacity.float() / scaling  # flow/capacity ratio is scale-invariant, so costs are unchanged
+    graph.b = graph.b.float()
+    graph.power = graph.power.float()
+    graph.demand = torch.as_tensor(demand_table.values.T, dtype=torch.float32).clone() / scaling  # demand[dest, origin]
+    graph.sink_node_mask = torch.diag_embed(torch.ones(len(node_list), dtype=torch.long))
+    return graph
 
 
 def bpr(free_flow_time, flow, capacity, b, power):
