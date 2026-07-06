@@ -21,7 +21,7 @@ from dataclasses import dataclass
 
 import torch
 from torch import Tensor
-from torch.utils.data import Dataset, IterableDataset, default_collate
+from torch.utils.data import Dataset, IterableDataset, default_collate, random_split
 
 
 @dataclass(frozen=True)
@@ -217,18 +217,34 @@ class StreamingFieldDataset(IterableDataset):
             yield _normalize_example(raw, target, transform, self.normalizer)
 
 
-def build_streaming_dataset(family_factory, n_bootstrap, n_val, n_test, points_per_instance):
+def split_instances(instances, counts, seed):
+    """Split a flat list of instances into disjoint sublists of sizes ``counts`` (reproducibly).
+
+    A cache larger than ``sum(counts)`` is allowed -- the leftover is randomly held out and dropped.
+    """
+    counts = list(counts)
+    remainder = len(instances) - sum(counts)
+    assert remainder >= 0, f"need {sum(counts)} instances but the cache has only {len(instances)}"
+    generator = torch.Generator().manual_seed(seed)
+    subsets = random_split(instances, counts + [remainder], generator=generator)
+    return [[instances[i] for i in subset.indices] for subset in subsets[: len(counts)]]
+
+
+def build_streaming_dataset(family_factory, bootstrap_instances, val_instances, test_instances, points_per_instance):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
 
-    The normalizer is fit once on a fixed **bootstrap** set of freshly-solved instances, then frozen
-    and shared with the stream and the fixed val/test splits -- preserving the fit-on-a-fixed-sample
-    invariant while training draws unbounded fresh instances. Val/test stay pre-solved so their
-    metrics are stable across epochs. Pair with ``collate_examples(family)`` for the DataLoaders.
+    The bootstrap / val / test instances are pre-solved and passed in (split from a cached
+    ``SolvedInstanceDataset``); this builds their ``(input, target)`` examples with the family's
+    (calibrated) ``sample_domain`` + ``operator``. The normalizer is fit once on the **bootstrap**
+    examples, then frozen and shared with the stream and the fixed val/test splits -- preserving the
+    fit-on-a-fixed-sample invariant while training draws unbounded fresh instances. Val/test stay
+    fixed so their metrics are stable across epochs. Pair with ``collate_examples(family)`` for the
+    DataLoaders.
     """
     family = family_factory()
     bootstrap, val, test = (
-        _examples_for_instances(family, [family.sample_params() for _ in range(n)], points_per_instance)
-        for n in (n_bootstrap, n_val, n_test)
+        _examples_for_instances(family, instances, points_per_instance)
+        for instances in (bootstrap_instances, val_instances, test_instances)
     )
     normalizer = _fit_normalizer(family, bootstrap)
     train_ds = StreamingFieldDataset(family_factory, normalizer)

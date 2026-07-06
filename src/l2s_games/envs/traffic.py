@@ -98,17 +98,27 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         noise_type="normal",
         equilibrium_margin=2.5,
         equilibrium_spread=0.2,
+        reference_equilibrium=None,
+        reference_spread=None,
+        n_stds=3.0,
     ):
         self.base_graph = _canonicalize(base_graph)
         self.noise_scale = noise_scale
         self.noise_type = noise_type
         # Domain sampling must span the whole path the rollout traverses -- from the free-flow-time
-        # start up to the equilibrium. Rather than solve each instance's equilibrium, anchor the top
-        # of that range at the base network's shipped reference equilibrium cost (``Cost``), widened
-        # by ``equilibrium_margin`` so the bounded parameter perturbations' equilibria stay bracketed
-        # by one fixed ceiling shared across every instance. See sample_domain.
-        self.reference_equilibrium = self.base_graph.Cost * equilibrium_margin
-        self.equilibrium_spread = equilibrium_spread
+        # start up to the equilibrium. ``reference_equilibrium`` (per-edge mean of the bootstrap
+        # equilibria) and ``reference_spread`` (their per-edge std) center and scale that range; they
+        # are calibrated once in the main process (see ``calibrate_range``) and passed in so every
+        # streaming worker shares the same range. See sample_domain. When they are not supplied (the
+        # sandbox / uncalibrated path), fall back to anchoring the top of the range at the base
+        # network's shipped reference equilibrium cost (``Cost``), widened by ``equilibrium_margin``.
+        if reference_equilibrium is not None and reference_spread is not None:
+            self.reference_equilibrium = torch.as_tensor(reference_equilibrium, dtype=torch.float32)
+            self.reference_spread = torch.as_tensor(reference_spread, dtype=torch.float32)
+        else:
+            self.reference_equilibrium = self.base_graph.Cost * equilibrium_margin
+            self.reference_spread = equilibrium_spread * self.reference_equilibrium
+        self.n_stds = n_stds
         self.dest_dim = -2
         # ift=True gives exact implicit-function-theorem gradients through the value/flow linear
         # solves. (The analytic operator's full Jacobian is blocked by a NaN in route_choice's
@@ -187,21 +197,35 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
     def initial_point(self, batch):
         return batch["free_flow_time"]
 
+    @staticmethod
+    def calibrate_range(instances):
+        """Per-edge ``(reference_equilibrium, reference_spread)`` from a set of solved instances.
+
+        Treats the instances' equilibria (``instance.equilibrium_cost``, solved offline by
+        ``PUMESolver`` and cached in the dataset) as an empirical distribution: the center is the
+        per-edge mean and the spread is the per-edge std across instances. Feed the pair into
+        ``__init__`` so ``sample_domain`` draws around where the equilibria actually are.
+        """
+        eq = torch.stack([instance.equilibrium_cost.float() for instance in instances])  # [N, E]
+        return eq.mean(dim=0), eq.std(dim=0)
+
     def sample_domain(self, graph, n):
         """Feasible cost points spanning the whole path from the free-flow-time start to equilibrium.
 
         The rollout starts at ``free_flow_time`` and converges to the equilibrium, so training must
-        cover that entire segment -- not just a ball around either end. Each point interpolates from
-        the instance's ``free_flow_time`` toward the fixed ``reference_equilibrium`` ceiling by a
-        scalar reach in ``[0, 1]`` (so the samples fill the path rather than a high-dimensional box),
-        with multiplicative noise spreading points off the line. Costs are clamped to the feasible
-        floor ``free_flow_time``.
+        cover that entire segment -- not just a ball around either end. The bootstrap set gives an
+        empirical distribution over equilibria (per-edge mean ``reference_equilibrium`` and std
+        ``reference_spread``), so each point is drawn in two steps: (1) sample an equilibrium from
+        that distribution, truncated to the ``n_stds``-sigma ball around the mean; (2) interpolate
+        from the instance's ``free_flow_time`` toward that sampled equilibrium by a scalar reach in
+        ``[0, 1]`` (so the samples fill the path rather than a high-dimensional box). Costs are
+        clamped to the feasible floor ``free_flow_time``.
         """
         fft = graph.free_flow_time
+        z = torch.randn(n, graph.num_edges).clamp(-self.n_stds, self.n_stds)
+        sampled_eq = self.reference_equilibrium + self.reference_spread * z
         reach = torch.rand(n, 1)
-        line = fft + reach * (self.reference_equilibrium - fft)
-        spread = 1.0 + self.equilibrium_spread * torch.randn(n, graph.num_edges)
-        return torch.clamp(line * spread, min=fft)
+        return torch.clamp(fft + reach * (sampled_eq - fft), min=fft)
 
     def model_input(self, graph, cost):
         """Raw input item: the instance graph with the domain point attached as ``.cost``.

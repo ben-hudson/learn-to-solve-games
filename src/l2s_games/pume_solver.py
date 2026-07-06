@@ -1,0 +1,128 @@
+"""
+pume_solver.py
+
+Reference user-equilibrium solver for the Markov traffic VI, built on the PUME (Perturbed Utility
+Markovian Equilibrium) package. It solves the cost-space residual ``costs - bpr(demand_flow(-costs))``
+to zero on a PyG road graph with PUME's aGRAAL base under Anderson (type-1) meta-acceleration and
+supply-diagonal preconditioning -- more robust on noised instances than the damped-fixed-point
+torchdeq iteration it replaces.
+
+Construct one solver per graph *structure* (edge_index + sink nodes); the per-destination PUMCM
+models are the expensive part and are built once here. Then call ``solve(instance)`` for any
+instance sharing that structure, returning equilibrium ``(costs, flows)`` as float tensors in real
+units. Follows PUME's own SiouxFalls equilibrium example rather than reconstructing incidence via a
+separate route-choice dependency: the state->action / action->state matrices come straight off
+``edge_index`` and the destination structures are built with the batched ``build_structures_batch``.
+"""
+
+import numpy as np
+import scipy.sparse
+import torch
+import torch_geometric.data
+
+from pumcm import (
+    PUMCM,
+    FlowMapping,
+    ModifiedPolicyIteration,
+    RecursiveLogit,
+    RewardMapping,
+    build_structures_batch,
+)
+from pume import PUMEModel, StackedPUMCMDemandLoader
+from pume.operators import InverseBPRSupply
+
+
+class PUMESolver:
+    """PUME-based reference equilibrium solver for a fixed traffic-graph structure."""
+
+    def __init__(
+        self,
+        graph: torch_geometric.data.Data,
+        choice_model=None,
+        inner_max_iter=3000,
+        inner_tol=1e-7,
+        outer_max_iter=500,
+        outer_tol=1e-1,
+    ):
+        choice_model = choice_model if choice_model is not None else RecursiveLogit()
+        self._outer_max_iter = outer_max_iter
+        self._outer_tol = outer_tol
+
+        num_links = graph.num_edges
+        source_nodes, target_nodes = graph.edge_index.numpy()
+        links = np.arange(num_links)
+        ones = np.ones(num_links)
+        states_to_actions = scipy.sparse.coo_matrix(
+            (ones, (source_nodes, links)), shape=(graph.num_nodes, num_links)
+        ).tocsr()
+        actions_to_states = scipy.sparse.coo_matrix(
+            (ones, (links, target_nodes)), shape=(num_links, graph.num_nodes)
+        ).tocsr()
+
+        destination_nodes = graph.sink_node_mask.argmax(dim=-1).tolist()
+        structures = build_structures_batch(
+            lambda_full=states_to_actions,
+            P_full=actions_to_states,
+            termination_states=destination_nodes,
+            gamma=1.0,
+        )
+        self._pumcm_models = [
+            PUMCM(
+                structure=structure,
+                choice_model=choice_model,
+                solver=ModifiedPolicyIteration(m=1, max_iter=inner_max_iter, tol=inner_tol, verbose=False),
+            )
+            for structure in structures
+        ]
+
+        # TNTP identity mappings: cost -> reward is u = -c, occupancy -> flow is the identity.
+        self._reward_mapping = RewardMapping(
+            A_sa_l=scipy.sparse.identity(num_links, format="csr"),
+            base_u_sa=torch.zeros(num_links, dtype=torch.float64),
+        )
+        self._flow_mapping = FlowMapping(B_sa_l=scipy.sparse.identity(num_links, format="csr"))
+
+    def solve(self, instance: torch_geometric.data.Data):
+        """Solve ``instance`` to user equilibrium; returns ``(costs, flows)`` in real units."""
+        free_flow_time = instance.free_flow_time.double()
+        supply = InverseBPRSupply(
+            free_flow_time=free_flow_time,
+            capacity=torch.clamp(instance.capacity.double(), min=1e-8),
+            alpha=instance.b.double(),
+            beta=instance.power.double(),
+            eps=1e-6,
+        )
+
+        cost_lower = free_flow_time.detach().numpy()
+        # Cap cost below the exp(-cost) float64 underflow cliff (~709): an unbounded upper lets the
+        # iterate run away, after which demand snaps to zero and the solve stalls without recovering.
+        cost_upper = np.full_like(cost_lower, 700.0, dtype=np.float64)
+
+        demand_loader = StackedPUMCMDemandLoader(
+            pumcm_models=self._pumcm_models,
+            flow_mappings=self._flow_mapping.B_sa_l,
+            reward_provider=lambda costs, _destination_idx: self._reward_mapping.rewards(costs),
+            initial_states_list=list(instance.demand.double().unbind(dim=0)),
+            reward_invariant=True,
+        )
+        model = PUMEModel(
+            pumcm_models=self._pumcm_models,
+            supply_func=supply,
+            reward_mapping=self._reward_mapping,
+            flow_mapping=self._flow_mapping,
+            cost_bounds=(cost_lower, cost_upper),
+            demand_loader=demand_loader,
+        )
+
+        result = model.solve(
+            c_initial=torch.as_tensor(cost_lower, dtype=torch.float64) * 1.1,
+            method="meta",
+            options={
+                "max_iterations": self._outer_max_iter,
+                "convergence_tolerance": self._outer_tol,
+                "oracle_type": "aa1",
+                "base_method": "agraal",
+                "base_options": {"metric_mode": "supply_diagonal", "initial_stepsize": 5e-2},
+            },
+        )
+        return result["cost"].float(), result["demand"].float()

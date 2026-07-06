@@ -32,8 +32,9 @@ from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.callbacks import EquilibriumRolloutCallback
-from l2s_games.data import build_streaming_dataset, collate_examples
-from l2s_games.envs.traffic import MarkovTrafficEquilibrium, load_sioux_falls_base_graph
+from l2s_games.data import build_streaming_dataset, collate_examples, split_instances
+from l2s_games.datasets import SolvedInstanceDataset
+from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.models import GraphormerFieldModel
 
 torch.set_float32_matmul_precision("medium")
@@ -41,12 +42,16 @@ torch.set_float32_matmul_precision("medium")
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # dataset (each sample is a route-choice solve, so keep points-per-instance modest)
-    # Training streams fresh instances on the fly (one point each); the fixed sets below only fit the
-    # normalizer (bootstrap) and measure generalization (val/test). Epoch length is --steps-per-epoch.
-    p.add_argument("--bootstrap-instances", type=int, default=1024, help="fixed instances the normalizer is fit on")
-    p.add_argument("--n-val-instances", type=int, default=128, help="validation instances (fixed)")
-    p.add_argument("--n-test-instances", type=int, default=128, help="held-out test instances (fixed)")
+    # dataset: a cached SolvedInstanceDataset (see scripts/generate_traffic_dataset.py) is loaded and
+    # split into bootstrap/val/test instances. Training still streams fresh instances on the fly (one
+    # point each); the splits fit the normalizer + calibrate the sampling range (bootstrap) and measure
+    # generalization (val/test). Epoch length is --steps-per-epoch.
+    p.add_argument(
+        "--dataset-root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load"
+    )
+    p.add_argument("--bootstrap-instances", type=int, default=1024, help="bootstrap split size (normalizer + calibration)")
+    p.add_argument("--n-val-instances", type=int, default=128, help="validation split size")
+    p.add_argument("--n-test-instances", type=int, default=128, help="held-out test split size")
     p.add_argument(
         "--points-per-instance", type=int, default=1, help="cost samples per fixed (bootstrap/val/test) instance"
     )
@@ -55,23 +60,18 @@ def build_parser():
     )
     p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
     p.add_argument("--seed", type=int, default=0, help="global seed")
+    # domain coverage (see MarkovTrafficEquilibrium.sample_domain): the range is calibrated from the
+    # bootstrap split's equilibria -- per-edge mean (center) and std (spread) -- and sampled within
+    # --sample-stds sigma of that mean. --equilibrium-margin/--equilibrium-spread are the uncalibrated
+    # fallback only (used when a family is built without a calibrated range, e.g. the sandbox).
     p.add_argument(
-        "--data-root",
-        type=str,
-        default="data/sioux_falls",
-        help="root location of the SiouxFalls_*.tntp files (local directory or URL)",
-    )
-    # domain coverage (see MarkovTrafficEquilibrium.sample_domain): samples fill the path from the
-    # free-flow-time start up to the base network's reference equilibrium, widened by the margin so
-    # the perturbed instances' equilibria stay bracketed -- no per-instance equilibrium solve.
-    p.add_argument(
-        "--equilibrium-margin",
-        type=float,
-        default=2.5,
-        help="widen the reference-equilibrium ceiling to bracket perturbations",
+        "--sample-stds", type=float, default=3.0, help="sigma radius of the equilibrium ball sample_domain draws from"
     )
     p.add_argument(
-        "--equilibrium-spread", type=float, default=0.2, help="multiplicative spread off the fft->equilibrium path"
+        "--equilibrium-margin", type=float, default=2.5, help="uncalibrated fallback: reference-equilibrium ceiling widen"
+    )
+    p.add_argument(
+        "--equilibrium-spread", type=float, default=0.2, help="uncalibrated fallback: multiplicative spread"
     )
     # model
     p.add_argument("--dim", type=int, default=128, help="Graphormer hidden dim")
@@ -130,22 +130,32 @@ def build_parser():
 def main(args):
     # workers=True makes Lightning seed each streaming dataloader worker distinctly & reproducibly.
     L.seed_everything(args.seed, workers=True)
-    # A picklable factory (base graph + floats) the streaming dataset ships to each worker, which
-    # builds its own family + route-choice solver lazily -- nothing solver-related is pickled. The
+    # Load the cached solved instances and split them into bootstrap/val/test. The bootstrap split's
+    # equilibria calibrate the streaming sampling range (per-edge mean + std); the calibrated tensors
+    # are baked into the picklable factory so every worker shares the same range.
+    dataset = SolvedInstanceDataset(args.dataset_root)
+    instances = list(dataset)
+    bootstrap_inst, val_inst, test_inst = split_instances(
+        instances, (args.bootstrap_instances, args.n_val_instances, args.n_test_instances), args.seed
+    )
+    reference_equilibrium, reference_spread = MarkovTrafficEquilibrium.calibrate_range(bootstrap_inst)
+    # A picklable factory (base graph + calibrated tensors) the streaming dataset ships to each worker,
+    # which builds its own family + route-choice solver lazily -- nothing solver-related is pickled. The
     # main process also needs one live family for collate_fn and the validation rollout callbacks.
     family_factory = functools.partial(
         MarkovTrafficEquilibrium,
-        load_sioux_falls_base_graph(args.data_root),
+        dataset.base_graph,
         noise_scale=args.noise_scale,
-        equilibrium_margin=args.equilibrium_margin,
-        equilibrium_spread=args.equilibrium_spread,
+        reference_equilibrium=reference_equilibrium,
+        reference_spread=reference_spread,
+        n_stds=args.sample_stds,
     )
     family = family_factory()
     (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_dataset(
         family_factory,
-        args.bootstrap_instances,
-        args.n_val_instances,
-        args.n_test_instances,
+        bootstrap_inst,
+        val_inst,
+        test_inst,
         args.points_per_instance,
     )
     print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
