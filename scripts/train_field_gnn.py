@@ -33,7 +33,7 @@ from torch.utils.data import DataLoader
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.callbacks import EquilibriumRolloutCallback
 from l2s_games.data import build_streaming_dataset, collate_examples
-from l2s_games.envs.traffic import MarkovTrafficEquilibrium, sioux_falls_base_graph
+from l2s_games.envs.traffic import MarkovTrafficEquilibrium, load_sioux_falls_base_graph
 from l2s_games.models import GraphormerFieldModel
 
 torch.set_float32_matmul_precision("medium")
@@ -55,6 +55,12 @@ def build_parser():
     )
     p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
     p.add_argument("--seed", type=int, default=0, help="global seed")
+    p.add_argument(
+        "--data-root",
+        type=str,
+        default="data/sioux_falls",
+        help="root location of the SiouxFalls_*.tntp files (local directory or URL)",
+    )
     # domain coverage (see MarkovTrafficEquilibrium.sample_domain): samples fill the path from the
     # free-flow-time start up to the base network's reference equilibrium, widened by the margin so
     # the perturbed instances' equilibria stay bracketed -- no per-instance equilibrium solve.
@@ -109,7 +115,7 @@ def build_parser():
         "--algos",
         nargs="*",
         choices=list(ALGORITHMS),
-        default=["projection", "consesus"],
+        default=["projection", "consensus"],
         help="dynamics algorithms rolled out on the learned field each val epoch, logging the analytic "
         "endpoint residual val/{algo}/residual (pass --algos with no value for fast field-only training)",
     )
@@ -129,7 +135,7 @@ def main(args):
     # main process also needs one live family for collate_fn and the validation rollout callbacks.
     family_factory = functools.partial(
         MarkovTrafficEquilibrium,
-        sioux_falls_base_graph(),
+        load_sioux_falls_base_graph(args.data_root),
         noise_scale=args.noise_scale,
         equilibrium_margin=args.equilibrium_margin,
         equilibrium_spread=args.equilibrium_spread,
@@ -190,7 +196,7 @@ def main(args):
         logger = CSVLogger(save_dir=save_dir)
     trainer = L.Trainer(
         max_epochs=args.epochs,
-        accelerator="cpu",
+        accelerator="gpu",
         num_sanity_val_steps=0,
         logger=logger,
         default_root_dir=save_dir,

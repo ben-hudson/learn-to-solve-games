@@ -22,7 +22,7 @@ import torchdeq
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.dynamics import simulate
 from l2s_games.envs import bind
-from l2s_games.envs.traffic import MarkovTrafficEquilibrium, sioux_falls_base_graph
+from l2s_games.envs.traffic import MarkovTrafficEquilibrium, load_sioux_falls_base_graph
 
 
 def solve_equilibrium(vi, free_flow_time, step=0.1):
@@ -35,7 +35,7 @@ def solve_equilibrium(vi, free_flow_time, step=0.1):
 
 
 def main():
-    base_graph = sioux_falls_base_graph()
+    base_graph = load_sioux_falls_base_graph("data/sioux_falls")
     family = MarkovTrafficEquilibrium(base_graph)
     print(f"Sioux Falls: {base_graph.num_nodes} nodes, {base_graph.num_edges} edges")
 
@@ -61,7 +61,9 @@ def main():
     graph = family.sample_params()
     instance = bind(family, graph)
     costs0 = graph.free_flow_time.clone()
-    traj = simulate(lambda c: -instance.operator(c), ALGORITHMS["projection"](0.1), costs0, n_steps=300, project=instance.project)
+    traj = simulate(
+        lambda c: -instance.operator(c), ALGORITHMS["projection"](0.1), costs0, n_steps=300, project=instance.project
+    )
     print(
         f"instance: residual ||r|| start={instance.operator(costs0).norm():.4e}  "
         f"end={instance.operator(traj[-1]).norm():.4e}  (feasible={bool((traj >= graph.free_flow_time - 1e-5).all())})"
