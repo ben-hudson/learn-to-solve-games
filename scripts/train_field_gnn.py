@@ -6,17 +6,18 @@ each road edge's features ``[cost, free_flow_time, capacity, b, power, +4 demand
 the line-graph structure to the per-edge operator value ``costs - bpr(demand_flow(-costs))`` -- so
 one network represents the operator across a family of noised SiouxFalls instances.
 
-Training data is **streamed**: every step draws a fresh instance (one cost point each), solving the
-operator for its target inside ``DataLoader`` workers -- so the model sees unbounded instance
-diversity rather than a fixed set (see ``data.build_streaming_dataset`` / ``StreamingFieldDataset``).
-The normalizer is fit once on a fixed bootstrap set (``--bootstrap-instances``); val/test stay fixed.
+Training data is **streamed**: every step draws a fresh instance and solves the operator jointly for
+``--points_per_instance`` cost points inside ``DataLoader`` workers (one solve amortized over that
+many training examples) -- so the model sees unbounded instance diversity rather than a fixed set
+(see ``data.build_streaming_dataset`` / ``StreamingFieldDataset``).
+The normalizer is fit once on a fixed bootstrap set (``--bootstrap_instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
 every algorithm in ``--algos`` -- the analytic residual ``||costs - bpr(demand_flow(-costs))||`` at
 the endpoint of a projected rollout of that algorithm on the learned field. The whole val batch of
 instances is solved at once (see ``FieldModel.batched_field`` / ``MarkovTrafficEquilibrium.operator``).
 
-    python scripts/train_field_gnn.py --num-workers 4
+    python scripts/train_field_gnn.py --n_workers 4
 """
 
 import argparse
@@ -45,62 +46,67 @@ def build_parser():
     # dataset: a cached SolvedInstanceDataset (see scripts/generate_traffic_dataset.py) is loaded and
     # split into bootstrap/val/test instances. Training still streams fresh instances on the fly (one
     # point each); the splits fit the normalizer + calibrate the sampling range (bootstrap) and measure
-    # generalization (val/test). Epoch length is --steps-per-epoch.
+    # generalization (val/test). Epoch length is --steps_per_epoch.
+    p.add_argument("--dataset_root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load")
     p.add_argument(
-        "--dataset-root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load"
+        "--bootstrap_instances", type=int, default=128, help="bootstrap split size (normalizer + calibration)"
     )
-    p.add_argument("--bootstrap-instances", type=int, default=1024, help="bootstrap split size (normalizer + calibration)")
-    p.add_argument("--n-val-instances", type=int, default=128, help="validation split size")
-    p.add_argument("--n-test-instances", type=int, default=128, help="held-out test split size")
+    p.add_argument("--n_val_instances", type=int, default=128, help="validation split size")
+    p.add_argument("--n_test_instances", type=int, default=128, help="held-out test split size")
     p.add_argument(
-        "--points-per-instance", type=int, default=1, help="cost samples per fixed (bootstrap/val/test) instance"
+        "--points_per_instance",
+        type=int,
+        default=32,
+        help="cost points solved jointly per streamed train instance (also bootstrap density for the "
+        "normalizer fit); val/test always solve each instance once",
     )
     p.add_argument(
-        "--num-workers", type=int, default=8, help="streaming dataloader workers (0 = serial; changes the stream)"
+        "--n_workers", type=int, default=7, help="streaming dataloader workers (0 = serial; changes the stream)"
     )
-    p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
-    p.add_argument("--seed", type=int, default=0, help="global seed")
+    p.add_argument("--noise_scale", type=float, default=0.2, help="multiplicative attribute noise")
+    p.add_argument("--seed", type=int, default=None, help="global seed")
     # domain coverage (see MarkovTrafficEquilibrium.sample_domain): the range is calibrated from the
     # bootstrap split's equilibria -- per-edge mean (center) and std (spread) -- and sampled within
-    # --sample-stds sigma of that mean. --equilibrium-margin/--equilibrium-spread are the uncalibrated
+    # --sample_stds sigma of that mean. --equilibrium_margin/--equilibrium_spread are the uncalibrated
     # fallback only (used when a family is built without a calibrated range, e.g. the sandbox).
     p.add_argument(
-        "--sample-stds", type=float, default=3.0, help="sigma radius of the equilibrium ball sample_domain draws from"
+        "--sample_stds", type=float, default=3.0, help="sigma radius of the equilibrium ball sample_domain draws from"
     )
     p.add_argument(
-        "--equilibrium-margin", type=float, default=2.5, help="uncalibrated fallback: reference-equilibrium ceiling widen"
+        "--equilibrium_margin",
+        type=float,
+        default=2.5,
+        help="uncalibrated fallback: reference-equilibrium ceiling widen",
     )
-    p.add_argument(
-        "--equilibrium-spread", type=float, default=0.2, help="uncalibrated fallback: multiplicative spread"
-    )
+    p.add_argument("--equilibrium_spread", type=float, default=0.2, help="uncalibrated fallback: multiplicative spread")
     # model
     p.add_argument("--dim", type=int, default=128, help="Graphormer hidden dim")
-    p.add_argument("--n-heads", type=int, default=4, help="attention heads")
-    p.add_argument("--n-layers", type=int, default=6, help="encoder layers")
-    p.add_argument("--dim-ff", type=int, default=256, help="feed-forward dim")
+    p.add_argument("--n_heads", type=int, default=4, help="attention heads")
+    p.add_argument("--n_layers", type=int, default=6, help="encoder layers")
+    p.add_argument("--dim_ff", type=int, default=256, help="feed-forward dim")
     p.add_argument(
         "--dropout", type=float, default=0.0, help="dropout (0: streaming can't overfit, so don't regularize)"
     )
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
-    p.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate")
+    p.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
     p.add_argument(
-        "--weight-decay",
+        "--weight_decay",
         type=float,
         default=0.0,
         help="AdamW weight decay (0: no overfitting to regularize under streaming)",
     )
-    p.add_argument("--start-factor", type=float, default=0.01, help="linear warmup start factor")
-    p.add_argument("--warmup-epochs", type=int, default=50, help="linear warmup epochs (must be < --epochs)")
-    p.add_argument("--cosine-annealing", type=int, default=1, help="cosine-anneal after warmup (0 disables)")
-    p.add_argument("--gradient-clip-val", type=float, default=1.0, help="gradient-norm clip value")
+    p.add_argument("--start_factor", type=float, default=0.01, help="linear warmup start factor")
+    p.add_argument("--warmup_epochs", type=int, default=50, help="linear warmup epochs (must be < --epochs)")
+    p.add_argument("--cosine_annealing", type=int, default=1, help="cosine-anneal after warmup (0 disables)")
+    p.add_argument("--gradient_clip_val", type=float, default=1.0, help="gradient-norm clip value")
     p.add_argument("--epochs", type=int, default=400, help="training epochs")
     p.add_argument(
-        "--steps-per-epoch", type=int, default=64, help="train batches per epoch (bounds the infinite stream)"
+        "--steps_per_epoch", type=int, default=64, help="train batches per epoch (bounds the infinite stream)"
     )
     p.add_argument("--batch", type=int, default=128, help="minibatch size")
     # early stopping on the field relative error (no MAPE here -- we regress the operator field)
-    p.add_argument("--patience-epochs", type=int, default=40, help="early-stopping patience in epochs")
-    p.add_argument("--val-every-n-epochs", type=int, default=1, help="run validation every N epochs")
+    p.add_argument("--patience_epochs", type=int, default=40, help="early-stopping patience in epochs")
+    p.add_argument("--val_every_n_epochs", type=int, default=10, help="run validation every N epochs")
     # logging (ported from markov-traffic-eq/scripts/self_supervised.py)
     p.add_argument(
         "--logger",
@@ -115,7 +121,7 @@ def build_parser():
         "--algos",
         nargs="*",
         choices=list(ALGORITHMS),
-        default=["projection", "consensus"],
+        default=["projection"],
         help="dynamics algorithms rolled out on the learned field each val epoch, logging the analytic "
         "endpoint residual val/{algo}/residual (pass --algos with no value for fast field-only training)",
     )
@@ -123,12 +129,14 @@ def build_parser():
     # at a ~8e-2 residual floor even on the true operator; h=0.02/1000 converges to ~1e-6 on every
     # val instance, so the learned-field residual is measured against a reachable target.
     p.add_argument("--h", type=float, default=0.02, help="algorithm step size (damped fixed point)")
-    p.add_argument("--n-steps", type=int, default=1000, help="iterations for the rollout")
+    p.add_argument("--n_steps", type=int, default=1000, help="iterations for the rollout")
     return p
 
 
 def main(args):
     # workers=True makes Lightning seed each streaming dataloader worker distinctly & reproducibly.
+    if args.seed is None:
+        args.seed = torch.randint(0, 2**31 - 1, (1,)).item()
     L.seed_everything(args.seed, workers=True)
     # Load the cached solved instances and split them into bootstrap/val/test. The bootstrap split's
     # equilibria calibrate the streaming sampling range (per-edge mean + std); the calibrated tensors
@@ -136,7 +144,7 @@ def main(args):
     dataset = SolvedInstanceDataset(args.dataset_root)
     instances = list(dataset)
     bootstrap_inst, val_inst, test_inst = split_instances(
-        instances, (args.bootstrap_instances, args.n_val_instances, args.n_test_instances), args.seed
+        instances, (args.bootstrap_instances, args.n_val_instances, args.n_test_instances)
     )
     reference_equilibrium, reference_spread = MarkovTrafficEquilibrium.calibrate_range(bootstrap_inst)
     # A picklable factory (base graph + calibrated tensors) the streaming dataset ships to each worker,
@@ -214,9 +222,9 @@ def main(args):
         enable_checkpointing=False,
         enable_model_summary=False,
         callbacks=rollouts + [early_stop],
-        gradient_clip_val=args.gradient_clip_val,
+        gradient_clip_val=args.gradient_clip_val or None,
         check_val_every_n_epoch=args.val_every_n_epochs,
-        # The train stream is unbounded (no __len__), so cap the epoch at --steps-per-epoch; the
+        # The train stream is unbounded (no __len__), so cap the epoch at --steps_per_epoch; the
         # epoch-based cosine schedule (over --epochs) counts these bounded epochs.
         limit_train_batches=args.steps_per_epoch,
         inference_mode="consensus" not in args.algos,  # only consensus' rollout jacrev needs autograd in validation
@@ -226,9 +234,12 @@ def main(args):
         DataLoader(
             train_ds,
             batch_size=args.batch,
-            num_workers=args.num_workers,
-            persistent_workers=args.num_workers > 0,
+            num_workers=args.n_workers,
+            persistent_workers=args.n_workers > 0,
             collate_fn=collate,
+            # Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe
+            # the cores and thrash, causing bursty/stalling batch delivery.
+            worker_init_fn=lambda _worker_id: torch.set_num_threads(1),
         ),
         DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
     )

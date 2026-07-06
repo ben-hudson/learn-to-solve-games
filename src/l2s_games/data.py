@@ -203,9 +203,10 @@ class StreamingFieldDataset(IterableDataset):
     call site (the Trainer installs the per-worker seeding); this dataset owns no seeding of its own.
     """
 
-    def __init__(self, family_factory, normalizer):
+    def __init__(self, family_factory, normalizer, points_per_instance):
         self.family_factory = family_factory
         self.normalizer = normalizer
+        self.points_per_instance = points_per_instance
 
     def __iter__(self):
         # Built once per __iter__ (~once per worker per epoch), not per sample; the per-epoch rebuild
@@ -213,20 +214,24 @@ class StreamingFieldDataset(IterableDataset):
         family = self.family_factory()
         transform = family.transform
         while True:
-            (raw, target), = _solve_instance(family, family.sample_params(), 1)
-            yield _normalize_example(raw, target, transform, self.normalizer)
+            # One joint operator solve per fresh instance yields points_per_instance examples,
+            # amortizing the expensive route-choice solve over that many training points.
+            examples = _solve_instance(family, family.sample_params(), self.points_per_instance)
+            for raw, target in examples:
+                yield _normalize_example(raw, target, transform, self.normalizer)
 
 
-def split_instances(instances, counts, seed):
+def split_instances(instances, counts):
     """Split a flat list of instances into disjoint sublists of sizes ``counts`` (reproducibly).
 
     A cache larger than ``sum(counts)`` is allowed -- the leftover is randomly held out and dropped.
+    Reproducibility comes from the global RNG (seed via ``lightning.seed_everything`` at the call
+    site); this function owns no seeding of its own.
     """
     counts = list(counts)
     remainder = len(instances) - sum(counts)
     assert remainder >= 0, f"need {sum(counts)} instances but the cache has only {len(instances)}"
-    generator = torch.Generator().manual_seed(seed)
-    subsets = random_split(instances, counts + [remainder], generator=generator)
+    subsets = random_split(instances, counts + [remainder])
     return [[instances[i] for i in subset.indices] for subset in subsets[: len(counts)]]
 
 
@@ -238,16 +243,19 @@ def build_streaming_dataset(family_factory, bootstrap_instances, val_instances, 
     (calibrated) ``sample_domain`` + ``operator``. The normalizer is fit once on the **bootstrap**
     examples, then frozen and shared with the stream and the fixed val/test splits -- preserving the
     fit-on-a-fixed-sample invariant while training draws unbounded fresh instances. Val/test stay
-    fixed so their metrics are stable across epochs. Pair with ``collate_examples(family)`` for the
-    DataLoaders.
+    fixed so their metrics are stable across epochs. ``points_per_instance`` drives the train stream
+    (points solved jointly per fresh instance) and the bootstrap density; val/test always solve each
+    instance once -- the equilibrium rollout depends only on the instance, so extra points there just
+    repeat identical rollouts. Pair with ``collate_examples(family)`` for the DataLoaders.
     """
     family = family_factory()
-    bootstrap, val, test = (
-        _examples_for_instances(family, instances, points_per_instance)
-        for instances in (bootstrap_instances, val_instances, test_instances)
-    )
+    bootstrap = _examples_for_instances(family, bootstrap_instances, points_per_instance)
+    # Solve each fixed val/test instance once: the rollout residual is a function of the instance
+    # alone (the sampled cost point is overwritten by the rollout state), so >1 point is redundant.
+    val = _examples_for_instances(family, val_instances, 1)
+    test = _examples_for_instances(family, test_instances, 1)
     normalizer = _fit_normalizer(family, bootstrap)
-    train_ds = StreamingFieldDataset(family_factory, normalizer)
+    train_ds = StreamingFieldDataset(family_factory, normalizer, points_per_instance)
     val_ds, test_ds = (FieldDataset(split, family.transform, normalizer) for split in (val, test))
     # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
     bootstrap_ds = FieldDataset(bootstrap, family.transform, normalizer)
