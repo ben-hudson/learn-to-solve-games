@@ -9,7 +9,7 @@ one network represents the operator across a family of noised SiouxFalls instanc
 Training data is **streamed**: every step draws a fresh instance (one cost point each), solving the
 operator for its target inside ``DataLoader`` workers -- so the model sees unbounded instance
 diversity rather than a fixed set (see ``data.build_streaming_dataset`` / ``StreamingFieldDataset``).
-The normalizer is fit once on a fixed bootstrap set (``--n-instances``); validation/test stay fixed.
+The normalizer is fit once on a fixed bootstrap set (``--bootstrap-instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
 every algorithm in ``--algos`` -- the analytic residual ``||costs - bpr(demand_flow(-costs))||`` at
@@ -44,13 +44,17 @@ torch.set_float32_matmul_precision("medium")
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # dataset (each sample is a route-choice solve, so keep points-per-instance modest)
-    # Training streams fresh instances on the fly (one point each); --n-instances only sizes the fixed
-    # bootstrap set the normalizer is fit on (and the epoch length, see limit_train_batches below).
-    p.add_argument("--n-instances", type=int, default=64, help="bootstrap instances (fit normalizer; size epoch)")
-    p.add_argument("--n-val-instances", type=int, default=16, help="validation instances (fixed)")
-    p.add_argument("--n-test-instances", type=int, default=16, help="held-out test instances (fixed)")
-    p.add_argument("--points-per-instance", type=int, default=32, help="cost samples per fixed (bootstrap/val/test) instance")
-    p.add_argument("--num-workers", type=int, default=4, help="streaming dataloader workers (0 = serial; changes the stream)")
+    # Training streams fresh instances on the fly (one point each); the fixed sets below only fit the
+    # normalizer (bootstrap) and measure generalization (val/test). Epoch length is --steps-per-epoch.
+    p.add_argument("--bootstrap-instances", type=int, default=1024, help="fixed instances the normalizer is fit on")
+    p.add_argument("--n-val-instances", type=int, default=128, help="validation instances (fixed)")
+    p.add_argument("--n-test-instances", type=int, default=128, help="held-out test instances (fixed)")
+    p.add_argument(
+        "--points-per-instance", type=int, default=1, help="cost samples per fixed (bootstrap/val/test) instance"
+    )
+    p.add_argument(
+        "--num-workers", type=int, default=8, help="streaming dataloader workers (0 = serial; changes the stream)"
+    )
     p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
     p.add_argument("--seed", type=int, default=0, help="global seed")
     # domain coverage (see MarkovTrafficEquilibrium.sample_domain): samples fill the path from the
@@ -65,29 +69,31 @@ def build_parser():
     p.add_argument(
         "--equilibrium-spread", type=float, default=0.2, help="multiplicative spread off the fft->equilibrium path"
     )
-    # the operator is heavy-tailed (BPR blows up at low costs); clip the standardized target to
-    # +-this many sigma so a few outliers don't dominate the MSE fit -- the equilibrium F=0 is kept.
-    p.add_argument(
-        "--target-clip",
-        type=float,
-        default=300.0,
-        help="cap the real-unit field's L2 norm, direction-preserving (0 disables)",
-    )
     # model
     p.add_argument("--dim", type=int, default=128, help="Graphormer hidden dim")
     p.add_argument("--n-heads", type=int, default=4, help="attention heads")
-    p.add_argument("--n-layers", type=int, default=4, help="encoder layers")
-    p.add_argument("--dim-ff", type=int, default=128, help="feed-forward dim")
-    p.add_argument("--dropout", type=float, default=0.2, help="dropout")
+    p.add_argument("--n-layers", type=int, default=6, help="encoder layers")
+    p.add_argument("--dim-ff", type=int, default=256, help="feed-forward dim")
+    p.add_argument(
+        "--dropout", type=float, default=0.0, help="dropout (0: streaming can't overfit, so don't regularize)"
+    )
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
     p.add_argument("--lr", type=float, default=2e-4, help="AdamW learning rate")
-    p.add_argument("--weight-decay", type=float, default=1e-2, help="AdamW weight decay")
+    p.add_argument(
+        "--weight-decay",
+        type=float,
+        default=0.0,
+        help="AdamW weight decay (0: no overfitting to regularize under streaming)",
+    )
     p.add_argument("--start-factor", type=float, default=0.01, help="linear warmup start factor")
     p.add_argument("--warmup-epochs", type=int, default=50, help="linear warmup epochs (must be < --epochs)")
     p.add_argument("--cosine-annealing", type=int, default=1, help="cosine-anneal after warmup (0 disables)")
     p.add_argument("--gradient-clip-val", type=float, default=1.0, help="gradient-norm clip value")
     p.add_argument("--epochs", type=int, default=400, help="training epochs")
-    p.add_argument("--batch", type=int, default=32, help="minibatch size")
+    p.add_argument(
+        "--steps-per-epoch", type=int, default=64, help="train batches per epoch (bounds the infinite stream)"
+    )
+    p.add_argument("--batch", type=int, default=128, help="minibatch size")
     # early stopping on the field relative error (no MAPE here -- we regress the operator field)
     p.add_argument("--patience-epochs", type=int, default=40, help="early-stopping patience in epochs")
     p.add_argument("--val-every-n-epochs", type=int, default=1, help="run validation every N epochs")
@@ -105,8 +111,9 @@ def build_parser():
         "--algos",
         nargs="*",
         choices=list(ALGORITHMS),
-        default=[],
-        help="dynamics algorithms swept in validation (pass none for fast field-only training)",
+        default=["projection", "consesus"],
+        help="dynamics algorithms rolled out on the learned field each val epoch, logging the analytic "
+        "endpoint residual val/{algo}/residual (pass --algos with no value for fast field-only training)",
     )
     # h=0.05 sits above the stability threshold for the stiffer instances -- simGD then oscillates
     # at a ~8e-2 residual floor even on the true operator; h=0.02/1000 converges to ~1e-6 on every
@@ -132,11 +139,10 @@ def main(args):
     family = family_factory()
     (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_dataset(
         family_factory,
-        args.n_instances,
+        args.bootstrap_instances,
         args.n_val_instances,
         args.n_test_instances,
         args.points_per_instance,
-        target_clip=args.target_clip or None,
     )
     print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
@@ -165,10 +171,10 @@ def main(args):
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
     # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
     rollouts = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
-    # Stop when the field relative error stops improving; tolerant like the source setup (a rollout
-    # can log a non-finite residual without aborting the run).
+    # Stop when the val loss stops improving; tolerant like the source setup (a rollout can log a
+    # non-finite residual without aborting the run). cos_err/mag_ratio are reported as diagnostics.
     early_stop = EarlyStopping(
-        monitor="val_rel_err",
+        monitor="val/mse",
         mode="min",
         patience=max(1, args.patience_epochs // args.val_every_n_epochs),
         check_finite=False,
@@ -196,9 +202,9 @@ def main(args):
         callbacks=rollouts + [early_stop],
         gradient_clip_val=args.gradient_clip_val,
         check_val_every_n_epoch=args.val_every_n_epochs,
-        # The train stream is unbounded (no __len__), so cap the epoch; keep it ~the old fixed-set size
-        # so the epoch-based cosine schedule stays meaningful.
-        limit_train_batches=max(1, (args.n_instances * args.points_per_instance) // args.batch),
+        # The train stream is unbounded (no __len__), so cap the epoch at --steps-per-epoch; the
+        # epoch-based cosine schedule (over --epochs) counts these bounded epochs.
+        limit_train_batches=args.steps_per_epoch,
         inference_mode="consensus" not in args.algos,  # only consensus' rollout jacrev needs autograd in validation
     )
     trainer.fit(

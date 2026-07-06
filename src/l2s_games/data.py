@@ -23,8 +23,6 @@ import torch
 from torch import Tensor
 from torch.utils.data import Dataset, IterableDataset, default_collate
 
-from l2s_games.transforms import NormClip
-
 
 @dataclass(frozen=True)
 class Standardizer:
@@ -49,29 +47,45 @@ class Standardizer:
 
 
 @dataclass(frozen=True)
+class AsinhScaler:
+    """Odd, zero-preserving tail compressor for the heavy-tailed operator field.
+
+    ``transform(y) = asinh(y / scale)``; ``inverse_transform(z) = scale * sinh(z)``. It is ~linear
+    near 0 (so the equilibrium ``F = 0`` and small-field fidelity are preserved: ``0 -> 0``) and
+    logarithmic for ``|y| >> scale`` (so BPR's blow-up tail is smoothly compressed rather than
+    hard-clipped). ``scale`` is a single *global* robust magnitude (median ``|y|``) fit on the train
+    split, which sets where the linear->log knee sits. It is deliberately **global (isotropic), not
+    per-edge**: an isotropic scale preserves the field's direction and cross-edge relative magnitude
+    (what the dynamics act on), whereas a per-edge scale would warp the field's geometry; and
+    **scale-only (no mean)**, so the equilibrium zero is untouched. Smooth and invertible, so it stays
+    jacrev-transparent in the inference field.
+    """
+
+    scale: Tensor
+
+    @classmethod
+    def fit(cls, y):
+        # one global typical magnitude; median is robust to the blow-up tail we compress
+        scale = y.abs().median()
+        return cls(scale if scale > 0 else torch.ones_like(scale))
+
+    def transform(self, y):
+        return torch.asinh(y / self.scale)
+
+    def inverse_transform(self, z):
+        return self.scale * torch.sinh(z)
+
+
+@dataclass(frozen=True)
 class Normalizer:
-    """The fitted feats/target standardizers the model trains and predicts through."""
+    """The fitted feats standardizer and target scaler the model trains and predicts through."""
 
     input: Standardizer
-    target: Standardizer
-    clip: NormClip | None = None
-
-    def clip_field(self, y):
-        """Norm-clip a **real-unit** field (identity when clipping is disabled)."""
-        return y if self.clip is None else self.clip(y)
+    target: AsinhScaler
 
     def transform_target(self, y):
-        """Clip the real-unit target's norm, then standardize it.
-
-        The traffic operator is heavy-tailed: at low costs (near the free-flow-time floor) BPR's
-        power term makes the residual blow up to ~100× the typical magnitude, so a handful of
-        outliers dominate an MSE fit. Clipping the field's *norm* (see ``NormClip``) saturates those
-        blow-ups without rotating the field, so the model learns the operator's true direction; the
-        equilibrium ``F = 0`` is untouched. The clip is applied in real units *before* standardizing
-        so it is a scalar scaling of the field -- de-standardizing at inference recovers that same
-        direction.
-        """
-        return self.target.transform(self.clip_field(y))
+        """Compress the heavy-tailed real-unit target into the network's regression space (asinh)."""
+        return self.target.transform(y)
 
     def inverse_target(self, y):
         return self.target.inverse_transform(y)
@@ -149,23 +163,19 @@ def _examples_for_instances(family, instances, points_per_instance):
     return [example for params in instances for example in _solve_instance(family, params, points_per_instance)]
 
 
-def _fit_normalizer(family, examples, target_clip):
-    """Fit feats/target standardizers on the (transformed) train examples.
+def _fit_normalizer(family, examples):
+    """Fit the feats standardizer and the target scaler on the (transformed) train examples.
 
-    The target standardizer is fit on the **clipped** targets -- the same tensor the model regresses
-    (``transform_target`` standardizes ``clip(y)``), so the fitted std matches the target's true
-    dynamic range. Fitting on the unclipped targets instead lets the heavy BPR tail inflate std, so
-    the clipped target divides down to ~0 and the model gets no signal.
+    Feats are per-feature standardized; the target is asinh-compressed with a per-edge robust scale
+    (see ``AsinhScaler``) so the heavy BPR tail is tamed at fit time without a hard clip.
     """
     transform = family.transform
     feats = torch.stack([transform(_clone(raw))["feats"] for raw, _ in examples])
     targets = torch.stack([target for _, target in examples])
-    clip = NormClip(target_clip) if target_clip else None
-    clipped_targets = clip(targets) if clip else targets
-    return Normalizer(Standardizer.fit(feats), Standardizer.fit(clipped_targets), clip)
+    return Normalizer(Standardizer.fit(feats), AsinhScaler.fit(targets))
 
 
-def build_dataset(family, n_train, n_val, n_test, points_per_instance, target_clip=None):
+def build_dataset(family, n_train, n_val, n_test, points_per_instance):
     """Train/val/test ``FieldDataset``s plus the fitted ``Normalizer``.
 
     The normalizer is fit on the train split and shared with all three, so val/test contribute no
@@ -176,7 +186,7 @@ def build_dataset(family, n_train, n_val, n_test, points_per_instance, target_cl
         _examples_for_instances(family, [family.sample_params() for _ in range(n)], points_per_instance)
         for n in (n_train, n_val, n_test)
     ]
-    normalizer = _fit_normalizer(family, splits[0], target_clip)
+    normalizer = _fit_normalizer(family, splits[0])
     datasets = tuple(FieldDataset(split, family.transform, normalizer) for split in splits)
     return datasets, normalizer
 
@@ -207,12 +217,12 @@ class StreamingFieldDataset(IterableDataset):
             yield _normalize_example(raw, target, transform, self.normalizer)
 
 
-def build_streaming_dataset(family_factory, n_bootstrap, n_val, n_test, points_per_instance, target_clip=None):
+def build_streaming_dataset(family_factory, n_bootstrap, n_val, n_test, points_per_instance):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
 
-    The normalizer (+clip) is fit once on a fixed **bootstrap** set of freshly-solved instances, then
-    frozen and shared with the stream and the fixed val/test splits -- preserving the fit-on-a-fixed-
-    sample invariant while training draws unbounded fresh instances. Val/test stay pre-solved so their
+    The normalizer is fit once on a fixed **bootstrap** set of freshly-solved instances, then frozen
+    and shared with the stream and the fixed val/test splits -- preserving the fit-on-a-fixed-sample
+    invariant while training draws unbounded fresh instances. Val/test stay pre-solved so their
     metrics are stable across epochs. Pair with ``collate_examples(family)`` for the DataLoaders.
     """
     family = family_factory()
@@ -220,7 +230,7 @@ def build_streaming_dataset(family_factory, n_bootstrap, n_val, n_test, points_p
         _examples_for_instances(family, [family.sample_params() for _ in range(n)], points_per_instance)
         for n in (n_bootstrap, n_val, n_test)
     )
-    normalizer = _fit_normalizer(family, bootstrap, target_clip)
+    normalizer = _fit_normalizer(family, bootstrap)
     train_ds = StreamingFieldDataset(family_factory, normalizer)
     val_ds, test_ds = (FieldDataset(split, family.transform, normalizer) for split in (val, test))
     # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
