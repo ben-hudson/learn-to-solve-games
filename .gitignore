@@ -217,6 +217,7 @@ CLAUDE.md
 .claude/
 
 wandb/
-milascripts/
 results/
 checkpoints/
+datasets/
+raw_data/
