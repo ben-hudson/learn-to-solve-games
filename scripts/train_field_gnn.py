@@ -6,6 +6,10 @@ each road edge's features ``[cost, free_flow_time, capacity, b, power, +4 demand
 the line-graph structure to the per-edge operator value ``costs - bpr(demand_flow(-costs))`` -- so
 one network represents the operator across a family of noised SiouxFalls instances.
 
+``--model`` selects the architecture: ``graphormer`` (line-graph attention) or ``mlp`` -- a
+whole-graph flat baseline that flattens the fixed network's per-edge feats and predicts every edge
+jointly (no graph inductive bias), for benchmarking how much the Graphormer's structure buys.
+
 Training data is **streamed**: every step draws a fresh instance and solves the operator jointly for
 ``--points_per_instance`` cost points inside ``DataLoader`` workers (one solve amortized over that
 many training examples) -- so the model sees unbounded instance diversity rather than a fixed set
@@ -36,7 +40,7 @@ from l2s_games.callbacks import EquilibriumRolloutCallback
 from l2s_games.data import build_streaming_dataset, collate_examples, split_instances
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
-from l2s_games.models import GraphormerFieldModel
+from l2s_games.models import GraphormerFieldModel, MLPFieldModel
 
 torch.set_float32_matmul_precision("medium")
 
@@ -80,21 +84,22 @@ def build_parser():
     )
     p.add_argument("--equilibrium_spread", type=float, default=0.2, help="uncalibrated fallback: multiplicative spread")
     # model
-    p.add_argument("--dim", type=int, default=128, help="Graphormer hidden dim")
-    p.add_argument("--n_heads", type=int, default=4, help="attention heads")
-    p.add_argument("--n_layers", type=int, default=6, help="encoder layers")
-    p.add_argument("--dim_ff", type=int, default=256, help="feed-forward dim")
     p.add_argument(
-        "--dropout", type=float, default=0.0, help="dropout (0: streaming can't overfit, so don't regularize)"
+        "--model",
+        choices=["graphormer", "mlp"],
+        default="graphormer",
+        help="architecture: 'graphormer' (line-graph attention) or 'mlp' (whole-graph flat baseline: "
+        "the fixed network's per-edge feats are flattened and every edge is predicted jointly, no "
+        "graph inductive bias)",
     )
+    p.add_argument("--dim", type=int, default=128, help="hidden dim")
+    p.add_argument("--n_heads", type=int, default=4, help="attention heads (graphormer only)")
+    p.add_argument("--n_layers", type=int, default=6, help="layers")
+    p.add_argument("--dim_ff", type=int, default=256, help="feed-forward dim (graphormer only)")
+    # No --dropout / --weight_decay: the streaming pipeline sees a fresh instance every step, so it
+    # can't overfit -- both are hardcoded to 0 (no regularization) at model construction.
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
     p.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
-    p.add_argument(
-        "--weight_decay",
-        type=float,
-        default=0.0,
-        help="AdamW weight decay (0: no overfitting to regularize under streaming)",
-    )
     p.add_argument("--start_factor", type=float, default=0.01, help="linear warmup start factor")
     p.add_argument("--warmup_epochs", type=int, default=50, help="linear warmup epochs (must be < --epochs)")
     p.add_argument("--cosine_annealing", type=int, default=1, help="cosine-anneal after warmup (0 disables)")
@@ -171,23 +176,40 @@ def main(args):
     # Size the model from one transformed bootstrap example (line-graph structure + feature width);
     # the train stream is iterable, so it cannot be indexed.
     sample, _ = bootstrap_ds[0]
-    model = GraphormerFieldModel(
-        n_feats=sample["feats"].shape[-1],
-        in_degree=sample["in_degree"],
-        out_degree=sample["out_degree"],
-        spd=sample["spd"],
-        lr=args.lr,
-        normalizer=normalizer,
-        weight_decay=args.weight_decay,
-        start_factor=args.start_factor,
-        warmup_epochs=args.warmup_epochs,
-        cosine_annealing=bool(args.cosine_annealing),
-        dim=args.dim,
-        n_heads=args.n_heads,
-        n_layers=args.n_layers,
-        dim_ff=args.dim_ff,
-        dropout=args.dropout,
-    )
+    if args.model == "graphormer":
+        model = GraphormerFieldModel(
+            n_feats=sample["feats"].shape[-1],
+            in_degree=sample["in_degree"],
+            out_degree=sample["out_degree"],
+            spd=sample["spd"],
+            lr=args.lr,
+            normalizer=normalizer,
+            weight_decay=0.0,
+            start_factor=args.start_factor,
+            warmup_epochs=args.warmup_epochs,
+            cosine_annealing=bool(args.cosine_annealing),
+            dim=args.dim,
+            n_heads=args.n_heads,
+            n_layers=args.n_layers,
+            dim_ff=args.dim_ff,
+            dropout=0.0,
+        )
+    else:
+        # Whole-graph flat baseline: flatten the fixed network's per-edge feats [E, k] to one vector
+        # and predict every edge jointly (out_features = E), reusing --dim / --n_layers for a uniform
+        # hidden stack.
+        model = MLPFieldModel(
+            in_features=sample["feats"].numel(),  # E * k
+            hidden=[args.dim] * args.n_layers,
+            out_features=sample["feats"].shape[0],  # E
+            flatten_start_dim=1,  # collapse per-edge feats [B, E, k] -> [B, E*k]
+            lr=args.lr,
+            normalizer=normalizer,
+            weight_decay=0.0,
+            start_factor=args.start_factor,
+            warmup_epochs=args.warmup_epochs,
+            cosine_annealing=bool(args.cosine_annealing),
+        )
     collate = collate_examples(family)
     # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
@@ -214,7 +236,6 @@ def main(args):
         logger = CSVLogger(save_dir=save_dir)
     trainer = L.Trainer(
         max_epochs=args.epochs,
-        accelerator="gpu",
         num_sanity_val_steps=0,
         logger=logger,
         default_root_dir=save_dir,

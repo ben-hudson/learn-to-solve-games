@@ -47,8 +47,10 @@ class FieldModel(L.LightningModule):
         Both are computed per point over the edge axis (the R^E field vector the dynamics step along),
         averaged over points whose true field is non-degenerate (``‖true‖`` above a floor -- the
         direction of a ~zero vector, right at equilibrium, is undefined). Returns ``(cos_err,
-        mag_ratio)``: ``cos_err = mean(1 - cos(pred, true))`` (0 = aligned) and ``mag_ratio =
-        mean(‖pred‖/‖true‖)`` (1 = right scale), since cosine is magnitude-blind.
+        mag_err)``, which isolate the two failure modes: ``cos_err = mean(1 - cos(pred, true))``
+        (0 = aligned) is the pure angle error, and ``mag_err = mean(|‖pred‖ - ‖true‖|)`` (0 = right
+        scale, in real field units) is the pure magnitude error -- the absolute gap in field length,
+        which cosine (magnitude-blind) does not capture.
         """
         pred = self.normalizer.inverse_target(prediction)
         true = self.normalizer.inverse_target(targets)
@@ -57,8 +59,8 @@ class FieldModel(L.LightningModule):
         keep = true_norm > 1e-6 * true_norm.mean()
         cos = (pred * true).sum(dim=-1) / (pred_norm * true_norm).clamp(min=1e-12)
         cos_err = (1.0 - cos)[keep].mean()
-        mag_ratio = (pred_norm / true_norm.clamp(min=1e-12))[keep].mean()
-        return cos_err, mag_ratio
+        mag_err = (pred_norm - true_norm).abs()[keep].mean()
+        return cos_err, mag_err
 
     def training_step(self, batch, _):
         inputs, targets = batch
@@ -73,10 +75,10 @@ class FieldModel(L.LightningModule):
         inputs, targets = batch
         batch_size = targets.shape[0]
         prediction = self(inputs)
-        cos_err, mag_ratio = self._field_metrics(prediction, targets)
+        cos_err, mag_err = self._field_metrics(prediction, targets)
         self.log("val/mse", self.loss_fn(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log("val/cos_err", cos_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
-        self.log("val/mag_ratio", mag_ratio, on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log("val/mag_err", mag_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
 
     def configure_optimizers(self):
         # AdamW with linear warmup then cosine annealing (ported from markov-traffic-eq): the flat lr
