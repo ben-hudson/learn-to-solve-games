@@ -80,6 +80,16 @@ class FieldModel(L.LightningModule):
         self.log("val/cos_err", cos_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log("val/mag_err", mag_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
 
+    def on_save_checkpoint(self, checkpoint):
+        # The normalizer is a fitted dataclass of tensors (not a parameter/buffer), so it is not in
+        # state_dict; stash it here so a checkpoint is self-contained -- inference/analysis can
+        # de-standardize predictions without re-deriving it from the seed + bootstrap split.
+        checkpoint["normalizer"] = self.normalizer
+
+    def on_load_checkpoint(self, checkpoint):
+        if checkpoint.get("normalizer") is not None:
+            self.normalizer = checkpoint["normalizer"]
+
     def configure_optimizers(self):
         # AdamW with linear warmup then cosine annealing (ported from markov-traffic-eq): the flat lr
         # bounced near convergence, and warmup stabilizes the transformer's early steps. Warmup ramps

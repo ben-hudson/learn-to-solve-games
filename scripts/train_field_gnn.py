@@ -31,7 +31,7 @@ import os
 import lightning as L
 import torch
 import wandb
-from lightning.pytorch.callbacks import EarlyStopping
+from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
@@ -214,16 +214,19 @@ def main(args):
     # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
     # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
-    rollouts = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
+    callbacks = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
     # Stop when the val loss stops improving; tolerant like the source setup (a rollout can log a
     # non-finite residual without aborting the run). cos_err/mag_ratio are reported as diagnostics.
-    early_stop = EarlyStopping(
-        monitor="val/mse",
-        mode="min",
-        patience=max(1, args.patience_epochs // args.val_every_n_epochs),
-        check_finite=False,
-        strict=False,
+    callbacks.append(
+        EarlyStopping(
+            monitor="val/mse",
+            mode="min",
+            patience=max(1, args.patience_epochs // args.val_every_n_epochs),
+            check_finite=False,
+            strict=False,
+        )
     )
+
     save_dir = os.getenv("SCRATCH", ".")
     if args.debug:
         logger = None
@@ -234,15 +237,24 @@ def main(args):
         )
     else:
         logger = CSVLogger(save_dir=save_dir)
+    # Save the best (by val/mse) + last checkpoint so a run's weights survive for downstream analysis.
+    # Gated on the logger: debug runs disable checkpointing, and Lightning rejects a ModelCheckpoint
+    # when it's off. No dirpath -- with a logger present Lightning places checkpoints under the
+    # run-namespaced path (<save_dir>/<project>/<run_id>/checkpoints/), so concurrent sweep runs don't
+    # clobber each other. The normalizer rides along in the checkpoint (see FieldModel.on_save_checkpoint),
+    # so the loaded model can de-standardize predictions on its own. filename is fixed (no metric
+    # interpolation -- the "val/mse" key's slash isn't a valid format field).
+    if logger is not None:
+        callbacks.append(ModelCheckpoint(monitor="val/mse", mode="min", save_top_k=1, save_last=True, filename="best"))
     trainer = L.Trainer(
         max_epochs=args.epochs,
         num_sanity_val_steps=0,
         logger=logger,
         default_root_dir=save_dir,
         fast_dev_run=args.debug,
-        enable_checkpointing=False,
+        enable_checkpointing=logger is not None,
         enable_model_summary=False,
-        callbacks=rollouts + [early_stop],
+        callbacks=callbacks,
         gradient_clip_val=args.gradient_clip_val or None,
         check_val_every_n_epoch=args.val_every_n_epochs,
         # The train stream is unbounded (no __len__), so cap the epoch at --steps_per_epoch; the
