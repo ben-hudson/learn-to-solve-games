@@ -3,12 +3,23 @@
 Lives above the model/dynamics/algorithms layers as glue -- keeps ``FieldModel`` free of any
 dynamics dependency (the project pipeline is family -> dataset -> field model -> dynamics). One
 callback runs one algorithm; compose a list to sweep several.
+
+Two more callbacks drive the on-policy rollout training mode (see ``rollout_sampling``):
+``RolloutBufferCallback`` refreshes the training buffer from the current field every few epochs,
+and ``RolloutVizCallback`` logs the rollout + true/learned field visualizations through training.
 """
 
+import os
+
 import lightning as L
+import matplotlib.pyplot as plt
+from lightning.pytorch.loggers import WandbLogger
 
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.dynamics import simulate
+from l2s_games.models import conditioned_field
+from l2s_games.rollout_sampling import rollout_examples
+from l2s_games.viz import plot_trajectory_arrows
 
 
 class EquilibriumRolloutCallback(L.Callback):
@@ -37,3 +48,97 @@ class EquilibriumRolloutCallback(L.Callback):
         traj = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)
         residual = self.family.operator(params, traj[-1]).norm(dim=-1).mean()
         pl_module.log(f"val/{self.algo}/residual", residual, on_epoch=True, batch_size=targets.shape[0])
+
+
+class RolloutBufferCallback(L.Callback):
+    """Refresh the on-policy training buffer from the current field every ``refresh_every`` epochs.
+
+    Holds a fixed pool of training instances and a reference to the train ``FieldDataset``. On the
+    refresh epochs it rolls out the current model's field, samples the operator along the visited
+    states (blended with uniform points; see ``rollout_sampling.rollout_examples``), and overwrites
+    ``train_ds.examples`` in place -- the DataLoader (built ``num_workers=0``) reads the new points
+    next epoch. Epoch 0 trains on the uniform buffer ``build_dataset`` produced, so the field has
+    signal before its own rollouts drive the sampling.
+    """
+
+    def __init__(self, family, train_ds, normalizer, instances, algo, h, n_steps, buffer_size,
+                 blend_uniform_frac, refresh_every):
+        super().__init__()
+        self.family = family
+        self.train_ds = train_ds
+        self.normalizer = normalizer
+        self.instances = instances
+        self.algo = algo
+        self.h = h
+        self.n_steps = n_steps
+        self.buffer_size = buffer_size
+        self.blend_uniform_frac = blend_uniform_frac
+        self.refresh_every = refresh_every
+
+    def on_train_epoch_start(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        if epoch == 0 or epoch % self.refresh_every != 0:
+            return
+        self.train_ds.examples = rollout_examples(
+            pl_module, self.family, self.normalizer, self.instances, self.algo,
+            self.h, self.n_steps, self.buffer_size, self.blend_uniform_frac,
+        )
+
+
+class RolloutVizCallback(L.Callback):
+    """Log the rollout trajectory + true/learned operators along it, for fixed instances through training.
+
+    Each validation epoch, for each fixed held-out instance rolls out the learned field and draws one
+    plot over the full domain: the trajectory as a blue line, with the true (crimson) and learned
+    (blue) operators arrowed (magnitude-scaled, shared scale) at ``n_arrows`` points along it (see
+    ``viz.plot_trajectory_arrows``). Both fields are shown because a lookahead/momentum algorithm does
+    not step straight along the learned field, so the trajectory tangent isn't the learned direction.
+    Logged as ``viz/rollout`` via the Lightning logger when it is wandb (so wandb's step bookkeeping
+    stays consistent -- never ``experiment.log`` directly), else saved to
+    ``{save_dir}/rollout_viz/epoch_{n}.png``.
+    """
+
+    def __init__(self, family, normalizer, instances, algo, h, n_steps, save_dir, n_arrows=20):
+        super().__init__()
+        self.family = family
+        self.normalizer = normalizer
+        self.instances = instances
+        self.algo = algo
+        self.h = h
+        self.n_steps = n_steps
+        self.save_dir = save_dir
+        self.n_arrows = n_arrows
+        # Fixed random starts, one per instance, so the trajectory across epochs is comparable.
+        self.starts = [family.sample_domain(params, 1)[0] for params in instances]
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        epoch = trainer.current_epoch
+        n = len(self.instances)
+        cols = min(n, 3)
+        rows = -(-n // cols)
+        fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 4.6 * rows), squeeze=False)
+        axes = axes.ravel()
+        for ax, params, z0 in zip(axes, self.instances, self.starts):
+            true_field = lambda z, p=params: self.family.operator(p, z)
+            learned_field = conditioned_field(pl_module, self.family, params, self.normalizer)
+            project = lambda z, p=params: self.family.project(p, z)
+            traj = simulate(lambda z: -learned_field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)
+            summary = ", ".join(f"p{i}={v:.2f}" for i, v in enumerate(params.tolist()))
+            plot_trajectory_arrows(
+                ax, traj, true_field, learned_field, lim=self.family.lim, n_arrows=self.n_arrows, title=summary
+            )
+            ax.legend(fontsize=8, loc="upper right")
+        for ax in axes[n:]:
+            ax.axis("off")
+        fig.suptitle(f"rollout ({self.algo}): trajectory + true/learned operator -- epoch {epoch}", fontsize=12)
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+
+        if isinstance(trainer.logger, WandbLogger):
+            # Go through the Lightning logger (not experiment.log) so wandb's step counter stays in sync
+            # with the metric logging -- a direct experiment.log desyncs the step and drops points on sync.
+            trainer.logger.log_image(key="viz/rollout", images=[fig], step=trainer.global_step)
+        else:
+            out_dir = os.path.join(self.save_dir, "rollout_viz")
+            os.makedirs(out_dir, exist_ok=True)
+            fig.savefig(os.path.join(out_dir, f"epoch_{epoch:04d}.png"), dpi=110)
+        plt.close(fig)

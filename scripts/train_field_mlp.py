@@ -16,14 +16,16 @@ dynamical system (the same algorithms rolled out on each).
 """
 
 import argparse
+import os
 
 import lightning as L
 import matplotlib.pyplot as plt
 import torch
+from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import EquilibriumRolloutCallback
+from l2s_games.callbacks import EquilibriumRolloutCallback, RolloutBufferCallback, RolloutVizCallback
 from l2s_games.data import build_dataset, collate_examples
 from l2s_games.dynamics import simulate
 from l2s_games.envs import make_game
@@ -51,6 +53,7 @@ def build_parser():
     p.add_argument("--hidden", type=int, nargs="+", default=[128, 128], help="hidden layer widths")
     p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
     p.add_argument("--epochs", type=int, default=60, help="training epochs")
+    p.add_argument("--val-every-n-epochs", type=int, default=10, help="run validation (+ rollout viz) every N epochs")
     p.add_argument("--batch", type=int, default=1024, help="minibatch size")
     # dynamics comparison (same knobs as the sandbox)
     p.add_argument("--h", type=float, default=0.1, help="algorithm step size")
@@ -63,7 +66,45 @@ def build_parser():
         choices=list(ALGORITHMS),
         help="algorithms for the validation residual sweep and the single-instance dynamics plots",
     )
+    # on-policy rollout sampling (see rollout_sampling / callbacks.RolloutBufferCallback)
+    p.add_argument(
+        "--sampling",
+        choices=["uniform", "rollout"],
+        default="uniform",
+        help="'uniform' samples the domain uniformly (baseline); 'rollout' trains on points visited "
+        "by rolling out the current learned field (on-policy), refreshed every --refresh-every epochs",
+    )
+    p.add_argument(
+        "--rollout-algo",
+        choices=list(ALGORITHMS),
+        default="extragradient",
+        help="algorithm rolled out on the learned field to generate on-policy points (also used for the "
+        "rollout viz); it shapes the sampling distribution -- projection spirals on RPS, extragradient/"
+        "consensus converge",
+    )
+    p.add_argument("--refresh-every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
+    p.add_argument(
+        "--blend-uniform-frac", type=float, default=0.3, help="fraction of the buffer drawn uniformly (vs on-policy)"
+    )
+    p.add_argument("--n-rollout-instances", type=int, default=128, help="instances rolled out per buffer refresh")
+    p.add_argument("--n-viz-instances", type=int, default=3, help="held-out instances shown in the rollout viz")
+    # logging (ported from train_field_gnn.py): wandb logs viz as images, csv saves them as PNGs to disk
+    p.add_argument("--logger", choices=["wandb", "csv"], default="csv", help="metrics/viz sink")
+    p.add_argument("--exp", type=str, default=None, help="experiment name (wandb group)")
     return p
+
+
+def build_logger(args, save_dir):
+    """A wandb or csv Lightning logger (replaces the old logger-free run so viz has a sink)."""
+    if args.logger == "wandb":
+        import wandb
+        from lightning.pytorch.loggers import WandbLogger
+
+        return WandbLogger(
+            experiment=wandb.init(project="learn-to-solve-games", group=args.exp, config=vars(args), dir=save_dir),
+            save_dir=save_dir,
+        )
+    return CSVLogger(save_dir=save_dir)
 
 
 # --------------------------------------------------------------------------
@@ -135,15 +176,45 @@ def main(args):
     )
     # Each validation epoch sweeps the algorithms, rolling out the learned field batched over the
     # held-out instances and logging the analytic residual at the endpoint per algorithm.
-    rollouts = [EquilibriumRolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
+    callbacks = [EquilibriumRolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
+
+    save_dir = os.getenv("SCRATCH", ".")
+    logger = build_logger(args, save_dir)
+
+    # On-policy sampling: refresh the training buffer from the current field every --refresh-every
+    # epochs, and log the rollout / true-vs-learned field viz through training. Epoch 0 trains on the
+    # uniform buffer build_dataset produced (below); the buffer callback takes over from --refresh-every.
+    if args.sampling == "rollout":
+        rollout_instances = [game.sample_params() for _ in range(args.n_rollout_instances)]
+        viz_instances = [game.sample_params() for _ in range(args.n_viz_instances)]
+        # The on-policy buffer keeps the same point count as the initial uniform buffer build_dataset
+        # made (n_instances * points_per_instance), so every epoch has the same number of batches.
+        # If the refreshed epochs were shorter, Lightning -- which fixes val_check_batch from epoch 0 --
+        # would never reach the validation batch and would silently skip validation entirely.
+        buffer_size = args.n_instances * args.points_per_instance
+        callbacks.append(
+            RolloutBufferCallback(
+                game, train_ds, normalizer, rollout_instances, args.rollout_algo, args.h, args.n_steps,
+                buffer_size, args.blend_uniform_frac, args.refresh_every,
+            )
+        )
+        if game.domain_dim == 2:
+            callbacks.append(
+                RolloutVizCallback(
+                    game, normalizer, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir,
+                )
+            )
+
     trainer = L.Trainer(
         max_epochs=args.epochs,
         accelerator="cpu",
         num_sanity_val_steps=0,
-        logger=False,
+        logger=logger,
+        default_root_dir=save_dir,
         enable_checkpointing=False,
         enable_model_summary=False,
-        callbacks=rollouts,
+        callbacks=callbacks,
+        check_val_every_n_epoch=args.val_every_n_epochs,
         inference_mode=False,  # validation rolls out consensus, whose grad term needs autograd
     )
     collate = collate_examples(game)
