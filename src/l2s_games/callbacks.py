@@ -23,19 +23,26 @@ from l2s_games.viz import plot_trajectory_arrows
 
 
 class EquilibriumRolloutCallback(L.Callback):
-    """Each validation batch, roll out ``algo`` on the learned field and log its endpoint residual.
+    """Each validation batch, roll out ``algo`` on the learned field and log two endpoint metrics.
 
     The rollout starts from ``family.initial_point`` and is projected onto the feasible set each
-    step; the endpoint's analytic residual ``||operator(params, z)||`` is logged as
-    ``val/{algo}/residual`` (mean over the batch, aggregated over the epoch).
+    step. Logged (mean over the batch, aggregated over the epoch):
+    ``val/{algo}/residual`` -- the analytic operator norm ``||operator(params, z_end)||`` -- and
+    ``val/{algo}/dist_to_eq`` -- the distance ``||z_end - z*||`` from the endpoint to the true
+    equilibrium ``z*``.
+
+    ``equilibrium`` is ``z*``, broadcast over the batch. It defaults to the origin (the Nash-centered
+    chart's equilibrium for the matrix-game scope); the traffic setting will pass its pre-computed
+    per-instance equilibria as a tensor.
     """
 
-    def __init__(self, family, algo, n_steps, h):
+    def __init__(self, family, algo, n_steps, h, equilibrium=0.0):
         super().__init__()
         self.family = family
         self.algo = algo
         self.n_steps = n_steps
         self.h = h
+        self.equilibrium = equilibrium
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         inputs, targets = batch
@@ -46,8 +53,11 @@ class EquilibriumRolloutCallback(L.Callback):
         # consensus' torch.func.grad manages its own grad tracking, so the ambient no-grad is fine;
         # params stay out of autograd (avoids the flash-attention grad-mask kernel error).
         traj = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)
-        residual = self.family.operator(params, traj[-1]).norm(dim=-1).mean()
+        endpoint = traj[-1]
+        residual = self.family.operator(params, endpoint).norm(dim=-1).mean()
+        dist_to_eq = (endpoint - self.equilibrium).norm(dim=-1).mean()
         pl_module.log(f"val/{self.algo}/residual", residual, on_epoch=True, batch_size=targets.shape[0])
+        pl_module.log(f"val/{self.algo}/eq_dist", dist_to_eq, on_epoch=True, batch_size=targets.shape[0])
 
 
 class RolloutBufferCallback(L.Callback):
@@ -61,8 +71,9 @@ class RolloutBufferCallback(L.Callback):
     signal before its own rollouts drive the sampling.
     """
 
-    def __init__(self, family, train_ds, normalizer, instances, algo, h, n_steps, buffer_size,
-                 blend_uniform_frac, refresh_every):
+    def __init__(
+        self, family, train_ds, normalizer, instances, algo, h, n_steps, buffer_size, blend_uniform_frac, refresh_every
+    ):
         super().__init__()
         self.family = family
         self.train_ds = train_ds
@@ -80,8 +91,15 @@ class RolloutBufferCallback(L.Callback):
         if epoch == 0 or epoch % self.refresh_every != 0:
             return
         self.train_ds.examples = rollout_examples(
-            pl_module, self.family, self.normalizer, self.instances, self.algo,
-            self.h, self.n_steps, self.buffer_size, self.blend_uniform_frac,
+            pl_module,
+            self.family,
+            self.normalizer,
+            self.instances,
+            self.algo,
+            self.h,
+            self.n_steps,
+            self.buffer_size,
+            self.blend_uniform_frac,
         )
 
 
@@ -122,7 +140,9 @@ class RolloutVizCallback(L.Callback):
             true_field = lambda z, p=params: self.family.operator(p, z)
             learned_field = conditioned_field(pl_module, self.family, params, self.normalizer)
             project = lambda z, p=params: self.family.project(p, z)
-            traj = simulate(lambda z: -learned_field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)
+            traj = simulate(
+                lambda z: -learned_field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project
+            )
             summary = ", ".join(f"p{i}={v:.2f}" for i, v in enumerate(params.tolist()))
             plot_trajectory_arrows(
                 ax, traj, true_field, learned_field, lim=self.family.lim, n_arrows=self.n_arrows, title=summary
