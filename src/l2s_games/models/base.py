@@ -63,8 +63,12 @@ class FieldModel(L.LightningModule):
         return cos_err, mag_err
 
     def training_step(self, batch, _):
-        inputs, targets = batch
-        prediction = self(inputs)
+        # A train batch is a mapping of named data sources (e.g. {"uniform": ..., "rollout": ...})
+        # to each source's (inputs, targets) -- Lightning's CombinedLoader over one loader per source.
+        # Concatenate every source's prediction + target into one MSE (family-agnostic: this operates
+        # on the model's output tensors, not on the family-specific collated inputs).
+        prediction = torch.cat([self(inputs) for inputs, _ in batch.values()])
+        targets = torch.cat([targets for _, targets in batch.values()])
         loss = self.loss_fn(prediction, targets)
         # Only the loss is logged on train: under the streaming pipeline every batch is a fresh unseen
         # instance, so a train relative error is not a fit signal (it just re-estimates val_rel_err).

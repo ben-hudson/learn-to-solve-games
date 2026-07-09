@@ -101,14 +101,14 @@ def _normalize_example(raw, target, transform, normalizer):
 
     Clones the raw item, applies the family ``transform`` (builds ``feats`` fresh), then standardizes
     ``feats`` and clip-then-standardizes the target. Shared by the map-style ``FieldDataset`` and the
-    streaming ``StreamingFieldDataset`` so both featurize/normalize identically.
+    streaming ``OperatorStream`` subclasses so both featurize/normalize identically.
     """
     item = transform(_clone(raw))
     item["feats"] = normalizer.input.transform(item["feats"])
     return item, normalizer.transform_target(target)
 
 
-class FieldDataset(Dataset):
+class OperatorDataset(Dataset):
     """Lazily featurize + normalize raw ``(input item, target)`` examples.
 
     ``__getitem__`` clones the raw item, applies the family's ``transform`` (builds ``feats`` fresh),
@@ -187,38 +187,58 @@ def build_dataset(family, n_train, n_val, n_test, points_per_instance):
         for n in (n_train, n_val, n_test)
     ]
     normalizer = _fit_normalizer(family, splits[0])
-    datasets = tuple(FieldDataset(split, family.transform, normalizer) for split in splits)
+    datasets = tuple(OperatorDataset(split, family.transform, normalizer) for split in splits)
     return datasets, normalizer
 
 
-class StreamingFieldDataset(IterableDataset):
-    """Infinite stream of freshly-sampled instances: one fresh instance -> one normalized example.
+class OperatorStream(IterableDataset):
+    """Base for an infinite stream of normalized ``(item, target)`` operator examples.
 
-    Each step samples a new instance, one domain point, solves the operator for the target, and yields
-    the same normalized ``(item, target)`` a ``FieldDataset`` would -- so every example is a distinct
-    parametrization and minibatches are maximally diverse. Holds a picklable ``family_factory`` (not a
-    live family) and builds the family -- hence its route-choice solver -- **lazily inside each worker
-    process** on first iteration, so nothing solver-related is pickled across the worker boundary.
-    Reproducible per-worker streams come from ``lightning.seed_everything(seed, workers=True)`` at the
-    call site (the Trainer installs the per-worker seeding); this dataset owns no seeding of its own.
+    Factors the shared seam every source needs: hold a picklable ``family_factory`` (not a live
+    family) and build the family -- hence its route-choice solver -- **lazily inside each worker
+    process** on first iteration, so nothing solver-related is pickled across the worker boundary;
+    then featurize + normalize each raw ``(item, target)`` a subclass produces via ``_raw_stream``,
+    exactly as a ``FieldDataset`` would. Subclasses implement ``_raw_stream(family)`` -- an infinite
+    iterator of raw ``(input item, target)`` pairs -- to define *where* the examples come from
+    (uniform sampling, on-policy rollouts, expert demonstrations, ...). Reproducible per-worker
+    streams come from ``lightning.seed_everything(seed, workers=True)`` at the call site (the Trainer
+    installs the per-worker seeding); this dataset owns no seeding of its own.
+    """
+
+    def __init__(self, family_factory, normalizer):
+        self.family_factory = family_factory
+        self.normalizer = normalizer
+
+    def _raw_stream(self, family):
+        """Infinite iterator of raw ``(input item, target)`` pairs -- defined by the subclass."""
+        raise NotImplementedError
+
+    def __iter__(self):
+        # The family is built once per __iter__ (~once per worker per epoch), not per sample; the
+        # per-epoch rebuild is cheap relative to a full epoch of solves.
+        family = self.family_factory()
+        transform = family.transform
+        for raw, target in self._raw_stream(family):
+            yield _normalize_example(raw, target, transform, self.normalizer)
+
+
+class UniformSampledOperatorStream(OperatorStream):
+    """Infinite stream of freshly-sampled instances: one fresh instance -> normalized examples.
+
+    Each step samples a new instance, ``points_per_instance`` domain points, solves the operator for
+    the targets, and yields the normalized ``(item, target)`` pairs -- so every example is a distinct
+    parametrization and minibatches are maximally diverse.
     """
 
     def __init__(self, family_factory, normalizer, points_per_instance):
-        self.family_factory = family_factory
-        self.normalizer = normalizer
+        super().__init__(family_factory, normalizer)
         self.points_per_instance = points_per_instance
 
-    def __iter__(self):
-        # Built once per __iter__ (~once per worker per epoch), not per sample; the per-epoch rebuild
-        # is cheap relative to a full epoch of solves.
-        family = self.family_factory()
-        transform = family.transform
+    def _raw_stream(self, family):
         while True:
             # One joint operator solve per fresh instance yields points_per_instance examples,
             # amortizing the expensive route-choice solve over that many training points.
-            examples = _solve_instance(family, family.sample_params(), self.points_per_instance)
-            for raw, target in examples:
-                yield _normalize_example(raw, target, transform, self.normalizer)
+            yield from _solve_instance(family, family.sample_params(), self.points_per_instance)
 
 
 def split_instances(instances, counts):
@@ -255,8 +275,8 @@ def build_streaming_dataset(family_factory, bootstrap_instances, val_instances, 
     val = _examples_for_instances(family, val_instances, 1)
     test = _examples_for_instances(family, test_instances, 1)
     normalizer = _fit_normalizer(family, bootstrap)
-    train_ds = StreamingFieldDataset(family_factory, normalizer, points_per_instance)
-    val_ds, test_ds = (FieldDataset(split, family.transform, normalizer) for split in (val, test))
+    train_ds = UniformSampledOperatorStream(family_factory, normalizer, points_per_instance)
+    val_ds, test_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test))
     # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
-    bootstrap_ds = FieldDataset(bootstrap, family.transform, normalizer)
+    bootstrap_ds = OperatorDataset(bootstrap, family.transform, normalizer)
     return (train_ds, val_ds, test_ds, bootstrap_ds), normalizer

@@ -4,9 +4,9 @@ Lives above the model/dynamics/algorithms layers as glue -- keeps ``FieldModel``
 dynamics dependency (the project pipeline is family -> dataset -> field model -> dynamics). One
 callback runs one algorithm; compose a list to sweep several.
 
-Two more callbacks drive the on-policy rollout training mode (see ``rollout_sampling``):
-``RolloutBufferCallback`` refreshes the training buffer from the current field every few epochs,
-and ``RolloutVizCallback`` logs the rollout + true/learned field visualizations through training.
+``VizRolloutCallback`` logs the rollout + true/learned field visualizations through training for the
+on-policy training mode (see ``rollout_sampling``); the on-policy buffer itself is owned by
+``rollout_sampling.OnPolicyOperatorStream``, not a callback.
 """
 
 import os
@@ -18,11 +18,10 @@ from lightning.pytorch.loggers import WandbLogger
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.dynamics import simulate
 from l2s_games.models import conditioned_field
-from l2s_games.rollout_sampling import rollout_examples
 from l2s_games.viz import plot_trajectory_arrows
 
 
-class EquilibriumRolloutCallback(L.Callback):
+class RolloutCallback(L.Callback):
     """Each validation batch, roll out ``algo`` on the learned field and log two endpoint metrics.
 
     The rollout starts from ``family.initial_point`` and is projected onto the feasible set each
@@ -60,50 +59,7 @@ class EquilibriumRolloutCallback(L.Callback):
         pl_module.log(f"val/{self.algo}/eq_dist", dist_to_eq, on_epoch=True, batch_size=targets.shape[0])
 
 
-class RolloutBufferCallback(L.Callback):
-    """Refresh the on-policy training buffer from the current field every ``refresh_every`` epochs.
-
-    Holds a fixed pool of training instances and a reference to the train ``FieldDataset``. On the
-    refresh epochs it rolls out the current model's field, samples the operator along the visited
-    states (blended with uniform points; see ``rollout_sampling.rollout_examples``), and overwrites
-    ``train_ds.examples`` in place -- the DataLoader (built ``num_workers=0``) reads the new points
-    next epoch. Epoch 0 trains on the uniform buffer ``build_dataset`` produced, so the field has
-    signal before its own rollouts drive the sampling.
-    """
-
-    def __init__(
-        self, family, train_ds, normalizer, instances, algo, h, n_steps, buffer_size, blend_uniform_frac, refresh_every
-    ):
-        super().__init__()
-        self.family = family
-        self.train_ds = train_ds
-        self.normalizer = normalizer
-        self.instances = instances
-        self.algo = algo
-        self.h = h
-        self.n_steps = n_steps
-        self.buffer_size = buffer_size
-        self.blend_uniform_frac = blend_uniform_frac
-        self.refresh_every = refresh_every
-
-    def on_train_epoch_start(self, trainer, pl_module):
-        epoch = trainer.current_epoch
-        if epoch == 0 or epoch % self.refresh_every != 0:
-            return
-        self.train_ds.examples = rollout_examples(
-            pl_module,
-            self.family,
-            self.normalizer,
-            self.instances,
-            self.algo,
-            self.h,
-            self.n_steps,
-            self.buffer_size,
-            self.blend_uniform_frac,
-        )
-
-
-class RolloutVizCallback(L.Callback):
+class VizRolloutCallback(L.Callback):
     """Log the rollout trajectory + true/learned operators along it, for fixed instances through training.
 
     Each validation epoch, for each fixed held-out instance rolls out the learned field and draws one

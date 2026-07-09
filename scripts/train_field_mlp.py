@@ -16,6 +16,7 @@ dynamical system (the same algorithms rolled out on each).
 """
 
 import argparse
+import functools
 import os
 
 import lightning as L
@@ -25,11 +26,12 @@ from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import EquilibriumRolloutCallback, RolloutBufferCallback, RolloutVizCallback
-from l2s_games.data import build_dataset, collate_examples
+from l2s_games.callbacks import RolloutCallback, VizRolloutCallback
+from l2s_games.data import UniformSampledOperatorStream, build_dataset, collate_examples
 from l2s_games.dynamics import simulate
 from l2s_games.envs import make_game
 from l2s_games.models import MLPFieldModel, conditioned_field
+from l2s_games.rollout_sampling import OnPolicyOperatorStream
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
 
@@ -54,7 +56,11 @@ def build_parser():
     p.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate")
     p.add_argument("--epochs", type=int, default=60, help="training epochs")
     p.add_argument("--val-every-n-epochs", type=int, default=10, help="run validation (+ rollout viz) every N epochs")
-    p.add_argument("--batch", type=int, default=1024, help="minibatch size")
+    p.add_argument("--batch-uniform", type=int, default=256, help="minibatch size for the uniform stream")
+    p.add_argument("--batch-rollout", type=int, default=768, help="minibatch size for the on-policy rollout stream")
+    p.add_argument(
+        "--steps-per-epoch", type=int, default=64, help="train batches per epoch (bounds the infinite streams)"
+    )
     # dynamics comparison (same knobs as the sandbox)
     p.add_argument("--h", type=float, default=0.1, help="algorithm step size")
     p.add_argument("--n-steps", type=int, default=400, help="iterations per trajectory")
@@ -66,13 +72,16 @@ def build_parser():
         choices=list(ALGORITHMS),
         help="algorithms for the validation residual sweep and the single-instance dynamics plots",
     )
-    # on-policy rollout sampling (see rollout_sampling / callbacks.RolloutBufferCallback)
+    # data sources (one dataloader per source; see data.OperatorStream subclasses)
     p.add_argument(
-        "--sampling",
+        "--sources",
+        nargs="+",
         choices=["uniform", "rollout"],
-        default="uniform",
-        help="'uniform' samples the domain uniformly (baseline); 'rollout' trains on points visited "
-        "by rolling out the current learned field (on-policy), refreshed every --refresh-every epochs",
+        default=["uniform"],
+        help="training data sources, each its own stream+dataloader: 'uniform' samples the domain "
+        "uniformly (baseline); 'rollout' trains on points visited by rolling out the current learned "
+        "field (on-policy), refreshed every --refresh-every epochs. Combine both to blend them (the mix "
+        "is set by --batch-uniform / --batch-rollout)",
     )
     p.add_argument(
         "--rollout-algo",
@@ -83,9 +92,6 @@ def build_parser():
         "consensus converge",
     )
     p.add_argument("--refresh-every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
-    p.add_argument(
-        "--blend-uniform-frac", type=float, default=0.3, help="fraction of the buffer drawn uniformly (vs on-policy)"
-    )
     p.add_argument("--n-rollout-instances", type=int, default=128, help="instances rolled out per buffer refresh")
     p.add_argument("--n-viz-instances", type=int, default=3, help="held-out instances shown in the rollout viz")
     # logging (ported from train_field_gnn.py): wandb logs viz as images, csv saves them as PNGs to disk
@@ -156,15 +162,24 @@ def plot_dynamics_comparison(true_field, learned_field, algorithms, h, z0, n_ste
 # --------------------------------------------------------------------------
 def main(args):
     L.seed_everything(args.seed)
-    game = make_game(args.game, n_actions=args.n_actions) if args.game == "symmetric" else make_game(args.game)
-    (train_ds, val_ds, test_ds), normalizer = build_dataset(
+    # A picklable factory (not a live game) is what the streams hold; build one live game here for
+    # model sizing, val/test construction, and the field/dynamics plots.
+    family_factory = (
+        functools.partial(make_game, args.game, n_actions=args.n_actions)
+        if args.game == "symmetric"
+        else functools.partial(make_game, args.game)
+    )
+    game = family_factory()
+    # build_dataset gives the fitted normalizer + fixed val/test splits; its uniform train split is
+    # only the normalizer-fit sample -- training draws its own (streaming) uniform points below.
+    (_, val_ds, test_ds), normalizer = build_dataset(
         game,
         args.n_instances,
         args.n_val_instances,
         args.n_test_instances,
         args.points_per_instance,
     )
-    print(f"train examples: {len(train_ds)}   " f"val examples: {len(val_ds)}   test examples: {len(test_ds)}")
+    print(f"train: streaming   val examples: {len(val_ds)}   test examples: {len(test_ds)}")
 
     # train the model; train/val loss is shown on the progress bar
     model = MLPFieldModel(
@@ -176,33 +191,44 @@ def main(args):
     )
     # Each validation epoch sweeps the algorithms, rolling out the learned field batched over the
     # held-out instances and logging the analytic residual at the endpoint per algorithm.
-    callbacks = [EquilibriumRolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
+    callbacks = [RolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
 
     save_dir = os.getenv("SCRATCH", ".")
     logger = build_logger(args, save_dir)
 
-    # On-policy sampling: refresh the training buffer from the current field every --refresh-every
-    # epochs, and log the rollout / true-vs-learned field viz through training. Epoch 0 trains on the
-    # uniform buffer build_dataset produced (below); the buffer callback takes over from --refresh-every.
-    if args.sampling == "rollout":
+    # One infinite stream + dataloader per selected data source; the training batch is a mapping of
+    # them (Lightning's CombinedLoader), and training_step concatenates the sources into one MSE. The
+    # per-source batch sizes set the mix; --steps-per-epoch bounds the (infinite) streams per epoch.
+    streams = {
+        "uniform": (
+            UniformSampledOperatorStream(family_factory, normalizer, args.points_per_instance),
+            args.batch_uniform,
+        )
+    }
+    if "rollout" in args.sources:
+        # The on-policy stream owns its rollout + buffer, refreshing from the current field every
+        # --refresh-every epochs; it holds a live model ref, hence num_workers=0. It also logs the
+        # rollout / true-vs-learned field viz through training (2D domains only).
         rollout_instances = [game.sample_params() for _ in range(args.n_rollout_instances)]
-        viz_instances = [game.sample_params() for _ in range(args.n_viz_instances)]
-        # The on-policy buffer keeps the same point count as the initial uniform buffer build_dataset
-        # made (n_instances * points_per_instance), so every epoch has the same number of batches.
-        # If the refreshed epochs were shorter, Lightning -- which fixes val_check_batch from epoch 0 --
-        # would never reach the validation batch and would silently skip validation entirely.
-        buffer_size = args.n_instances * args.points_per_instance
-        callbacks.append(
-            RolloutBufferCallback(
-                game, train_ds, normalizer, rollout_instances, args.rollout_algo, args.h, args.n_steps,
-                buffer_size, args.blend_uniform_frac, args.refresh_every,
-            )
+        buffer_size = args.n_rollout_instances * args.points_per_instance
+        streams["rollout"] = (
+            OnPolicyOperatorStream(
+                family_factory,
+                normalizer,
+                model,
+                rollout_instances,
+                args.rollout_algo,
+                args.h,
+                args.n_steps,
+                buffer_size,
+                args.refresh_every,
+            ),
+            args.batch_rollout,
         )
         if game.domain_dim == 2:
+            viz_instances = [game.sample_params() for _ in range(args.n_viz_instances)]
             callbacks.append(
-                RolloutVizCallback(
-                    game, normalizer, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir,
-                )
+                VizRolloutCallback(game, normalizer, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir)
             )
 
     trainer = L.Trainer(
@@ -215,13 +241,15 @@ def main(args):
         enable_model_summary=False,
         callbacks=callbacks,
         check_val_every_n_epoch=args.val_every_n_epochs,
-        inference_mode=False,  # validation rolls out consensus, whose grad term needs autograd
+        limit_train_batches=args.steps_per_epoch,  # bounds the infinite streams -> fixed epoch length
+        inference_mode="consensus" in args.algorithms,  # validation rolls out consensus, whose grad term needs autograd
     )
     collate = collate_examples(game)
+    train_loaders = {k: DataLoader(ds, batch_size=b, collate_fn=collate) for k, (ds, b) in streams.items()}
     trainer.fit(
         model,
-        DataLoader(train_ds, batch_size=args.batch, shuffle=True, collate_fn=collate),
-        DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
+        train_loaders,
+        DataLoader(val_ds, batch_size=args.batch_uniform + args.batch_rollout, collate_fn=collate),
     )
 
     params = game.sample_params()

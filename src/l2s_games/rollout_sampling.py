@@ -4,8 +4,8 @@ The uniform pipeline (``data.build_dataset``) trains on points drawn uniformly o
 domain. This module instead samples the points a solver *actually visits*: it rolls out the
 current model's field with a pluggable algorithm from random starts and evaluates the
 ground-truth operator at the visited states, so the model is trained on the state
-distribution its own field induces. The field changes as it trains, so a caller regenerates
-these examples periodically (see ``callbacks.RolloutBufferCallback``).
+distribution its own field induces. The field changes as it trains, so ``OnPolicyOperatorStream``
+(below) regenerates these examples periodically -- one refreshing stream per training loader.
 
 Everything runs through the existing family seams -- ``model_input`` / ``transform`` /
 ``collate_fn`` (conditioning), ``batched_field`` (the batched learned field, real units),
@@ -16,6 +16,7 @@ to the concrete representation, though only the flat (RPS/matrix) path is wired 
 import torch
 
 from l2s_games.algorithms import ALGORITHMS
+from l2s_games.data import OperatorStream
 from l2s_games.dynamics import simulate
 
 
@@ -37,16 +38,16 @@ def _batched_learned_field(model, family, normalizer, params, z0):
     return model.batched_field(family, batch)
 
 
-def rollout_examples(model, family, normalizer, params_list, algo_name, h, n_steps, buffer_size, blend_uniform_frac):
+def rollout_examples(model, family, normalizer, params_list, algo_name, h, n_steps, buffer_size):
     """Fresh raw ``(model_input, target)`` examples for the on-policy training buffer.
 
-    Rolls out ``-learned_field`` (descent, matching ``EquilibriumRolloutCallback``) with
-    ``ALGORITHMS[algo_name]`` from one random start per instance in ``params_list``, then
-    mixes the visited states with a ``blend_uniform_frac`` share of uniform ``sample_domain``
-    points (exploration + cold-start coverage while the field is still near-random). The
-    target at each chosen point is the analytic operator, unnegated -- the model regresses
-    the operator itself, exactly as the uniform pipeline does. Returns ``buffer_size`` raw
-    ``({"point", "params"}, target)`` pairs, the shape ``FieldDataset.examples`` holds.
+    Rolls out ``-learned_field`` (descent, matching ``RolloutCallback``) with ``ALGORITHMS[algo_name]``
+    from one random start per instance in ``params_list``, then samples ``buffer_size`` of the visited
+    states. The target at each chosen point is the analytic operator, unnegated -- the model regresses
+    the operator itself, exactly as the uniform pipeline does. Uniform coverage (exploration /
+    cold-start, while the field is near-random) is supplied by the sibling ``UniformSampledOperatorStream``,
+    so this stream is purely on-policy. Returns ``buffer_size`` raw ``({"point", "params"}, target)``
+    pairs, the shape ``FieldDataset.examples`` holds.
     """
     params = torch.stack([torch.as_tensor(p, dtype=torch.float32) for p in params_list])  # [B, n_params]
     z0 = torch.cat([family.sample_domain(p, 1) for p in params_list], dim=0)  # [B, d]
@@ -57,24 +58,50 @@ def rollout_examples(model, family, normalizer, params_list, algo_name, h, n_ste
     # graph; consensus manages its own autograd internally (caller runs with inference_mode off).
     traj = simulate(lambda z: -field(z), ALGORITHMS[algo_name](h), z0, n_steps, project=project)  # [T+1, B, d]
 
-    n_onpolicy = round(buffer_size * (1.0 - blend_uniform_frac))
-    n_uniform = buffer_size - n_onpolicy
-
-    # On-policy: flatten trajectory points with their per-instance params, subsample to n_onpolicy.
+    # Flatten trajectory points with their per-instance params, subsample to buffer_size.
     flat_points = traj.reshape(-1, traj.shape[-1])  # [(T+1)*B, d]
     flat_params = params.unsqueeze(0).expand(traj.shape[0], -1, -1).reshape(-1, params.shape[-1])
-    pick = torch.randint(0, flat_points.shape[0], (n_onpolicy,))
-    on_points, on_params = flat_points[pick], flat_params[pick]
+    pick = torch.randint(0, flat_points.shape[0], (buffer_size,))
+    points, point_params = flat_points[pick], flat_params[pick]
 
-    # Uniform blend: fresh uniform domain points, each tied to a random instance's params.
-    inst = torch.randint(0, len(params_list), (n_uniform,))
-    uni_params = params[inst]
-    uni_points = family.sample_domain(params_list[0], n_uniform)  # params ignored by flat sample_domain
-
-    all_params = torch.cat([on_params, uni_params], dim=0)
-    all_points = torch.cat([on_points, uni_points], dim=0)
     with torch.no_grad():
-        targets = family.operator(all_params, all_points)
-    return [
-        (family.model_input(all_params[i], all_points[i]), targets[i]) for i in range(all_points.shape[0])
-    ]
+        targets = family.operator(point_params, points)
+    return [(family.model_input(point_params[i], points[i]), targets[i]) for i in range(points.shape[0])]
+
+
+class OnPolicyOperatorStream(OperatorStream):
+    """Infinite stream of on-policy rollout points, refreshed from the *current* model each epoch.
+
+    Owns its rollout and its buffer: at the start of each epoch (its ``__iter__``, cadenced by
+    ``refresh_every``) it rolls out the learned field with ``algo`` and refills ``self._buffer`` via
+    ``rollout_examples``, then cycles that buffer for the rest of the epoch. The per-epoch length is
+    bounded by ``Trainer(limit_train_batches=...)``, not by buffer exhaustion, so the epoch always has
+    the same number of batches (which Lightning fixes from epoch 0). Rolling out at epoch start
+    mirrors the old ``on_train_epoch_start`` timing; ``simulate`` detaches every iterate, so no graph
+    leaks into data loading.
+
+    Holds a **live** ``model`` reference (weights update in place, so it always rolls out the current
+    field), which requires ``num_workers=0`` -- the model cannot be pickled to a worker process.
+    """
+
+    def __init__(self, family_factory, normalizer, model, instances, algo, h, n_steps, buffer_size, refresh_every):
+        super().__init__(family_factory, normalizer)
+        self.model = model
+        self.instances = instances
+        self.algo = algo
+        self.h = h
+        self.n_steps = n_steps
+        self.buffer_size = buffer_size
+        self.refresh_every = refresh_every
+        self._buffer = None
+        self._epoch = -1
+
+    def _raw_stream(self, family):
+        self._epoch += 1
+        if self._buffer is None or self._epoch % self.refresh_every == 0:
+            self._buffer = rollout_examples(
+                self.model, family, self.normalizer, self.instances,
+                self.algo, self.h, self.n_steps, self.buffer_size,
+            )
+        while True:
+            yield from self._buffer

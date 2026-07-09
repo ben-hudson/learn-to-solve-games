@@ -13,7 +13,7 @@ jointly (no graph inductive bias), for benchmarking how much the Graphormer's st
 Training data is **streamed**: every step draws a fresh instance and solves the operator jointly for
 ``--points_per_instance`` cost points inside ``DataLoader`` workers (one solve amortized over that
 many training examples) -- so the model sees unbounded instance diversity rather than a fixed set
-(see ``data.build_streaming_dataset`` / ``StreamingFieldDataset``).
+(see ``data.build_streaming_dataset`` / ``UniformSampledOperatorStream``).
 The normalizer is fit once on a fixed bootstrap set (``--bootstrap_instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
@@ -36,7 +36,7 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import EquilibriumRolloutCallback
+from l2s_games.callbacks import RolloutCallback
 from l2s_games.data import build_streaming_dataset, collate_examples, split_instances
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
@@ -214,7 +214,7 @@ def main(args):
     # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
     # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
-    callbacks = [EquilibriumRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
+    callbacks = [RolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
     # Stop when the val loss stops improving; tolerant like the source setup (a rollout can log a
     # non-finite residual without aborting the run). cos_err/mag_ratio are reported as diagnostics.
     callbacks.append(
@@ -264,16 +264,20 @@ def main(args):
     )
     trainer.fit(
         model,
-        DataLoader(
-            train_ds,
-            batch_size=args.batch,
-            num_workers=args.n_workers,
-            persistent_workers=args.n_workers > 0,
-            collate_fn=collate,
-            # Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe
-            # the cores and thrash, causing bursty/stalling batch delivery.
-            worker_init_fn=lambda _worker_id: torch.set_num_threads(1),
-        ),
+        # A single source, but wrapped as a named-source mapping so the batch matches training_step's
+        # contract (batch = {source: (inputs, targets)}); Lightning wraps this in a CombinedLoader.
+        {
+            "uniform": DataLoader(
+                train_ds,
+                batch_size=args.batch,
+                num_workers=args.n_workers,
+                persistent_workers=args.n_workers > 0,
+                collate_fn=collate,
+                # Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe
+                # the cores and thrash, causing bursty/stalling batch delivery.
+                worker_init_fn=lambda _worker_id: torch.set_num_threads(1),
+            )
+        },
         DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
     )
 
