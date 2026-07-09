@@ -17,19 +17,23 @@ call site.
 """
 
 import functools
-from dataclasses import dataclass
 
 import torch
-from torch import Tensor
+from torch import nn
 from torch.utils.data import Dataset, IterableDataset, default_collate, random_split
 
 
-@dataclass(frozen=True)
-class Standardizer:
-    """Per-feature ``(x - mean) / std`` map, fit from data, with its inverse."""
+class Standardizer(nn.Module):
+    """Per-feature ``(x - mean) / std`` map, fit from data, with its inverse.
 
-    mean: Tensor
-    std: Tensor
+    ``mean`` / ``std`` are registered buffers so the fitted stats move with the module (Lightning
+    ships them to the model's device with the rest of the module) and serialize into ``state_dict``.
+    """
+
+    def __init__(self, mean, std):
+        super().__init__()
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
 
     @classmethod
     def fit(cls, x):
@@ -46,8 +50,7 @@ class Standardizer:
         return x * self.std + self.mean
 
 
-@dataclass(frozen=True)
-class AsinhScaler:
+class AsinhScaler(nn.Module):
     """Odd, zero-preserving tail compressor for the heavy-tailed operator field.
 
     ``transform(y) = asinh(y / scale)``; ``inverse_transform(z) = scale * sinh(z)``. It is ~linear
@@ -58,10 +61,13 @@ class AsinhScaler:
     per-edge**: an isotropic scale preserves the field's direction and cross-edge relative magnitude
     (what the dynamics act on), whereas a per-edge scale would warp the field's geometry; and
     **scale-only (no mean)**, so the equilibrium zero is untouched. Smooth and invertible, so it stays
-    jacrev-transparent in the inference field.
+    jacrev-transparent in the inference field. ``scale`` is a registered buffer so it moves with the
+    module (onto the model's device) and serializes into ``state_dict``.
     """
 
-    scale: Tensor
+    def __init__(self, scale):
+        super().__init__()
+        self.register_buffer("scale", scale)
 
     @classmethod
     def fit(cls, y):
@@ -76,12 +82,17 @@ class AsinhScaler:
         return self.scale * torch.sinh(z)
 
 
-@dataclass(frozen=True)
-class Normalizer:
-    """The fitted feats standardizer and target scaler the model trains and predicts through."""
+class Normalizer(nn.Module):
+    """The fitted feats standardizer and target scaler the model trains and predicts through.
 
-    input: Standardizer
-    target: AsinhScaler
+    ``input`` / ``target`` are submodules, so a ``Normalizer`` owned by a model (see
+    ``FieldModel``) moves to the model's device and serializes into ``state_dict`` automatically.
+    """
+
+    def __init__(self, input, target):
+        super().__init__()
+        self.input = input
+        self.target = target
 
     def transform_target(self, y):
         """Compress the heavy-tailed real-unit target into the network's regression space (asinh)."""

@@ -9,8 +9,9 @@ regenerates its buffer periodically -- one refreshing stream per training loader
 
 Everything runs through the existing family seams -- ``model_input`` / ``transform`` /
 ``collate_fn`` (conditioning), ``batched_field`` (the batched learned field, real units),
-``simulate`` + ``ALGORITHMS`` (the rollout), and ``operator`` (the target) -- so it is blind
-to the concrete representation, though only the flat (RPS/matrix) path is wired for now.
+``project`` (off the collated batch), ``simulate`` + ``ALGORITHMS`` (the rollout), and
+``operator`` (the per-instance target) -- so it is blind to the concrete representation and
+works for both the flat (RPS/matrix) and graph (traffic) families.
 """
 
 import torch
@@ -47,50 +48,63 @@ class OnPolicyOperatorStream(OperatorStream):
         self._buffer = None
         self._epoch = -1
 
-    def _learned_field(self, family, params, z0):
-        """The model's field over the instance batch, real units: ``v(Z)``, ``Z [B, d] -> [B, d]``.
-
-        Builds the collated batch the same way training does -- ``normalize_input`` (transform +
-        standardize ``feats``) then ``collate_fn`` -- and hands it to ``FieldModel.batched_field``,
-        which splices the rollout state ``Z`` into the batch and de-standardizes the prediction. The
-        seed point per instance is arbitrary (``batched_field_input`` overwrites the point columns
-        with ``Z`` each step); we use ``z0`` for concreteness.
-        """
-        items = [
-            normalize_input(family.model_input(p, z), family.transform, self.normalizer)
-            for p, z in zip(params, z0)
-        ]
-        return self.model.batched_field(family, family.collate_fn(items))
-
     def _rollout_buffer(self, family):
         """Fresh raw ``(model_input, target)`` examples for the on-policy training buffer.
 
         Rolls out ``-learned_field`` (descent, matching ``RolloutCallback``) with
-        ``ALGORITHMS[self.algo]`` from one random start per instance, then samples ``buffer_size`` of
+        ``ALGORITHMS[self.algo]`` from one uniform start per instance, then samples ``buffer_size`` of
         the visited states. The target at each chosen point is the analytic operator, unnegated -- the
         model regresses the operator itself, exactly as the uniform pipeline does. Uniform coverage
         (exploration / cold-start, while the field is near-random) is supplied by the sibling
-        ``UniformSampledOperatorStream``, so this stream is purely on-policy. Returns ``buffer_size``
-        raw ``({"point", "params"}, target)`` pairs, the shape ``OperatorStream`` normalizes.
-        """
-        params = torch.stack([torch.as_tensor(p, dtype=torch.float32) for p in self.instances])  # [B, n_params]
-        z0 = torch.cat([family.sample_domain(p, 1) for p in self.instances], dim=0)  # [B, d]
+        ``UniformSampledOperatorStream``, so this stream is purely on-policy.
 
-        field = self._learned_field(family, params, z0)
-        project = lambda z: family.project(params, z)
+        Representation-agnostic: it drives the same family seams the validation rollout uses
+        (``model_input`` -> ``transform`` -> ``collate_fn`` for the batch, ``batched_field`` for the
+        learned field, ``params_from_batch`` / ``project`` off the collated batch, ``operator`` for the
+        targets), so it works for flat games and graph instances alike. Targets are solved once per
+        instance over its picked points (one route-choice solve per instance for traffic), then the
+        assembled examples are shuffled so a minibatch is not dominated by a single instance.
+        """
+        # The model (hence the learned field) lives on this device; the rollout must run there, while
+        # featurization above and the operator solve below stay on CPU (the stream's normalizer stats
+        # and the raw instances are CPU, matching every other stream). See the two moves below.
+        device = next(self.model.parameters()).device
+        # One uniform start per instance; the seed also sizes the collated batch (batched_field_input
+        # overwrites the point columns with the rollout state each step, so the seed value is arbitrary).
+        z0 = torch.stack([family.sample_domain(inst, 1)[0] for inst in self.instances])  # [B, d]
+        items = [
+            normalize_input(family.model_input(inst, z), family.transform, self.normalizer)
+            for inst, z in zip(self.instances, z0)
+        ]
+        # Ship the collated batch to the model's device for the rollout (the field runs the model);
+        # the batch is a plain dict of tensors for every family, so move it entry-wise.
+        batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in family.collate_fn(items).items()}
+        field = self.model.batched_field(family, batch)
+        project = lambda z: family.project(batch, z)
         # simulate() detaches every iterate, so the trajectory is a set of sample locations with no
         # graph; consensus manages its own autograd internally (caller runs with inference_mode off).
-        traj = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)  # [T+1,B,d]
+        traj = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0.to(device), self.n_steps, project=project)  # [T+1,B,d]
 
-        # Flatten trajectory points with their per-instance params, subsample to buffer_size.
-        flat_points = traj.reshape(-1, traj.shape[-1])  # [(T+1)*B, d]
-        flat_params = params.unsqueeze(0).expand(traj.shape[0], -1, -1).reshape(-1, params.shape[-1])
+        # Back to CPU (a single ~20MB copy per refresh) so the per-instance operator solve + model_input
+        # below run on CPU against the CPU raw instances -- the operator path the uniform stream uses.
+        traj = traj.cpu()
+        # Flatten the trajectory, tracking each row's instance so targets + model_input use its params.
+        n_steps, n_inst = traj.shape[0], traj.shape[1]
+        flat_points = traj.reshape(n_steps * n_inst, -1)  # [(T+1)*B, d]
+        flat_inst = torch.arange(n_inst).repeat(n_steps)  # instance index per flat row
         pick = torch.randint(0, flat_points.shape[0], (self.buffer_size,))
-        points, point_params = flat_points[pick], flat_params[pick]
+        points, picked_inst = flat_points[pick], flat_inst[pick]
 
+        # Solve the operator per instance over its picked points, then assemble + shuffle the examples.
+        examples = []
         with torch.no_grad():
-            targets = family.operator(point_params, points)
-        return [(family.model_input(point_params[i], points[i]), targets[i]) for i in range(points.shape[0])]
+            for b, inst in enumerate(self.instances):
+                pts = points[picked_inst == b]  # [m, d]
+                if pts.shape[0] == 0:
+                    continue
+                targets = family.operator(inst, pts)
+                examples += [(family.model_input(inst, pts[j]), targets[j]) for j in range(pts.shape[0])]
+        return [examples[i] for i in torch.randperm(len(examples))]
 
     def _raw_stream(self, family):
         self._epoch += 1

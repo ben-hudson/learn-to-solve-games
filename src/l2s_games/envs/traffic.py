@@ -210,22 +210,20 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return eq.mean(dim=0), eq.std(dim=0)
 
     def sample_domain(self, graph, n):
-        """Feasible cost points spanning the whole path from the free-flow-time start to equilibrium.
+        """Feasible cost points drawn uniformly per edge over the calibrated domain box.
 
-        The rollout starts at ``free_flow_time`` and converges to the equilibrium, so training must
-        cover that entire segment -- not just a ball around either end. The bootstrap set gives an
-        empirical distribution over equilibria (per-edge mean ``reference_equilibrium`` and std
-        ``reference_spread``), so each point is drawn in two steps: (1) sample an equilibrium from
-        that distribution, truncated to the ``n_stds``-sigma ball around the mean; (2) interpolate
-        from the instance's ``free_flow_time`` toward that sampled equilibrium by a scalar reach in
-        ``[0, 1]`` (so the samples fill the path rather than a high-dimensional box). Costs are
-        clamped to the feasible floor ``free_flow_time``.
+        Each edge's cost is drawn uniformly in ``[free_flow_time, ceiling]``, where the per-edge
+        ``ceiling = reference_equilibrium + n_stds * reference_spread`` is calibrated from the
+        bootstrap equilibria (per-edge mean ``reference_equilibrium`` and std ``reference_spread``;
+        see ``calibrate_range``). This spans the whole segment the rollout traverses -- from the
+        free-flow-time start up to (a few sigma above) the equilibrium -- as a flat box rather than
+        the earlier equilibrium-ball-plus-reach sampler. ``hi`` is floored at ``free_flow_time`` so
+        the range is never negative; every sample is feasible by construction (``>= free_flow_time``).
         """
         fft = graph.free_flow_time
-        z = torch.randn(n, graph.num_edges).clamp(-self.n_stds, self.n_stds)
-        sampled_eq = self.reference_equilibrium + self.reference_spread * z
-        reach = torch.rand(n, 1)
-        return torch.clamp(fft + reach * (sampled_eq - fft), min=fft)
+        ceiling = self.reference_equilibrium + self.n_stds * self.reference_spread
+        hi = torch.maximum(ceiling, fft)
+        return fft + torch.rand(n, graph.num_edges) * (hi - fft)
 
     def model_input(self, graph, cost):
         """Raw input item: the instance graph with the domain point attached as ``.cost``.

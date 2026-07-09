@@ -10,10 +10,20 @@ one network represents the operator across a family of noised SiouxFalls instanc
 whole-graph flat baseline that flattens the fixed network's per-edge feats and predicts every edge
 jointly (no graph inductive bias), for benchmarking how much the Graphormer's structure buys.
 
-Training data is **streamed**: every step draws a fresh instance and solves the operator jointly for
-``--points_per_instance`` cost points inside ``DataLoader`` workers (one solve amortized over that
-many training examples) -- so the model sees unbounded instance diversity rather than a fixed set
-(see ``data.build_streaming_dataset`` / ``UniformSampledOperatorStream``).
+Training data is **streamed** from one or more sources selected with ``--sources`` (each its own
+stream + dataloader, blended by Lightning's ``CombinedLoader``; the mix is set by the per-source
+batch sizes ``--batch_uniform`` / ``--batch_rollout``):
+
+- ``uniform`` (baseline): every step draws a fresh instance and solves the operator jointly for
+  ``--points_per_instance`` cost points sampled **uniformly** over the calibrated domain box (see
+  ``MarkovTrafficEquilibrium.sample_domain``) inside ``DataLoader`` workers -- so the model sees
+  unbounded instance diversity rather than a fixed set (see ``data.build_streaming_dataset`` /
+  ``UniformSampledOperatorStream``).
+- ``rollout`` (on-policy): trains on the cost points a solver actually visits when rolling out the
+  *current* learned field with ``--rollout_algo`` from uniform starts, refreshed every
+  ``--refresh_every`` epochs (see ``rollout_sampling.OnPolicyOperatorStream``). It holds a live model
+  ref, so its loader runs with ``num_workers=0``.
+
 The normalizer is fit once on a fixed bootstrap set (``--bootstrap_instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
@@ -41,6 +51,7 @@ from l2s_games.data import build_streaming_dataset, collate_examples, split_inst
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.models import GraphormerFieldModel, MLPFieldModel
+from l2s_games.rollout_sampling import OnPolicyOperatorStream
 
 torch.set_float32_matmul_precision("medium")
 
@@ -74,7 +85,11 @@ def build_parser():
     # --sample_stds sigma of that mean. --equilibrium_margin/--equilibrium_spread are the uncalibrated
     # fallback only (used when a family is built without a calibrated range, e.g. the sandbox).
     p.add_argument(
-        "--sample_stds", type=float, default=3.0, help="sigma radius of the equilibrium ball sample_domain draws from"
+        "--sample_stds",
+        type=float,
+        default=3.0,
+        help="sigma reach of the per-edge uniform domain box ceiling (reference_equilibrium + "
+        "sample_stds * reference_spread) sample_domain draws uniformly up to",
     )
     p.add_argument(
         "--equilibrium_margin",
@@ -106,9 +121,30 @@ def build_parser():
     p.add_argument("--gradient_clip_val", type=float, default=1.0, help="gradient-norm clip value")
     p.add_argument("--epochs", type=int, default=400, help="training epochs")
     p.add_argument(
-        "--steps_per_epoch", type=int, default=64, help="train batches per epoch (bounds the infinite stream)"
+        "--steps_per_epoch", type=int, default=64, help="train batches per epoch (bounds the infinite streams)"
     )
-    p.add_argument("--batch", type=int, default=128, help="minibatch size")
+    p.add_argument("--batch_uniform", type=int, default=128, help="minibatch size for the uniform stream")
+    p.add_argument("--batch_rollout", type=int, default=128, help="minibatch size for the on-policy rollout stream")
+    # data sources (one stream + dataloader per source; see data.OperatorStream subclasses)
+    p.add_argument(
+        "--sources",
+        nargs="+",
+        choices=["uniform", "rollout"],
+        default=["uniform"],
+        help="training data sources, each its own stream+dataloader: 'uniform' samples the domain "
+        "uniformly (baseline); 'rollout' trains on points visited by rolling out the current learned "
+        "field (on-policy), refreshed every --refresh_every epochs. Combine both to blend them (the mix "
+        "is set by --batch_uniform / --batch_rollout)",
+    )
+    p.add_argument(
+        "--rollout_algo",
+        choices=list(ALGORITHMS),
+        default="projection",
+        help="algorithm rolled out on the learned field to generate on-policy points; it shapes the "
+        "sampling distribution (projection is the traffic damped fixed point). Reuses --h / --n_steps",
+    )
+    p.add_argument("--refresh_every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
+    p.add_argument("--n_rollout_instances", type=int, default=128, help="instances rolled out per buffer refresh")
     # early stopping on the field relative error (no MAPE here -- we regress the operator field)
     p.add_argument("--patience_epochs", type=int, default=40, help="early-stopping patience in epochs")
     p.add_argument("--val_every_n_epochs", type=int, default=10, help="run validation every N epochs")
@@ -211,6 +247,43 @@ def main(args):
             cosine_annealing=bool(args.cosine_annealing),
         )
     collate = collate_examples(family)
+    # One infinite stream + dataloader per selected source; training_step concatenates the sources
+    # into one MSE (Lightning's CombinedLoader), and the per-source batch sizes set the mix. The
+    # uniform loader keeps its route-choice-solving workers; the on-policy loader holds a live model
+    # ref and so must run in-process (num_workers=0). Uniform is always present (cold-start coverage
+    # while the learned field is near-random); --sources toggles the on-policy source on top of it.
+    train_loaders = {
+        "uniform": DataLoader(
+            train_ds,
+            batch_size=args.batch_uniform,
+            num_workers=args.n_workers,
+            persistent_workers=args.n_workers > 0,
+            collate_fn=collate,
+            # Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe
+            # the cores and thrash, causing bursty/stalling batch delivery.
+            worker_init_fn=lambda _worker_id: torch.set_num_threads(1),
+        )
+    }
+    if "rollout" in args.sources:
+        # The on-policy stream owns its rollout + buffer, refreshing from the current field every
+        # --refresh_every epochs; it holds a live model ref, hence num_workers=0. Starts are sampled
+        # uniformly by the (now uniform) sample_domain.
+        rollout_instances = [family.sample_params() for _ in range(args.n_rollout_instances)]
+        buffer_size = args.n_rollout_instances * args.points_per_instance
+        rollout_stream = OnPolicyOperatorStream(
+            family_factory,
+            normalizer,
+            model,
+            rollout_instances,
+            args.rollout_algo,
+            args.h,
+            args.n_steps,
+            buffer_size,
+            args.refresh_every,
+        )
+        train_loaders["rollout"] = DataLoader(
+            rollout_stream, batch_size=args.batch_rollout, num_workers=0, collate_fn=collate
+        )
     # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
     # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
@@ -231,8 +304,15 @@ def main(args):
     if args.debug:
         logger = None
     elif args.logger == "wandb":
+        # Tag the run with game=traffic so its config is comparable to train_field_mlp.py's runs
+        # (which log --game); this script is traffic-only, so it's a fixed constant.
         logger = WandbLogger(
-            experiment=wandb.init(project="learn-to-solve-games", group=args.exp, config=vars(args), dir=save_dir),
+            experiment=wandb.init(
+                project="learn-to-solve-games",
+                group=args.exp,
+                config={**vars(args), "game": "traffic"},
+                dir=save_dir,
+            ),
             save_dir=save_dir,
         )
     else:
@@ -264,21 +344,10 @@ def main(args):
     )
     trainer.fit(
         model,
-        # A single source, but wrapped as a named-source mapping so the batch matches training_step's
-        # contract (batch = {source: (inputs, targets)}); Lightning wraps this in a CombinedLoader.
-        {
-            "uniform": DataLoader(
-                train_ds,
-                batch_size=args.batch,
-                num_workers=args.n_workers,
-                persistent_workers=args.n_workers > 0,
-                collate_fn=collate,
-                # Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe
-                # the cores and thrash, causing bursty/stalling batch delivery.
-                worker_init_fn=lambda _worker_id: torch.set_num_threads(1),
-            )
-        },
-        DataLoader(val_ds, batch_size=args.batch, collate_fn=collate),
+        # A named-source mapping so the batch matches training_step's contract
+        # (batch = {source: (inputs, targets)}); Lightning wraps this in a CombinedLoader.
+        train_loaders,
+        DataLoader(val_ds, batch_size=args.batch_uniform + args.batch_rollout, collate_fn=collate),
     )
 
 

@@ -1,5 +1,7 @@
 """Shared Lightning base for amortized field models."""
 
+import copy
+
 import lightning as L
 import torch
 from torch import nn
@@ -20,7 +22,13 @@ class FieldModel(L.LightningModule):
     ):
         super().__init__()
         self.lr = lr
-        self.normalizer = normalizer
+        # Own a private copy of the normalizer as a submodule: its stats are buffers, so Lightning
+        # moves them to the model's device with the rest of the module (needed by inverse_target /
+        # batched_field_input, which combine them with on-device predictions) and serializes them
+        # into state_dict. It must be a *copy* -- the data pipeline shares one normalizer across the
+        # CPU-side datasets/streams (some in forked workers, where CUDA tensors are unsafe), so the
+        # model cannot move the shared instance onto the GPU.
+        self.normalizer = copy.deepcopy(normalizer)
         self.weight_decay = weight_decay
         self.start_factor = start_factor
         self.warmup_epochs = warmup_epochs
@@ -109,16 +117,6 @@ class FieldModel(L.LightningModule):
         self.log("val/mse", self.loss_fn(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log("val/cos_err", cos_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log("val/mag_err", mag_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
-
-    def on_save_checkpoint(self, checkpoint):
-        # The normalizer is a fitted dataclass of tensors (not a parameter/buffer), so it is not in
-        # state_dict; stash it here so a checkpoint is self-contained -- inference/analysis can
-        # de-standardize predictions without re-deriving it from the seed + bootstrap split.
-        checkpoint["normalizer"] = self.normalizer
-
-    def on_load_checkpoint(self, checkpoint):
-        if checkpoint.get("normalizer") is not None:
-            self.normalizer = checkpoint["normalizer"]
 
     def configure_optimizers(self):
         # AdamW with linear warmup then cosine annealing (ported from markov-traffic-eq): the flat lr

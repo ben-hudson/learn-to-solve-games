@@ -227,9 +227,7 @@ def main(args):
         )
         if game.domain_dim == 2:
             viz_instances = [game.sample_params() for _ in range(args.n_viz_instances)]
-            callbacks.append(
-                VizRolloutCallback(game, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir)
-            )
+            callbacks.append(VizRolloutCallback(game, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir))
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
@@ -242,7 +240,8 @@ def main(args):
         callbacks=callbacks,
         check_val_every_n_epoch=args.val_every_n_epochs,
         limit_train_batches=args.steps_per_epoch,  # bounds the infinite streams -> fixed epoch length
-        inference_mode="consensus" in args.algorithms,  # validation rolls out consensus, whose grad term needs autograd
+        inference_mode="consensus"
+        not in args.algorithms,  # validation rolls out consensus, whose grad term needs autograd
     )
     collate = collate_examples(game)
     train_loaders = {k: DataLoader(ds, batch_size=b, collate_fn=collate) for k, (ds, b) in streams.items()}
