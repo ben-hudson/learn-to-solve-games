@@ -17,7 +17,6 @@ from lightning.pytorch.loggers import WandbLogger
 
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.dynamics import simulate
-from l2s_games.models import conditioned_field
 from l2s_games.viz import plot_trajectory_arrows
 
 
@@ -72,10 +71,9 @@ class VizRolloutCallback(L.Callback):
     ``{save_dir}/rollout_viz/epoch_{n}.png``.
     """
 
-    def __init__(self, family, normalizer, instances, algo, h, n_steps, save_dir, n_arrows=20):
+    def __init__(self, family, instances, algo, h, n_steps, save_dir, n_arrows=20):
         super().__init__()
         self.family = family
-        self.normalizer = normalizer
         self.instances = instances
         self.algo = algo
         self.h = h
@@ -94,7 +92,7 @@ class VizRolloutCallback(L.Callback):
         axes = axes.ravel()
         for ax, params, z0 in zip(axes, self.instances, self.starts):
             true_field = lambda z, p=params: self.family.operator(p, z)
-            learned_field = conditioned_field(pl_module, self.family, params, self.normalizer)
+            learned_field = pl_module.conditioned_field(self.family, params)
             project = lambda z, p=params: self.family.project(p, z)
             traj = simulate(
                 lambda z: -learned_field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project

@@ -96,16 +96,27 @@ def _clone(item):
     return item.clone() if hasattr(item, "clone") else dict(item)
 
 
-def _normalize_example(raw, target, transform, normalizer):
-    """Featurize a raw item and standardize its feats + target -- the one place that shape lives.
+def normalize_input(raw, transform, normalizer):
+    """Featurize a raw input item and standardize its ``feats`` -- the one place that input shape lives.
 
-    Clones the raw item, applies the family ``transform`` (builds ``feats`` fresh), then standardizes
-    ``feats`` and clip-then-standardizes the target. Shared by the map-style ``FieldDataset`` and the
-    streaming ``OperatorStream`` subclasses so both featurize/normalize identically.
+    Clones the raw item (so a stored original stays pristine), applies the family ``transform`` (builds
+    ``feats`` fresh), then standardizes ``feats``. This is the input half of ``_normalize_example``,
+    factored out so every model-ready-input builder -- the datasets, ``FieldModel.conditioned_field``,
+    and ``OnPolicyOperatorStream`` -- featurizes/standardizes identically. Representation-agnostic: it
+    only touches the family ``transform`` seam and ``normalizer.input``, so it works for flat and graph
+    games alike.
     """
     item = transform(_clone(raw))
     item["feats"] = normalizer.input.transform(item["feats"])
-    return item, normalizer.transform_target(target)
+    return item
+
+
+def _normalize_example(raw, target, transform, normalizer):
+    """Featurize + standardize a raw ``(input item, target)`` pair -- input via ``normalize_input``,
+    target clip-then-standardized. Shared by the map-style ``OperatorDataset`` and the streaming
+    ``OperatorStream`` subclasses so both featurize/normalize identically.
+    """
+    return normalize_input(raw, transform, normalizer), normalizer.transform_target(target)
 
 
 class OperatorDataset(Dataset):

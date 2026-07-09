@@ -30,7 +30,7 @@ from l2s_games.callbacks import RolloutCallback, VizRolloutCallback
 from l2s_games.data import UniformSampledOperatorStream, build_dataset, collate_examples
 from l2s_games.dynamics import simulate
 from l2s_games.envs import make_game
-from l2s_games.models import MLPFieldModel, conditioned_field
+from l2s_games.models import MLPFieldModel
 from l2s_games.rollout_sampling import OnPolicyOperatorStream
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
@@ -228,7 +228,7 @@ def main(args):
         if game.domain_dim == 2:
             viz_instances = [game.sample_params() for _ in range(args.n_viz_instances)]
             callbacks.append(
-                VizRolloutCallback(game, normalizer, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir)
+                VizRolloutCallback(game, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir)
             )
 
     trainer = L.Trainer(
@@ -259,7 +259,7 @@ def main(args):
     def true_field(z):
         return game.operator(params, z)
 
-    learned_field = conditioned_field(model, game, params, normalizer)
+    learned_field = model.conditioned_field(game, params)
     z0 = args.z0 if args.z0 is not None else [0.5 * game.lim] * game.domain_dim
 
     if game.domain_dim == 2:

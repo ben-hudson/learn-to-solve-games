@@ -4,6 +4,8 @@ import lightning as L
 import torch
 from torch import nn
 
+from l2s_games.data import normalize_input
+
 
 class FieldModel(L.LightningModule):
     """MSE-regression training for a field model; subclasses implement ``forward``.
@@ -38,6 +40,30 @@ class FieldModel(L.LightningModule):
             # De-standardize into real units; the asinh target scaler's inverse (sinh) is smooth, so
             # this stays jacrev-transparent for Consensus.
             return self.normalizer.inverse_target(self(inputs))
+
+        return v
+
+    def conditioned_field(self, family, params):
+        """Return a plain field callable ``v(z)`` for a fixed instance, in real units.
+
+        The single-instance mirror of ``batched_field``: runs the family's conditioning seams
+        (``model_input`` -> ``transform`` -> standardize ``feats`` via ``normalize_input`` ->
+        ``collate_fn`` a batch of one), then de-standardizes the prediction. Works for any
+        representation (flat dict or graph ``Data``), so a trained field model is a drop-in field for
+        ``simulate`` / plotting. Unlike ``batched_field`` (which splices ``z`` into a precomputed batch
+        and so needs ``z`` shaped ``[B, d]``), this re-featurizes per call, so ``v`` accepts any ``z``
+        shape -- a bare ``[d]`` iterate, ``[n, d]``, or a ``[grid, grid, d]`` quiver grid. It is
+        grad-transparent (``torch.func.jacrev`` works -- ``feats`` and normalization are differentiable
+        in ``z``, structure is not a function of ``z``); value-only callers handle their own
+        ``no_grad`` / ``detach``.
+        """
+
+        def v(z):
+            z = torch.as_tensor(z, dtype=torch.float32)
+            item = normalize_input(family.model_input(params, z), family.transform, self.normalizer)
+            # De-standardize into real units; the asinh target scaler's inverse (sinh) is smooth, so
+            # this stays jacrev-transparent for Consensus / quiver.
+            return self.normalizer.inverse_target(self(family.collate_fn([item])).squeeze(0))
 
         return v
 
