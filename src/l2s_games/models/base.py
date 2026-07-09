@@ -5,6 +5,7 @@ import copy
 import lightning as L
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from l2s_games.data import normalize_input
 
@@ -18,7 +19,16 @@ class FieldModel(L.LightningModule):
     """
 
     def __init__(
-        self, lr, normalizer=None, weight_decay=1e-2, start_factor=0.01, warmup_epochs=50, cosine_annealing=True
+        self,
+        lr,
+        normalizer=None,
+        weight_decay=1e-2,
+        start_factor=0.01,
+        warmup_epochs=50,
+        cosine_annealing=True,
+        loss="asinh_mse",
+        huber_delta_scale=1.0,
+        rel_eps=1.0,
     ):
         super().__init__()
         self.lr = lr
@@ -33,6 +43,16 @@ class FieldModel(L.LightningModule):
         self.start_factor = start_factor
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
+        # Which norm the training loss measures error in (the model always *predicts* in asinh space;
+        # the normalizer's asinh target scaler is untouched). "asinh_mse" (default) compares in asinh
+        # space; the real-space variants ("l2"/"huber"/"rel_l2") compare in real units *in scale units*
+        # via sinh (the inverse of the normalizer's asinh minus the scale factor) -- the norm the
+        # rollout-residual bound controls. Staying in scale units (sinh, not scale*sinh) keeps the loss
+        # O(1) so lr transfers. huber is the stable default of the real variants.
+        assert loss in ("asinh_mse", "l2", "huber", "rel_l2"), loss
+        self.loss = loss
+        self.huber_delta_scale = huber_delta_scale
+        self.rel_eps = rel_eps
         self.loss_fn = nn.MSELoss()
 
     def batched_field(self, family, batch):
@@ -96,17 +116,43 @@ class FieldModel(L.LightningModule):
         mag_err = (pred_norm - true_norm).abs()[keep].mean()
         return cos_err, mag_err
 
+    def _compute_loss(self, prediction, targets):
+        """The optimized training loss under the configured norm (see ``__init__``).
+
+        ``prediction``/``targets`` are in asinh space. ``sinh`` inverts the normalizer's asinh (up to
+        the scale factor), so ``sinh(y) = real_units / scale`` -- comparing there measures the real-unit
+        error the rollout-residual bound controls, kept in scale units so it stays O(1) (lr transfers).
+        ``rel_l2`` is the operator-learning-standard relative L2 (FNO), per sample, with a ``rel_eps``
+        floor so the vanishing target at the equilibrium doesn't detonate the ratio (and which also
+        down-weights the large-field samples where ``sinh`` gradients would otherwise blow up).
+        """
+        if self.loss == "asinh_mse":
+            return F.mse_loss(prediction, targets)
+        if self.loss == "l2":
+            return F.mse_loss(torch.sinh(prediction), torch.sinh(targets))
+        if self.loss == "huber":
+            return F.huber_loss(torch.sinh(prediction), torch.sinh(targets), delta=self.huber_delta_scale)
+        # rel_l2: per-sample ||sinh(pred) - sinh(target)|| / sqrt(||sinh(target)||^2 + eps^2), mean over batch.
+        pred_r, true_r = torch.sinh(prediction), torch.sinh(targets)
+        num = (pred_r - true_r).norm(dim=-1)
+        den = (true_r.norm(dim=-1).square() + self.rel_eps**2).sqrt()
+        return (num / den).mean()
+
     def training_step(self, batch, _):
         # A train batch is a mapping of named data sources (e.g. {"uniform": ..., "rollout": ...})
         # to each source's (inputs, targets) -- Lightning's CombinedLoader over one loader per source.
-        # Concatenate every source's prediction + target into one MSE (family-agnostic: this operates
+        # Concatenate every source's prediction + target into one loss (family-agnostic: this operates
         # on the model's output tensors, not on the family-specific collated inputs).
         prediction = torch.cat([self(inputs) for inputs, _ in batch.values()])
         targets = torch.cat([targets for _, targets in batch.values()])
-        loss = self.loss_fn(prediction, targets)
-        # Only the loss is logged on train: under the streaming pipeline every batch is a fresh unseen
+        loss = self._compute_loss(prediction, targets)
+        # Log the optimized loss plus the asinh MSE under a fixed name (comparable across --loss modes).
+        # Only these are logged on train: under the streaming pipeline every batch is a fresh unseen
         # instance, so a train relative error is not a fit signal (it just re-estimates val_rel_err).
-        self.log("train/mse", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=targets.shape[0])
+        self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=targets.shape[0])
+        self.log(
+            "train/mse", self.loss_fn(prediction, targets), on_step=False, on_epoch=True, batch_size=targets.shape[0]
+        )
         return loss
 
     def validation_step(self, batch, _):
@@ -114,7 +160,12 @@ class FieldModel(L.LightningModule):
         batch_size = targets.shape[0]
         prediction = self(inputs)
         cos_err, mag_err = self._field_metrics(prediction, targets)
+        # val/mse is always the asinh MSE (fixed across --loss modes -> comparable + a stable monitor);
+        # val/loss is the optimized loss (equals val/mse when --loss asinh_mse).
         self.log("val/mse", self.loss_fn(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size)
+        self.log(
+            "val/loss", self._compute_loss(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size
+        )
         self.log("val/cos_err", cos_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
         self.log("val/mag_err", mag_err, on_epoch=True, prog_bar=True, batch_size=batch_size)
 

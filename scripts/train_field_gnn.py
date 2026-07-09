@@ -113,6 +113,23 @@ def build_parser():
     p.add_argument("--dim_ff", type=int, default=256, help="feed-forward dim (graphormer only)")
     # No --dropout / --weight_decay: the streaming pipeline sees a fresh instance every step, so it
     # can't overfit -- both are hardcoded to 0 (no regularization) at model construction.
+    # loss norm: the model always predicts in asinh space; --loss picks the norm the error is measured
+    # in. "asinh_mse" (default) compares in asinh space; "l2"/"huber"/"rel_l2" compare in real units
+    # (via sinh, in asinh-scale units) -- the norm the rollout-residual bound controls. "huber" is the
+    # stable default of the real variants; "rel_l2" is FNO-style per-sample relative L2 with an eps floor.
+    p.add_argument(
+        "--loss",
+        choices=["asinh_mse", "l2", "huber", "rel_l2"],
+        default="asinh_mse",
+        help="training loss norm (asinh space vs. real-unit L2/Huber/relative-L2)",
+    )
+    p.add_argument("--huber_delta_scale", type=float, default=1.0, help="huber knee, in asinh-scale units")
+    p.add_argument(
+        "--rel_eps",
+        type=float,
+        default=1.0,
+        help="rel_l2 denominator floor, in asinh-scale units (caps near-eq up-weighting)",
+    )
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
     p.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
     p.add_argument("--start_factor", type=float, default=0.01, help="linear warmup start factor")
@@ -162,7 +179,7 @@ def build_parser():
         "--algos",
         nargs="*",
         choices=list(ALGORITHMS),
-        default=["projection"],
+        default=list(ALGORITHMS),
         help="dynamics algorithms rolled out on the learned field each val epoch, logging the analytic "
         "endpoint residual val/{algo}/residual (pass --algos with no value for fast field-only training)",
     )
@@ -229,6 +246,9 @@ def main(args):
             n_layers=args.n_layers,
             dim_ff=args.dim_ff,
             dropout=0.0,
+            loss=args.loss,
+            huber_delta_scale=args.huber_delta_scale,
+            rel_eps=args.rel_eps,
         )
     else:
         # Whole-graph flat baseline: flatten the fixed network's per-edge feats [E, k] to one vector
@@ -245,6 +265,9 @@ def main(args):
             start_factor=args.start_factor,
             warmup_epochs=args.warmup_epochs,
             cosine_annealing=bool(args.cosine_annealing),
+            loss=args.loss,
+            huber_delta_scale=args.huber_delta_scale,
+            rel_eps=args.rel_eps,
         )
     collate = collate_examples(family)
     # One infinite stream + dataloader per selected source; training_step concatenates the sources
