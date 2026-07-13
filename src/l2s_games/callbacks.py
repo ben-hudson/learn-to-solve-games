@@ -23,8 +23,10 @@ from l2s_games.viz import plot_trajectory_arrows
 class RolloutCallback(L.Callback):
     """Each validation batch, roll out ``algo`` on the learned field and log two endpoint metrics.
 
-    The rollout starts from ``family.initial_point`` and is projected onto the feasible set each
-    step. Logged (mean over the batch, aggregated over the epoch):
+    The rollout starts from ``family.initial_point`` -- each example's uniformly sampled domain
+    point (drawn by ``sample_domain`` at dataset-build time, so fixed across epochs), matching the
+    start distribution the on-policy collector trains on -- and is projected onto the feasible set
+    each step. Logged (mean over the batch, aggregated over the epoch):
     ``val/{algo}/residual`` -- the analytic operator norm ``||operator(params, z_end)||`` -- and
     ``val/{algo}/dist_to_eq`` -- the distance ``||z_end - z*||`` from the endpoint to the true
     equilibrium ``z*``.

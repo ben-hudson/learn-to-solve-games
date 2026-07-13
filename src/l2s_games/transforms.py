@@ -57,8 +57,11 @@ class ConcatConditioning:
         params = torch.as_tensor(item["params"], dtype=torch.float32)
         conditioning = params.expand(*point.shape[:-1], params.shape[-1])
         # Keep the raw params alongside feats so the collated batch can supply per-instance params
-        # to the analytic operator during the validation equilibrium sweep.
-        return {"feats": torch.cat([point, conditioning], dim=-1), "params": params}
+        # to the analytic operator during the validation equilibrium sweep. Keep the raw (un-
+        # standardized) point too -- it stays inside feats (the coordinate the field is evaluated
+        # at), but the collated batch also needs it raw as the validation rollout's start iterate
+        # (mirrors how traffic keeps a raw ``cost`` alongside the standardized cost in ``feats[0]``).
+        return {"feats": torch.cat([point, conditioning], dim=-1), "params": params, "point": point}
 
 
 def demand_edge_features(graph):

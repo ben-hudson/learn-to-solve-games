@@ -89,7 +89,12 @@ class VariationalInequalityFamily(ABC):
 
     @abstractmethod
     def initial_point(self, batch):
-        """Rollout start for the validation equilibrium sweep."""
+        """Rollout start for the validation equilibrium sweep.
+
+        Returns the example's uniformly sampled domain point carried on the batch (drawn by
+        ``sample_domain`` at build time), so the sweep starts from the same uniform-domain
+        distribution the on-policy collector trains on, fixed across epochs.
+        """
 
 
 @dataclass(frozen=True)

@@ -89,8 +89,13 @@ class MatrixGame(VariationalInequalityFamily):
         return {**batch, "feats": feats}
 
     def initial_point(self, batch):
-        """Rollout start for the validation sweep: a fixed non-equilibrium point ``[B, domain_dim]``."""
-        return 0.5 * self.lim * torch.ones_like(batch["feats"][..., : self.domain_dim])
+        """Rollout start for the validation sweep: the example's uniformly sampled domain point.
+
+        ``[B, domain_dim]`` -- the raw ``sample_domain`` draw kept alongside ``feats`` (see
+        ``ConcatConditioning``), so the validation rollout starts from the same uniform-domain
+        distribution the on-policy collector trains on.
+        """
+        return batch["point"]
 
     @property
     @abstractmethod

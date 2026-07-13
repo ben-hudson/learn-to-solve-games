@@ -195,7 +195,14 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return {**batch, "edge_index": batch["physical_edge_index"]}
 
     def initial_point(self, batch):
-        return batch["free_flow_time"]
+        """Rollout start for the validation sweep: the example's uniformly sampled cost point.
+
+        ``[B, E]`` -- the raw ``sample_domain`` draw in ``[free_flow_time, ceiling]`` that
+        ``model_input`` set as ``.cost`` (survives the transform/collate untouched), so the
+        validation rollout starts from the same uniform-domain distribution the on-policy collector
+        trains on. Feasible by construction (``>= free_flow_time``); ``project`` still clamps.
+        """
+        return batch["cost"]
 
     @staticmethod
     def calibrate_range(instances):
