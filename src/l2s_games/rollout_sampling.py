@@ -155,10 +155,18 @@ class ExpertOperatorStream(OperatorStream):
       solved in a single batched operator call -- when ``include_solution``.
 
     Both are plain operator examples, so they blend into the same regression MSE. The two ``include_*``
-    gates let a future solutions-only baseline select just the equilibria by config, not a rewrite.
+    gates let a solutions-only baseline select just the equilibria by config, not a rewrite.
     ``algo`` must be non-Jacobian (``consensus`` is excluded: ``jacrev`` does not compose through the
     analytic traffic operator); ``algo_kwargs`` overrides its extra hyperparameters (e.g. momentum
     ``beta``) picklably through the registry.
+
+    ``solution_target`` switches the stream from *operator-field* demonstrations to *full-amortization*
+    demonstrations for the solution-prediction baseline (``--amortization full``): each example becomes
+    ``(model_input(inst, free_flow_time), z*)`` -- a **parameters-only** input (the free-flow start,
+    carrying no query point that would leak the answer) regressed onto the **equilibrium** ``z*``,
+    rather than a domain point regressed onto its operator value. It requires ``include_trajectory``
+    off (trajectory examples carry operator-value targets and cannot mix into a ``z*`` regression) and
+    skips the endpoint residual solve (the target is ``z*`` itself, not the ~0 operator there).
     """
 
     def __init__(
@@ -174,8 +182,13 @@ class ExpertOperatorStream(OperatorStream):
         algo_kwargs=None,
         include_trajectory=True,
         include_solution=True,
+        solution_target=False,
     ):
         super().__init__(family_factory, normalizer)
+        assert not (solution_target and include_trajectory), (
+            "solution_target regresses z* (not operator values), so the operator-target trajectory "
+            "examples cannot be mixed in -- set include_trajectory=False"
+        )
         self.algo = algo
         self.h = h
         self.n_steps = n_steps
@@ -185,6 +198,7 @@ class ExpertOperatorStream(OperatorStream):
         self.algo_kwargs = algo_kwargs or {}
         self.include_trajectory = include_trajectory
         self.include_solution = include_solution
+        self.solution_target = solution_target
         self._buffer = None
         self._epoch = -1
 
@@ -197,7 +211,7 @@ class ExpertOperatorStream(OperatorStream):
             for inst, z in zip(instances, z0)
         ]
         # All-CPU (no model), so no device move; params_from_batch points the operator at the batch's
-        # real-unit attrs -- the same batched analytic path the validation RolloutCallback uses.
+        # real-unit attrs -- the same batched analytic path the validation FieldRolloutCallback uses.
         batch = family.collate_fn(items)
         params = family.params_from_batch(batch)
         algo = ALGORITHMS[self.algo](self.h, **self.algo_kwargs)  # fresh instance per rollout
@@ -208,13 +222,18 @@ class ExpertOperatorStream(OperatorStream):
         if self.include_trajectory:
             examples += trajectory_examples(family, instances, traj, self.n_instances * self.points_per_instance)
         if self.include_solution:
-            # Each instance's converged endpoint traj[-1, b] is its equilibrium solution z*; solve the
-            # operator (~0 there) for all B distinct endpoints in ONE batched call -- batching the B
-            # instances together, the same way the rollout does -- not one solve per instance.
-            z_star = traj[-1]  # [B, d]
-            with torch.no_grad():
-                residuals = family.operator(params, z_star)
-            examples += [(family.model_input(inst, z_star[b]), residuals[b]) for b, inst in enumerate(instances)]
+            z_star = traj[-1]  # [B, d] -- each instance's converged endpoint is its equilibrium solution
+            if self.solution_target:
+                # Full-amortization target: regress z* directly from a parameters-only input. The
+                # free-flow-time start fills the query column (see model_input), carrying no point
+                # that would leak z*; no residual solve -- the target is z* itself.
+                examples += [(family.model_input(inst, inst.free_flow_time), z_star[b]) for b, inst in enumerate(instances)]
+            else:
+                # Operator-field target: solve the operator (~0 there) for all B distinct endpoints in
+                # ONE batched call -- batching the B instances together, as the rollout does.
+                with torch.no_grad():
+                    residuals = family.operator(params, z_star)
+                examples += [(family.model_input(inst, z_star[b]), residuals[b]) for b, inst in enumerate(instances)]
         return examples
 
     def _raw_stream(self, family):

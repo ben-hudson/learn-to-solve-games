@@ -26,11 +26,11 @@ from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import RolloutCallback, VizRolloutCallback
+from l2s_games.callbacks import FieldRolloutCallback, VizRolloutCallback
 from l2s_games.data import UniformSampledOperatorStream, build_dataset, collate_examples
 from l2s_games.dynamics import simulate
 from l2s_games.envs import make_game
-from l2s_games.models import MLPFieldModel
+from l2s_games.models import FieldModel, MLPBackbone
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
@@ -192,29 +192,32 @@ def main(args):
     print(f"train: streaming   val examples: {len(val_ds)}   test examples: {len(test_ds)}")
 
     # train the model; train/val loss is shown on the progress bar
-    model = MLPFieldModel(
-        in_features=game.domain_dim + game.n_params,
-        hidden=args.hidden,
-        out_features=game.domain_dim,
+    model = FieldModel(
+        MLPBackbone(
+            in_features=game.domain_dim + game.n_params,
+            hidden=args.hidden,
+            out_features=game.domain_dim,
+        ),
         lr=args.lr,
         normalizer=normalizer,
     )
     # Each validation epoch sweeps the algorithms, rolling out the learned field batched over the
     # held-out instances and logging the analytic residual at the endpoint per algorithm.
-    callbacks = [RolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
+    callbacks = [FieldRolloutCallback(game, name, args.n_steps, args.h) for name in args.algorithms]
 
     save_dir = os.getenv("SCRATCH", ".")
     logger = build_logger(args, save_dir)
 
-    # One infinite stream + dataloader per selected data source; the training batch is a mapping of
-    # them (Lightning's CombinedLoader), and training_step concatenates the sources into one MSE. The
-    # per-source batch sizes set the mix; --steps-per-epoch bounds the (infinite) streams per epoch.
-    streams = {
-        "uniform": (
+    # One infinite stream + dataloader per source named in --sources (>=1, argparse-enforced); the
+    # training batch is a mapping of them (Lightning's CombinedLoader), and training_step concatenates
+    # the sources into one MSE. The per-source batch sizes set the mix; --steps-per-epoch bounds the
+    # (infinite) streams per epoch.
+    streams = {}
+    if "uniform" in args.sources:
+        streams["uniform"] = (
             UniformSampledOperatorStream(family_factory, normalizer, args.points_per_instance),
             args.batch_uniform,
         )
-    }
     if "rollout" in args.sources:
         # The on-policy stream owns its rollout + buffer, refreshing from the current field every
         # --refresh-every epochs; it holds a live model ref, hence num_workers=0. It also logs the

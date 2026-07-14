@@ -1,12 +1,17 @@
-"""Validation callback: roll out the learned field with one algorithm, log the analytic residual.
+"""Validation callbacks: score an equilibrium estimate by the analytic operator residual.
 
-Lives above the model/dynamics/algorithms layers as glue -- keeps ``FieldModel`` free of any
-dynamics dependency (the project pipeline is family -> dataset -> field model -> dynamics). One
-callback runs one algorithm; compose a list to sweep several.
+Lives above the model/dynamics/algorithms layers as glue -- keeps the models free of any dynamics
+dependency (the project pipeline is family -> dataset -> model -> dynamics). Both amortization modes
+produce an equilibrium estimate ``z_end`` and log the same two metrics at it (``_log_equilibrium_metrics``);
+they differ only in how ``z_end`` is produced, so each has its own thin callback:
+
+- ``FieldRolloutCallback`` -- the field model has no solution of its own, so it rolls out one ``algo``
+  on the learned field to reach ``z_end`` (compose a list to sweep several algorithms).
+- ``SolutionPredictionCallback`` -- the solution model predicts ``z*`` directly, so ``z_end`` is just
+  its (projected) prediction; no rollout.
 
 ``VizRolloutCallback`` logs the rollout + true/learned field visualizations through training for the
-on-policy training mode (see ``rollout_sampling``); the on-policy buffer itself is owned by
-``rollout_sampling.OnPolicyOperatorStream``, not a callback.
+on-policy training mode (see ``rollout_sampling``).
 """
 
 import os
@@ -20,20 +25,35 @@ from l2s_games.dynamics import simulate
 from l2s_games.viz import plot_trajectory_arrows
 
 
-class RolloutCallback(L.Callback):
-    """Each validation batch, roll out ``algo`` on the learned field and log two endpoint metrics.
+def _log_equilibrium_metrics(pl_module, family, inputs, z_end, name, equilibrium):
+    """Log the two endpoint metrics at an equilibrium estimate ``z_end`` (mean over the batch, per epoch).
 
-    The rollout starts from ``family.initial_point`` -- each example's uniformly sampled domain
-    point (drawn by ``sample_domain`` at dataset-build time, so fixed across epochs), matching the
-    start distribution the on-policy collector trains on -- and is projected onto the feasible set
-    each step. Logged (mean over the batch, aggregated over the epoch):
-    ``val/{algo}/residual`` -- the analytic operator norm ``||operator(params, z_end)||`` -- and
-    ``val/{algo}/dist_to_eq`` -- the distance ``||z_end - z*||`` from the endpoint to the true
-    equilibrium ``z*``.
+    ``val/{name}/residual`` -- the analytic operator norm ``||operator(params, z_end)||`` (zero at a
+    true equilibrium) -- and ``val/{name}/eq_dist`` -- the distance ``||z_end - equilibrium||`` to the
+    reference ``z*``. Shared by the field (rollout) and solution (direct) callbacks so both sit on the
+    same axes and neither reimplements the scoring.
+    """
+    params = family.params_from_batch(inputs)
+    residual = family.operator(params, z_end).norm(dim=-1).mean()
+    eq_dist = (z_end - equilibrium).norm(dim=-1).mean()
+    batch_size = z_end.shape[0]
+    pl_module.log(f"val/{name}/residual", residual, on_epoch=True, batch_size=batch_size)
+    pl_module.log(f"val/{name}/eq_dist", eq_dist, on_epoch=True, batch_size=batch_size)
 
-    ``equilibrium`` is ``z*``, broadcast over the batch. It defaults to the origin (the Nash-centered
-    chart's equilibrium for the matrix-game scope); the traffic setting will pass its pre-computed
-    per-instance equilibria as a tensor.
+
+class FieldRolloutCallback(L.Callback):
+    """Score a **field model** by rolling out ``algo`` on its learned field (``--amortization partial``).
+
+    The field model has no predicted solution, so ``z_end`` is the endpoint of rolling out ``algo`` on
+    the learned field from ``family.initial_point`` -- each example's uniformly sampled domain point
+    (drawn by ``sample_domain`` at dataset-build time, so fixed across epochs), matching the start
+    distribution the on-policy collector trains on -- projected onto the feasible set each step. One
+    callback runs one algorithm; compose a list to sweep several, each logging
+    ``val/{algo}/{residual,eq_dist}``.
+
+    ``equilibrium`` is the reference ``z*`` for ``eq_dist``. It defaults to the origin (the
+    Nash-centered chart's equilibrium for the matrix-game scope); the traffic setting will pass its
+    pre-computed per-instance equilibria as a tensor.
     """
 
     def __init__(self, family, algo, n_steps, h, equilibrium=0.0):
@@ -45,19 +65,35 @@ class RolloutCallback(L.Callback):
         self.equilibrium = equilibrium
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
-        inputs, targets = batch
+        inputs, _ = batch
         field = pl_module.batched_field(self.family, inputs)
         z0 = self.family.initial_point(inputs)
         project = lambda z: self.family.project(inputs, z)
-        params = self.family.params_from_batch(inputs)
         # consensus' torch.func.grad manages its own grad tracking, so the ambient no-grad is fine;
         # params stay out of autograd (avoids the flash-attention grad-mask kernel error).
-        traj = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)
-        endpoint = traj[-1]
-        residual = self.family.operator(params, endpoint).norm(dim=-1).mean()
-        dist_to_eq = (endpoint - self.equilibrium).norm(dim=-1).mean()
-        pl_module.log(f"val/{self.algo}/residual", residual, on_epoch=True, batch_size=targets.shape[0])
-        pl_module.log(f"val/{self.algo}/eq_dist", dist_to_eq, on_epoch=True, batch_size=targets.shape[0])
+        endpoint = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)[-1]
+        _log_equilibrium_metrics(pl_module, self.family, inputs, endpoint, self.algo, self.equilibrium)
+
+
+class SolutionPredictionCallback(L.Callback):
+    """Score a **solution model** at its directly-predicted equilibrium (``--amortization full``).
+
+    ``z_end`` is the model's projected, de-standardized prediction (``SolutionModel.solve``) -- no
+    rollout. The reference ``z*`` for ``eq_dist`` is exact here: the solution model's validation
+    *target* **is** the cached equilibrium, read off the batch. Logs ``val/solution/{residual,eq_dist}``,
+    the same axes as ``FieldRolloutCallback``.
+    """
+
+    def __init__(self, family):
+        super().__init__()
+        self.family = family
+
+    def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
+        inputs, targets = batch
+        z_end = pl_module.solve(self.family, inputs)
+        # The target is the standardized z*; the model owns the de-standardization (its normalizer).
+        equilibrium = pl_module.inverse_target(targets)
+        _log_equilibrium_metrics(pl_module, self.family, inputs, z_end, "solution", equilibrium)
 
 
 class OperatorCountCallback(L.Callback):
@@ -73,7 +109,7 @@ class OperatorCountCallback(L.Callback):
     Logged at the **epoch boundary** with ``on_epoch=True`` (not per training batch), so it lands on
     the same logging step as the epoch-aggregated metrics it exists to be plotted against -- the model
     logs ``train/loss`` / ``train/mse`` with ``on_step=False, on_epoch=True`` and the val metrics
-    ``on_epoch=True`` (see ``models.base`` and ``RolloutCallback``). Logged per training batch instead,
+    ``on_epoch=True`` (see ``models.base`` and ``FieldRolloutCallback``). Logged per training batch instead,
     the budget occupied its own logging steps that no ``on_epoch`` metric ever shared, so selecting it
     as a custom wandb x-axis returned "no data" (nothing to pair against). Per-epoch is also the right
     granularity: every plottable metric here is per-epoch.

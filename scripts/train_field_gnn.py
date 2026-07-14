@@ -17,7 +17,7 @@ batch sizes ``--batch_uniform`` / ``--batch_rollout``):
 - ``uniform`` (baseline): every step draws a fresh instance and solves the operator jointly for
   ``--points_per_instance`` cost points sampled **uniformly** over the calibrated domain box (see
   ``MarkovTrafficEquilibrium.sample_domain``) inside ``DataLoader`` workers -- so the model sees
-  unbounded instance diversity rather than a fixed set (see ``data.build_streaming_dataset`` /
+  unbounded instance diversity rather than a fixed set (see ``data.build_streaming_operator_dataset`` /
   ``UniformSampledOperatorStream``).
 - ``rollout`` (on-policy): trains on the cost points a solver actually visits when rolling out the
   *current* learned field with ``--train_algo`` from uniform starts, refreshed every
@@ -46,11 +46,16 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import OperatorCountCallback, RolloutCallback
-from l2s_games.data import build_streaming_dataset, collate_examples, split_instances
+from l2s_games.callbacks import FieldRolloutCallback, OperatorCountCallback, SolutionPredictionCallback
+from l2s_games.data import (
+    build_streaming_operator_dataset,
+    build_streaming_solution_dataset,
+    collate_examples,
+    split_instances,
+)
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
-from l2s_games.models import GraphormerFieldModel, MLPFieldModel
+from l2s_games.models import FieldModel, GraphormerBackbone, MLPBackbone, SolutionModel
 from l2s_games.operator_count import SharedCounter
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 
@@ -106,6 +111,19 @@ def build_parser():
         help="uncalibrated fallback: reference-equilibrium ceiling widen",
     )
     p.add_argument("--equilibrium_spread", type=float, default=0.2, help="uncalibrated fallback: multiplicative spread")
+    # amortization target: 'partial' (default) learns the operator *field* -- a solver still rolls it
+    # out (--algos) to reach the equilibrium; 'full' learns the equilibrium *solution* directly,
+    # z* = g(params), with no rollout at inference. The same backbone serves both (both predict a
+    # per-edge [B, E] vector); 'full' feeds a parameters-only input (the free-flow start fills the
+    # query column) and regresses z* via the expert solution stream, ignoring --sources / --algos /
+    # --batch_uniform / --batch_rollout.
+    p.add_argument(
+        "--amortization",
+        choices=["partial", "full"],
+        default="partial",
+        help="'partial' learns the operator field (rolled out to solve); 'full' predicts the "
+        "equilibrium solution z* directly from parameters (no rollout)",
+    )
     # model
     p.add_argument(
         "--model",
@@ -171,8 +189,8 @@ def build_parser():
         choices=[name for name in ALGORITHMS if name != "consensus"],
         default="projection",
         help="converging algorithm rolled out to generate training points, on the learned field (the "
-        "on-policy 'rollout' source) and on the *true* field (the 'expert' source); it shapes the "
-        "sampling distribution (projection is the traffic damped fixed point). Reuses --h / --n_steps",
+        "on-policy 'rollout' source) and on the *true* field (the 'expert'/solution source); it shapes "
+        "the sampling distribution (projection is the traffic damped fixed point). Reuses --h / --n_steps",
     )
     p.add_argument("--refresh_every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
     p.add_argument("--n_rollout_instances", type=int, default=128, help="instances rolled out per buffer refresh")
@@ -189,7 +207,7 @@ def build_parser():
     )
     p.add_argument("--exp", type=str, default=None, help="experiment name (wandb group)")
     p.add_argument("--debug", action="store_true", help="run a single train/val batch for quick sanity checking")
-    # validation equilibrium sweep (rollout on the learned field, per algorithm)
+    # validation equilibrium sweep (rollout on the learned field, per algorithm; ignored under --amortization full)
     p.add_argument(
         "--algos",
         nargs="*",
@@ -246,100 +264,75 @@ def main(args):
         n_stds=args.sample_stds,
         operator_counter=operator_counter,
     )
-    (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_dataset(
-        family_factory,
-        bootstrap_inst,
-        val_inst,
-        test_inst,
-        args.points_per_instance,
-        stream_factory=counting_factory,
-    )
+    # 'full' amortization regresses z* directly: its fixed splits use the cached equilibria and its
+    # only train source is the expert solution stream (built below). 'partial' regresses the operator
+    # field, with the uniform stream as its always-on train source. train_ds is None under 'full'.
+    if args.amortization == "full":
+        (val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_solution_dataset(
+            family_factory, bootstrap_inst, val_inst, test_inst
+        )
+        train_ds = None
+    else:
+        (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_operator_dataset(
+            family_factory,
+            bootstrap_inst,
+            val_inst,
+            test_inst,
+            args.points_per_instance,
+            stream_factory=counting_factory,
+        )
     print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
-    # Size the model from one transformed bootstrap example (line-graph structure + feature width);
-    # the train stream is iterable, so it cannot be indexed.
+    # Size the backbone from one transformed bootstrap example (line-graph structure + feature width);
+    # the train stream is iterable, so it cannot be indexed. The same backbone feeds either task:
+    # --amortization picks the Field vs Solution task wrapper (different target + validation), and only
+    # the Field task takes the --loss knobs (the solution task is plain MSE on a standardized z*). The
+    # mlp is the whole-graph flat baseline: flatten the fixed network's per-edge feats [E, k] to one
+    # vector and predict every edge jointly (out_features = E).
     sample, _ = bootstrap_ds[0]
     if args.model == "graphormer":
-        model = GraphormerFieldModel(
+        net = GraphormerBackbone(
             n_feats=sample["feats"].shape[-1],
             in_degree=sample["in_degree"],
             out_degree=sample["out_degree"],
             spd=sample["spd"],
-            lr=args.lr,
-            normalizer=normalizer,
-            weight_decay=0.0,
-            start_factor=args.start_factor,
-            warmup_epochs=args.warmup_epochs,
-            cosine_annealing=bool(args.cosine_annealing),
             dim=args.dim,
             n_heads=args.n_heads,
             n_layers=args.n_layers,
             dim_ff=args.dim_ff,
             dropout=0.0,
-            loss=args.loss,
-            huber_delta_scale=args.huber_delta_scale,
-            rel_eps=args.rel_eps,
         )
     else:
-        # Whole-graph flat baseline: flatten the fixed network's per-edge feats [E, k] to one vector
-        # and predict every edge jointly (out_features = E), reusing --dim / --n_layers for a uniform
-        # hidden stack.
-        model = MLPFieldModel(
+        net = MLPBackbone(
             in_features=sample["feats"].numel(),  # E * k
             hidden=[args.dim] * args.n_layers,
             out_features=sample["feats"].shape[0],  # E
             flatten_start_dim=1,  # collapse per-edge feats [B, E, k] -> [B, E*k]
-            lr=args.lr,
-            normalizer=normalizer,
-            weight_decay=0.0,
-            start_factor=args.start_factor,
-            warmup_epochs=args.warmup_epochs,
-            cosine_annealing=bool(args.cosine_annealing),
-            loss=args.loss,
-            huber_delta_scale=args.huber_delta_scale,
-            rel_eps=args.rel_eps,
         )
+    train_kwargs = dict(
+        lr=args.lr,
+        normalizer=normalizer,
+        weight_decay=0.0,
+        start_factor=args.start_factor,
+        warmup_epochs=args.warmup_epochs,
+        cosine_annealing=bool(args.cosine_annealing),
+    )
+    if args.amortization == "full":
+        model = SolutionModel(net, **train_kwargs)
+    else:
+        loss_kwargs = dict(loss=args.loss, huber_delta_scale=args.huber_delta_scale, rel_eps=args.rel_eps)
+        model = FieldModel(net, **train_kwargs, **loss_kwargs)
     collate = collate_examples(family)
-    # One infinite stream + dataloader per selected source; training_step concatenates the sources
-    # into one MSE (Lightning's CombinedLoader), and the per-source batch sizes set the mix. The
-    # uniform loader keeps its route-choice-solving workers; the on-policy loader holds a live model
-    # ref and so must run in-process (num_workers=0). Uniform is always present (cold-start coverage
-    # while the learned field is near-random); --sources toggles the on-policy source on top of it.
-    train_loaders = {
-        "uniform": DataLoader(
-            train_ds,
-            batch_size=args.batch_uniform,
-            num_workers=args.n_workers,
-            persistent_workers=args.n_workers > 0,
-            collate_fn=collate,
-            worker_init_fn=_single_thread_worker,
-        )
-    }
-    if "rollout" in args.sources:
-        # The on-policy stream owns its rollout + buffer, refreshing from the current field every
-        # --refresh_every epochs; it holds a live model ref, hence num_workers=0. Starts are sampled
-        # uniformly by the (now uniform) sample_domain.
-        rollout_instances = [family.sample_params() for _ in range(args.n_rollout_instances)]
-        buffer_size = args.n_rollout_instances * args.points_per_instance
-        rollout_stream = OnPolicyOperatorStream(
-            counting_factory,
-            normalizer,
-            model,
-            rollout_instances,
-            args.train_algo,
-            args.h,
-            args.n_steps,
-            buffer_size,
-            args.refresh_every,
-        )
-        train_loaders["rollout"] = DataLoader(
-            rollout_stream, batch_size=args.batch_rollout, num_workers=0, collate_fn=collate
-        )
-    if "expert" in args.sources:
-        # The expert stream rolls out the *analytic* operator (no model), so it is picklable and keeps
-        # the uniform loader's route-choice-solving workers; it yields both the expert trajectory and
-        # the equilibrium solutions.
-        expert_stream = ExpertOperatorStream(
+    # Per amortization mode, build the training source loaders and the matching validation callback.
+    # training_step concatenates every source into one MSE (Lightning's CombinedLoader), and the
+    # per-source batch sizes set the mix.
+    if args.amortization == "full":
+        # Full amortization: the sole train source is the expert *solution* stream -- it rolls out the
+        # true operator to z* and regresses z* directly from a parameters-only input (solution_target).
+        # Model-free, so it keeps the route-choice-solving workers; include_trajectory off (its
+        # operator-value targets cannot mix into a z* regression). Validation scores the model's direct
+        # prediction (no rollout).
+        solution_stream = ExpertOperatorStream(
             counting_factory,
             normalizer,
             args.train_algo,
@@ -348,19 +341,79 @@ def main(args):
             args.n_expert_instances,
             args.points_per_instance,
             args.refresh_every,
+            include_trajectory=False,
+            solution_target=True,
         )
-        train_loaders["expert"] = DataLoader(
-            expert_stream,
-            batch_size=args.batch_expert,
-            num_workers=args.n_workers,
-            persistent_workers=args.n_workers > 0,
-            collate_fn=collate,
-            worker_init_fn=_single_thread_worker,
-        )
-    # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
-    # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
-    # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
-    callbacks = [RolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
+        train_loaders = {
+            "solution": DataLoader(
+                solution_stream,
+                batch_size=args.batch_expert,
+                num_workers=args.n_workers,
+                persistent_workers=args.n_workers > 0,
+                collate_fn=collate,
+                worker_init_fn=_single_thread_worker,
+            )
+        }
+        callbacks = [SolutionPredictionCallback(family)]
+    else:
+        # One loader per source named in --sources (>=1, argparse-enforced); training_step blends them.
+        # Validation rolls out the learned field per --algos (a sweep).
+        train_loaders = {}
+        if "uniform" in args.sources:
+            # Fresh uniform-domain samples -- cold-start coverage while the learned field is near-random,
+            # and the picklable stream keeps its route-choice-solving workers.
+            train_loaders["uniform"] = DataLoader(
+                train_ds,
+                batch_size=args.batch_uniform,
+                num_workers=args.n_workers,
+                persistent_workers=args.n_workers > 0,
+                collate_fn=collate,
+                worker_init_fn=_single_thread_worker,
+            )
+        if "rollout" in args.sources:
+            # The on-policy stream owns its rollout + buffer, refreshing from the current field every
+            # --refresh_every epochs; it holds a live model ref, hence num_workers=0. Starts are sampled
+            # uniformly by the (now uniform) sample_domain.
+            rollout_instances = [family.sample_params() for _ in range(args.n_rollout_instances)]
+            buffer_size = args.n_rollout_instances * args.points_per_instance
+            rollout_stream = OnPolicyOperatorStream(
+                counting_factory,
+                normalizer,
+                model,
+                rollout_instances,
+                args.train_algo,
+                args.h,
+                args.n_steps,
+                buffer_size,
+                args.refresh_every,
+            )
+            train_loaders["rollout"] = DataLoader(
+                rollout_stream, batch_size=args.batch_rollout, num_workers=0, collate_fn=collate
+            )
+        if "expert" in args.sources:
+            # The expert stream rolls out the *analytic* operator (no model), so it is picklable and
+            # keeps the route-choice-solving workers; it yields both the expert trajectory and the
+            # equilibrium solutions.
+            expert_stream = ExpertOperatorStream(
+                counting_factory,
+                normalizer,
+                args.train_algo,
+                args.h,
+                args.n_steps,
+                args.n_expert_instances,
+                args.points_per_instance,
+                args.refresh_every,
+            )
+            train_loaders["expert"] = DataLoader(
+                expert_stream,
+                batch_size=args.batch_expert,
+                num_workers=args.n_workers,
+                persistent_workers=args.n_workers > 0,
+                collate_fn=collate,
+                worker_init_fn=_single_thread_worker,
+            )
+        # Pass no --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
+        callbacks = [FieldRolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
     # Log the cumulative training-data operator point-evaluation budget each step (see OperatorCountCallback).
     callbacks.append(OperatorCountCallback(operator_counter))
     # Stop when the val loss stops improving; tolerant like the source setup (a rollout can log a
@@ -417,7 +470,9 @@ def main(args):
         # The train stream is unbounded (no __len__), so cap the epoch at --steps_per_epoch; the
         # epoch-based cosine schedule (over --epochs) counts these bounded epochs.
         limit_train_batches=args.steps_per_epoch,
-        inference_mode="consensus" not in args.algos,  # only consensus' rollout jacrev needs autograd in validation
+        # Only the partial-mode consensus rollout jacrev needs autograd in validation; full mode
+        # (direct z* prediction, no rollout) always runs under inference_mode.
+        inference_mode=args.amortization == "full" or "consensus" not in args.algos,
     )
     trainer.fit(
         model,

@@ -194,16 +194,19 @@ def _examples_for_instances(family, instances, points_per_instance):
     return [example for params in instances for example in _solve_instance(family, params, points_per_instance)]
 
 
-def _fit_normalizer(family, examples):
+def _fit_normalizer(family, examples, target_scaler=AsinhScaler):
     """Fit the feats standardizer and the target scaler on the (transformed) train examples.
 
-    Feats are per-feature standardized; the target is asinh-compressed with a per-edge robust scale
-    (see ``AsinhScaler``) so the heavy BPR tail is tamed at fit time without a hard clip.
+    Feats are per-feature standardized. ``target_scaler`` picks the target normalization: the default
+    ``AsinhScaler`` asinh-compresses the heavy-tailed operator *field* with a robust scale so the BPR
+    tail is tamed without a hard clip; the solution baseline passes ``Standardizer`` instead, treating
+    the equilibrium ``z*`` as a generic per-feature-standardized regression target (see
+    ``build_streaming_solution_dataset``).
     """
     transform = family.transform
     feats = torch.stack([transform(_clone(raw))["feats"] for raw, _ in examples])
     targets = torch.stack([target for _, target in examples])
-    return Normalizer(Standardizer.fit(feats), AsinhScaler.fit(targets))
+    return Normalizer(Standardizer.fit(feats), target_scaler.fit(targets))
 
 
 def build_dataset(family, n_train, n_val, n_test, points_per_instance):
@@ -286,10 +289,13 @@ def split_instances(instances, counts):
     return [[instances[i] for i in subset.indices] for subset in subsets[: len(counts)]]
 
 
-def build_streaming_dataset(
+def build_streaming_operator_dataset(
     family_factory, bootstrap_instances, val_instances, test_instances, points_per_instance, stream_factory=None
 ):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
+
+    Operator-field target (``--amortization partial``): the model regresses the operator value at a
+    domain point. The sibling ``build_streaming_solution_dataset`` builds the ``z*``-target variant.
 
     The bootstrap / val / test instances are pre-solved and passed in (split from a cached
     ``SolvedInstanceDataset``); this builds their ``(input, target)`` examples with the family's
@@ -318,3 +324,38 @@ def build_streaming_dataset(
     # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
     bootstrap_ds = OperatorDataset(bootstrap, family.transform, normalizer)
     return (train_ds, val_ds, test_ds, bootstrap_ds), normalizer
+
+
+def solution_examples(family, instances):
+    """Raw ``(parameters-only input, equilibrium z*)`` examples from cached solved instances.
+
+    The full-amortization target (``--amortization full``): each instance's free-flow-time start fills
+    the query column (``model_input`` -- no point that would leak the answer), regressed onto the
+    cached ``equilibrium_cost`` ``z*`` (solved offline, see ``SolvedInstanceDataset``). Mirrors the
+    ``solution_target=True`` path of ``rollout_sampling.ExpertOperatorStream`` for the fixed splits.
+    """
+    return [
+        (family.model_input(inst, inst.free_flow_time), inst.equilibrium_cost.float()) for inst in instances
+    ]
+
+
+def build_streaming_solution_dataset(family_factory, bootstrap_instances, val_instances, test_instances):
+    """Fixed val/test/bootstrap ``z*``-target ``FieldDataset``s plus the fitted ``Normalizer``.
+
+    The solution-target sibling of ``build_streaming_operator_dataset``. The fixed splits use each
+    instance's cached ``equilibrium_cost`` (exact and free), and the normalizer's target scaler is a
+    per-feature ``Standardizer`` fit on those equilibria -- ``z*`` is a generic regression target, not
+    a field, so it does not use the field's ``AsinhScaler``. There is no ``train_ds`` -- the streaming
+    train part is the expert solution stream (``ExpertOperatorStream(solution_target=True)``), built in
+    the training script with its counting family + algorithm args. Pair with ``collate_examples(family)``
+    for the DataLoaders.
+    """
+    family = family_factory()
+    bootstrap, val, test = (
+        solution_examples(family, instances) for instances in (bootstrap_instances, val_instances, test_instances)
+    )
+    normalizer = _fit_normalizer(family, bootstrap, target_scaler=Standardizer)
+    val_ds, test_ds, bootstrap_ds = (
+        OperatorDataset(split, family.transform, normalizer) for split in (val, test, bootstrap)
+    )
+    return (val_ds, test_ds, bootstrap_ds), normalizer

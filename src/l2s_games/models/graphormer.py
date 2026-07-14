@@ -1,33 +1,35 @@
 import torch
 
-from .base import FieldModel
-
 
 class GraphormerBackbone(torch.nn.Module):
-    """Graphormer model for node-property predictions.
+    """Graphormer over the line graph: per-edge features + structure -> per-edge ``[B, E]`` prediction.
 
-    Encodes features, degree embeddings, and shortest-path spatial
-    biases, then applies a standard Transformer encoder followed by an
-    MLP readout to produce per-node predictions.
+    The complete backbone network: embeds the per-edge ``feats`` to the hidden dim, adds degree
+    embeddings and shortest-path spatial biases, applies a Transformer encoder, and reads out a scalar
+    per edge. ``forward`` reads the line-graph structure from its input (``in_degree`` / ``out_degree``
+    / ``spd``) rather than from buffers, so topology may vary across instances; only the
+    embedding-table sizes are fixed at construction, inferred from a representative structure. A plain
+    ``nn.Module`` (no training logic) so both ``FieldModel`` and ``SolutionModel`` can wrap it.
 
     Args:
-        dim: Hidden dimension of the Transformer.
-        n_heads: Number of attention heads.
-        n_layers: Number of Transformer encoder layers.
-        max_in_degree: Maximum in-degree for the degree embedding table.
-        max_out_degree: Maximum out-degree for the degree embedding table.
-        max_spd: Maximum shortest-path distance for the spatial encoding.
-        dim_ff: Feed-forward dimension in each Transformer layer.
-        dropout: Dropout rate.
+        n_feats: per-edge feature width fed to the input embedding.
+        in_degree / out_degree / spd: a representative instance's structure tensors; their maxima size
+            the degree / spatial-encoding embedding tables.
+        dim: hidden dimension of the Transformer.
+        n_heads: number of attention heads.
+        n_layers: number of Transformer encoder layers.
+        dim_ff: feed-forward dimension in each Transformer layer.
+        dropout: dropout rate.
     """
 
-    def __init__(self, dim, n_heads, n_layers, max_in_degree, max_out_degree, max_spd, dim_ff, dropout):
+    def __init__(self, n_feats, in_degree, out_degree, spd, dim, n_heads, n_layers, dim_ff, dropout):
         super().__init__()
 
         self.n_heads = n_heads
-        self.in_degree_embedding = torch.nn.Embedding(max_in_degree + 1, dim)
-        self.out_degree_embedding = torch.nn.Embedding(max_out_degree + 1, dim)
-        self.spatial_encoding = torch.nn.Embedding(max_spd + 1, n_heads)
+        self.edge_embedding = torch.nn.Linear(n_feats, dim)
+        self.in_degree_embedding = torch.nn.Embedding(int(in_degree.max()) + 1, dim)
+        self.out_degree_embedding = torch.nn.Embedding(int(out_degree.max()) + 1, dim)
+        self.spatial_encoding = torch.nn.Embedding(int(spd[spd.isfinite()].max()) + 1, n_heads)
 
         encoder_layer = torch.nn.TransformerEncoderLayer(
             d_model=dim,
@@ -38,24 +40,21 @@ class GraphormerBackbone(torch.nn.Module):
             batch_first=True,
         )
         self.encoder = torch.nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
+        self.readout = torch.nn.Linear(dim, 1)
 
         # The MHA fast path on CPU mishandles the 3D per-head attention bias,
         # producing NaN in eval mode. A registered hook disables the fast path.
         for layer in self.encoder.layers:
             layer.self_attn.register_forward_hook(lambda m, i, o: None)
 
-    def forward(self, node_embedding, in_degree, out_degree, spd):
-        """Produce per-node encodings from batched inputs.
+    def forward(self, inputs):
+        """Per-edge prediction ``[B, E]`` from the batched inputs dict.
 
-        Args:
-            node_embedding: Pre-computed node embeddings ``[B, N, dim]``.
-            in_degree: Per-node in-degrees ``[B, N]``.
-            out_degree: Per-node out-degrees ``[B, N]``.
-            spd: Shortest-path distances ``[B, N, N]`` (may contain ``inf``).
-
-        Returns:
-            Encoded tensor of shape ``[B, N, dim]``.
+        ``inputs`` carries ``feats`` ``[B, E, n_feats]`` plus the line-graph structure ``in_degree`` /
+        ``out_degree`` ``[B, E]`` and ``spd`` ``[B, E, E]`` (may contain ``inf``).
         """
+        node_embedding = self.edge_embedding(inputs["feats"])
+        in_degree, out_degree, spd = inputs["in_degree"], inputs["out_degree"], inputs["spd"]
         B, N, _ = node_embedding.shape
 
         in_deg = in_degree.clamp(0, self.in_degree_embedding.num_embeddings - 1).long()
@@ -68,35 +67,5 @@ class GraphormerBackbone(torch.nn.Module):
         attn_bias = attn_bias.masked_fill(spd.isinf().unsqueeze(1), -torch.inf)
         attn_bias = attn_bias.reshape(B * self.n_heads, N, N)
 
-        return self.encoder(embedding, mask=attn_bias)  # [B, N, dim]
-
-
-class GraphormerFieldModel(FieldModel):
-    """Graphormer over the line graph: per-edge features + structure -> per-edge field value.
-
-    ``forward`` reads the line-graph structure from its input (``in_degree`` / ``out_degree`` /
-    ``spd``) rather than from buffers, so topology may vary across instances. Only the
-    embedding-table sizes are fixed at construction, inferred from a representative structure.
-    """
-
-    def __init__(
-        self, n_feats, in_degree, out_degree, spd, lr, dim=64, n_heads=4, n_layers=4, dim_ff=128, dropout=0.0, **kwargs
-    ):
-        super().__init__(lr, **kwargs)
-        self.edge_embedding = torch.nn.Linear(n_feats, dim)
-        self.backbone = GraphormerBackbone(
-            dim,
-            n_heads,
-            n_layers,
-            max_in_degree=int(in_degree.max()),
-            max_out_degree=int(out_degree.max()),
-            max_spd=int(spd[spd.isfinite()].max()),
-            dim_ff=dim_ff,
-            dropout=dropout,
-        )
-        self.readout = torch.nn.Linear(dim, 1)
-
-    def forward(self, inputs):
-        node_embedding = self.edge_embedding(inputs["feats"])
-        encoded = self.backbone(node_embedding, inputs["in_degree"], inputs["out_degree"], inputs["spd"])
-        return self.readout(encoded).squeeze(-1)
+        encoded = self.encoder(embedding, mask=attn_bias)  # [B, N, dim]
+        return self.readout(encoded).squeeze(-1)  # [B, E]

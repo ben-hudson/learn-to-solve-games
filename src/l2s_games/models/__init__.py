@@ -1,9 +1,11 @@
-from .base import FieldModel
-from .graphormer import GraphormerFieldModel
-from .mlp import MLPFieldModel
+from .base import AmortizedModel, FieldModel, SolutionModel
+from .graphormer import GraphormerBackbone
+from .mlp import MLPBackbone
 
 __all__ = [
+    "AmortizedModel",
     "FieldModel",
-    "MLPFieldModel",
-    "GraphormerFieldModel",
+    "SolutionModel",
+    "GraphormerBackbone",
+    "MLPBackbone",
 ]
