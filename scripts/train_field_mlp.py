@@ -219,21 +219,19 @@ def main(args):
             args.batch_uniform,
         )
     if "rollout" in args.sources:
-        # The on-policy stream owns its rollout + buffer, refreshing from the current field every
-        # --refresh-every epochs; it holds a live model ref, hence num_workers=0. It also logs the
-        # rollout / true-vs-learned field viz through training (2D domains only).
-        rollout_instances = [game.sample_params() for _ in range(args.n_rollout_instances)]
-        buffer_size = args.n_rollout_instances * args.points_per_instance
+        # The on-policy stream owns its rollout + buffer, refreshing every --refresh-every epochs: it
+        # draws fresh instances and re-rolls out the current field over them (live model ref, hence
+        # num_workers=0). It also logs the rollout / true-vs-learned field viz (2D domains only).
         streams["rollout"] = (
             OnPolicyOperatorStream(
                 family_factory,
                 normalizer,
                 model,
-                rollout_instances,
                 args.train_algo,
                 args.h,
                 args.n_steps,
-                buffer_size,
+                args.n_rollout_instances,
+                args.points_per_instance,
                 args.refresh_every,
             ),
             args.batch_rollout,

@@ -64,27 +64,31 @@ def trajectory_examples(family, instances, traj, n_points):
 
 
 class OnPolicyOperatorStream(OperatorStream):
-    """Infinite stream of on-policy rollout points, refreshed from the *current* model each epoch.
+    """Infinite stream of on-policy rollout points, refreshed from the *current* model each refresh.
 
-    Owns its rollout and its buffer: at the start of each epoch (its ``__iter__``, cadenced by
-    ``refresh_every``) it rolls out the learned field with ``algo`` and refills ``self._buffer`` via
-    ``_rollout_buffer``, then cycles that buffer for the rest of the epoch. The per-epoch length is
-    bounded by ``Trainer(limit_train_batches=...)``, not by buffer exhaustion, so the epoch always has
-    the same number of batches (which Lightning fixes from epoch 0). Rolling out at epoch start
-    mirrors the old ``on_train_epoch_start`` timing.
+    Owns its rollout and its buffer: every ``refresh_every`` epochs (cadenced in ``_raw_stream``) it
+    draws ``n_instances`` fresh instances, rolls out the learned field with ``algo`` over them, and
+    refills ``self._buffer`` via ``_rollout_buffer``, then cycles that buffer for the rest of the
+    window. The per-epoch length is bounded by ``Trainer(limit_train_batches=...)``, not by buffer
+    exhaustion, so the epoch always has the same number of batches (which Lightning fixes from epoch 0).
+
+    The refresh serves two purposes here (unlike the model-free ``ExpertOperatorStream``, where it only
+    rotates instances): it re-rolls out under the **current** field so the state distribution tracks
+    the moving field, *and* it rotates in fresh instances for diversity -- matching the expert stream,
+    so the on-policy source is not pinned to a fixed instance subset.
 
     Holds a **live** ``model`` reference (weights update in place, so it always rolls out the current
     field), which requires ``num_workers=0`` -- the model cannot be pickled to a worker process.
     """
 
-    def __init__(self, family_factory, normalizer, model, instances, algo, h, n_steps, buffer_size, refresh_every):
+    def __init__(self, family_factory, normalizer, model, algo, h, n_steps, n_instances, points_per_instance, refresh_every):
         super().__init__(family_factory, normalizer)
         self.model = model
-        self.instances = instances
         self.algo = algo
         self.h = h
         self.n_steps = n_steps
-        self.buffer_size = buffer_size
+        self.n_instances = n_instances
+        self.points_per_instance = points_per_instance
         self.refresh_every = refresh_every
         self._buffer = None
         self._epoch = -1
@@ -92,11 +96,11 @@ class OnPolicyOperatorStream(OperatorStream):
     def _rollout_buffer(self, family):
         """Fresh raw ``(model_input, target)`` examples for the on-policy training buffer.
 
-        Rolls out the *learned* batched field (on the model's device) from one uniform start per
-        instance, then delegates the shared subsample + per-instance target solve to
-        ``trajectory_examples``. The target is the analytic operator, unnegated -- the model regresses
-        the operator itself, exactly as the uniform pipeline does. Uniform coverage (exploration /
-        cold-start, while the field is near-random) is supplied by the sibling
+        Draws ``n_instances`` fresh instances, rolls out the *learned* batched field (on the model's
+        device) from one uniform start per instance, then delegates the shared subsample + per-instance
+        target solve to ``trajectory_examples``. The target is the analytic operator, unnegated -- the
+        model regresses the operator itself, exactly as the uniform pipeline does. Uniform coverage
+        (exploration / cold-start, while the field is near-random) is supplied by the sibling
         ``UniformSampledOperatorStream``, so this stream is purely on-policy.
 
         The model (hence the learned field) lives on this device; the rollout must run there, while
@@ -104,20 +108,21 @@ class OnPolicyOperatorStream(OperatorStream):
         stream's normalizer stats and the raw instances are CPU). ``batched_rollout`` returns the
         trajectory on CPU.
         """
+        instances = [family.sample_params() for _ in range(self.n_instances)]
         device = next(self.model.parameters()).device
         # One uniform start per instance; the seed also sizes the collated batch (batched_field_input
         # overwrites the point columns with the rollout state each step, so the seed value is arbitrary).
-        z0 = torch.stack([family.sample_domain(inst, 1)[0] for inst in self.instances])  # [B, d]
+        z0 = torch.stack([family.sample_domain(inst, 1)[0] for inst in instances])  # [B, d]
         items = [
             normalize_input(family.model_input(inst, z), family.transform, self.normalizer)
-            for inst, z in zip(self.instances, z0)
+            for inst, z in zip(instances, z0)
         ]
         # Ship the collated batch to the model's device for the rollout (the field runs the model);
         # the batch is a plain dict of tensors for every family, so move it entry-wise.
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in family.collate_fn(items).items()}
         field = self.model.batched_field(family, batch)
         traj = batched_rollout(family, batch, field, ALGORITHMS[self.algo](self.h), self.n_steps, z0.to(device))
-        return trajectory_examples(family, self.instances, traj, self.buffer_size)
+        return trajectory_examples(family, instances, traj, self.n_instances * self.points_per_instance)
 
     def _raw_stream(self, family):
         self._epoch += 1

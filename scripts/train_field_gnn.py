@@ -371,20 +371,18 @@ def main(args):
                 worker_init_fn=_single_thread_worker,
             )
         if "rollout" in args.sources:
-            # The on-policy stream owns its rollout + buffer, refreshing from the current field every
-            # --refresh_every epochs; it holds a live model ref, hence num_workers=0. Starts are sampled
-            # uniformly by the (now uniform) sample_domain.
-            rollout_instances = [family.sample_params() for _ in range(args.n_rollout_instances)]
-            buffer_size = args.n_rollout_instances * args.points_per_instance
+            # The on-policy stream owns its rollout + buffer, refreshing every --refresh_every epochs:
+            # it draws fresh instances and re-rolls out the current field over them (live model ref,
+            # hence num_workers=0). Starts are sampled uniformly by sample_domain.
             rollout_stream = OnPolicyOperatorStream(
                 counting_factory,
                 normalizer,
                 model,
-                rollout_instances,
                 args.train_algo,
                 args.h,
                 args.n_steps,
-                buffer_size,
+                args.n_rollout_instances,
+                args.points_per_instance,
                 args.refresh_every,
             )
             train_loaders["rollout"] = DataLoader(
