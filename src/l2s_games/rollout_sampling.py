@@ -134,10 +134,18 @@ class ExpertOperatorStream(OperatorStream):
     the expert rolls out the ground-truth operator with a converging algorithm, so it holds only the
     picklable ``family_factory`` and runs on ``DataLoader`` workers (``num_workers > 0``) -- essential
     because the rollout is ``n_steps`` operator solves (each an expensive route-choice solve for
-    traffic). Being model-free the expert distribution is stationary, so it streams fresh instance
-    batches continuously like ``UniformSampledOperatorStream`` -- no buffer/refresh.
+    traffic).
 
-    Each rollout draws ``n_instances`` fresh instances and rolls them out **jointly** (one batched
+    Like ``OnPolicyOperatorStream`` it owns a buffer refreshed every ``refresh_every`` epochs (its
+    ``__iter__``): one ``_expert_batch`` solve per refresh window, cycled for the rest of the window,
+    so a solved chunk trains the model across epochs instead of being regenerated-and-discarded every
+    time the epoch (bounded by ``Trainer(limit_train_batches=...)``) ends mid-chunk. This keeps the
+    logged operator-eval budget equal to the distinct solves the model actually trains on, rather than
+    ``n_workers * epochs`` re-solves. Being model-free the expert distribution is stationary, so the
+    refresh exists only to rotate in fresh instances for diversity (``_expert_batch`` draws new ones),
+    not to track a moving field.
+
+    Each refresh draws ``n_instances`` fresh instances and rolls them out **jointly** (one batched
     operator solve per step over the whole batch), then yields ordinary ``(model_input, operator)``
     examples at:
 
@@ -162,6 +170,7 @@ class ExpertOperatorStream(OperatorStream):
         n_steps,
         n_instances,
         points_per_instance,
+        refresh_every,
         algo_kwargs=None,
         include_trajectory=True,
         include_solution=True,
@@ -172,9 +181,12 @@ class ExpertOperatorStream(OperatorStream):
         self.n_steps = n_steps
         self.n_instances = n_instances
         self.points_per_instance = points_per_instance
+        self.refresh_every = refresh_every
         self.algo_kwargs = algo_kwargs or {}
         self.include_trajectory = include_trajectory
         self.include_solution = include_solution
+        self._buffer = None
+        self._epoch = -1
 
     def _expert_batch(self, family):
         """Roll out a fresh batch of instances on the true operator; return trajectory + solution examples."""
@@ -206,5 +218,14 @@ class ExpertOperatorStream(OperatorStream):
         return examples
 
     def _raw_stream(self, family):
+        # Refresh the buffer at epoch start (once per refresh_every epochs), then cycle it -- one
+        # expensive rollout solve per window, reused across epochs, so operator evals track the
+        # distinct solves the model trains on rather than a per-epoch regenerate-and-discard. The
+        # per-epoch length is bounded by Trainer(limit_train_batches=...), not buffer exhaustion.
+        # State persists across epochs: num_workers=0 keeps the object in-process; num_workers>0 runs
+        # with persistent_workers=True (see the training scripts), so each worker's replica survives.
+        self._epoch += 1
+        if self._buffer is None or self._epoch % self.refresh_every == 0:
+            self._buffer = self._expert_batch(family)
         while True:
-            yield from self._expert_batch(family)
+            yield from self._buffer

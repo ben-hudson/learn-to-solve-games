@@ -61,7 +61,7 @@ class RolloutCallback(L.Callback):
 
 
 class OperatorCountCallback(L.Callback):
-    """Log the cumulative ground-truth operator point-evaluation budget each training step.
+    """Log the cumulative ground-truth operator point-evaluation budget once per epoch.
 
     The ``SharedCounter`` (see ``operator_count``) accumulates every training-data operator call
     across the streaming workers and the main process; this logs its current (monotonic) value, so
@@ -69,6 +69,14 @@ class OperatorCountCallback(L.Callback):
     through ``pl_module.log`` (never ``experiment.log``) so wandb's step bookkeeping stays in sync;
     register it as a ``wandb.define_metric`` step_metric at the call site to plot other metrics
     against the budget.
+
+    Logged at the **epoch boundary** with ``on_epoch=True`` (not per training batch), so it lands on
+    the same logging step as the epoch-aggregated metrics it exists to be plotted against -- the model
+    logs ``train/loss`` / ``train/mse`` with ``on_step=False, on_epoch=True`` and the val metrics
+    ``on_epoch=True`` (see ``models.base`` and ``RolloutCallback``). Logged per training batch instead,
+    the budget occupied its own logging steps that no ``on_epoch`` metric ever shared, so selecting it
+    as a custom wandb x-axis returned "no data" (nothing to pair against). Per-epoch is also the right
+    granularity: every plottable metric here is per-epoch.
     """
 
     def __init__(self, counter, key="train/operator_evals"):
@@ -76,8 +84,8 @@ class OperatorCountCallback(L.Callback):
         self.counter = counter
         self.key = key
 
-    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
-        pl_module.log(self.key, float(self.counter.value), on_step=True, on_epoch=False)
+    def on_train_epoch_end(self, trainer, pl_module):
+        pl_module.log(self.key, float(self.counter.value), on_step=False, on_epoch=True)
 
 
 class VizRolloutCallback(L.Callback):

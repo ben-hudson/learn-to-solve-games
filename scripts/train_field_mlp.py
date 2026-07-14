@@ -250,6 +250,7 @@ def main(args):
                 args.n_steps,
                 args.n_expert_instances,
                 args.points_per_instance,
+                args.refresh_every,
             ),
             args.batch_expert,
         )
