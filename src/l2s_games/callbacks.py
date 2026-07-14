@@ -60,6 +60,26 @@ class RolloutCallback(L.Callback):
         pl_module.log(f"val/{self.algo}/eq_dist", dist_to_eq, on_epoch=True, batch_size=targets.shape[0])
 
 
+class OperatorCountCallback(L.Callback):
+    """Log the cumulative ground-truth operator point-evaluation budget each training step.
+
+    The ``SharedCounter`` (see ``operator_count``) accumulates every training-data operator call
+    across the streaming workers and the main process; this logs its current (monotonic) value, so
+    the logged series *is* the cumulative-sum curve -- no in-dashboard cumsum needed. Logging goes
+    through ``pl_module.log`` (never ``experiment.log``) so wandb's step bookkeeping stays in sync;
+    register it as a ``wandb.define_metric`` step_metric at the call site to plot other metrics
+    against the budget.
+    """
+
+    def __init__(self, counter, key="train/operator_evals"):
+        super().__init__()
+        self.counter = counter
+        self.key = key
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        pl_module.log(self.key, float(self.counter.value), on_step=True, on_epoch=False)
+
+
 class VizRolloutCallback(L.Callback):
     """Log the rollout trajectory + true/learned operators along it, for fixed instances through training.
 

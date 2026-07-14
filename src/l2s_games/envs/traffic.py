@@ -28,6 +28,7 @@ from route_choice import MarkovRouteChoice
 from torch_geometric.utils import coalesce, from_networkx
 
 from l2s_games.envs.base import VariationalInequalityFamily
+from l2s_games.operator_count import LocalCounter
 from l2s_games.transforms import traffic_field_transform
 
 
@@ -106,10 +107,15 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         reference_equilibrium=None,
         reference_spread=None,
         n_stds=3.0,
+        operator_counter=None,
     ):
         self.base_graph = _canonicalize(base_graph)
         self.noise_scale = noise_scale
         self.noise_type = noise_type
+        # Cumulative point-evaluation counter: `operator` adds its batch size on every call. The no-op
+        # LocalCounter default keeps `operator` branch-free; a SharedCounter injected via the streaming
+        # family_factory scopes the total to training-data generation (see operator_count.py).
+        self.operator_counter = operator_counter or LocalCounter()
         # Domain sampling must span the whole path the rollout traverses -- from the free-flow-time
         # start up to the equilibrium. ``reference_equilibrium`` (per-edge mean of the bootstrap
         # equilibria) and ``reference_spread`` (their per-edge std) center and scale that range; they
@@ -179,6 +185,7 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         single = costs.dim() == 1
         costs = costs.unsqueeze(0) if single else costs
         batch_size = costs.shape[0]
+        self.operator_counter.add(batch_size)  # one point-evaluation per cost vector solved
         free_flow_time, capacity, b, power = (self._to_batch(params[name], batch_size, 1) for name in _EDGE_ATTRS)
         demand = self._to_batch(params["demand"], batch_size, 2)
         sink_node_mask = self._to_batch(params["sink_node_mask"], batch_size, 2)

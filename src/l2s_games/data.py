@@ -286,7 +286,9 @@ def split_instances(instances, counts):
     return [[instances[i] for i in subset.indices] for subset in subsets[: len(counts)]]
 
 
-def build_streaming_dataset(family_factory, bootstrap_instances, val_instances, test_instances, points_per_instance):
+def build_streaming_dataset(
+    family_factory, bootstrap_instances, val_instances, test_instances, points_per_instance, stream_factory=None
+):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
 
     The bootstrap / val / test instances are pre-solved and passed in (split from a cached
@@ -298,7 +300,12 @@ def build_streaming_dataset(family_factory, bootstrap_instances, val_instances, 
     (points solved jointly per fresh instance) and the bootstrap density; val/test always solve each
     instance once -- the equilibrium rollout depends only on the instance, so extra points there just
     repeat identical rollouts. Pair with ``collate_examples(family)`` for the DataLoaders.
+
+    ``stream_factory`` builds the train stream's per-worker family; it defaults to ``family_factory``.
+    Pass a distinct factory (e.g. one carrying an operator-call counter) to instrument the train
+    stream without counting the one-time bootstrap/val/test build, which always uses ``family_factory``.
     """
+    stream_factory = stream_factory or family_factory
     family = family_factory()
     bootstrap = _examples_for_instances(family, bootstrap_instances, points_per_instance)
     # Solve each fixed val/test instance once: the rollout residual is a function of the instance
@@ -306,7 +313,7 @@ def build_streaming_dataset(family_factory, bootstrap_instances, val_instances, 
     val = _examples_for_instances(family, val_instances, 1)
     test = _examples_for_instances(family, test_instances, 1)
     normalizer = _fit_normalizer(family, bootstrap)
-    train_ds = UniformSampledOperatorStream(family_factory, normalizer, points_per_instance)
+    train_ds = UniformSampledOperatorStream(stream_factory, normalizer, points_per_instance)
     val_ds, test_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test))
     # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
     bootstrap_ds = OperatorDataset(bootstrap, family.transform, normalizer)

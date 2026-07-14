@@ -46,11 +46,12 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import RolloutCallback
+from l2s_games.callbacks import OperatorCountCallback, RolloutCallback
 from l2s_games.data import build_streaming_dataset, collate_examples, split_instances
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.models import GraphormerFieldModel, MLPFieldModel
+from l2s_games.operator_count import SharedCounter
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 
 torch.set_float32_matmul_precision("medium")
@@ -115,9 +116,9 @@ def build_parser():
         "graph inductive bias)",
     )
     p.add_argument("--dim", type=int, default=128, help="hidden dim")
-    p.add_argument("--n_heads", type=int, default=4, help="attention heads (graphormer only)")
+    p.add_argument("--n_heads", type=int, default=8, help="attention heads (graphormer only)")
     p.add_argument("--n_layers", type=int, default=6, help="layers")
-    p.add_argument("--dim_ff", type=int, default=256, help="feed-forward dim (graphormer only)")
+    p.add_argument("--dim_ff", type=int, default=512, help="feed-forward dim (graphormer only)")
     # No --dropout / --weight_decay: the streaming pipeline sees a fresh instance every step, so it
     # can't overfit -- both are hardcoded to 0 (no regularization) at model construction.
     # loss norm: the model always predicts in asinh space; --loss picks the norm the error is measured
@@ -138,12 +139,12 @@ def build_parser():
         help="rel_l2 denominator floor, in asinh-scale units (caps near-eq up-weighting)",
     )
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
-    p.add_argument("--lr", type=float, default=1e-3, help="AdamW learning rate")
-    p.add_argument("--start_factor", type=float, default=0.01, help="linear warmup start factor")
-    p.add_argument("--warmup_epochs", type=int, default=50, help="linear warmup epochs (must be < --epochs)")
-    p.add_argument("--cosine_annealing", type=int, default=1, help="cosine-anneal after warmup (0 disables)")
-    p.add_argument("--gradient_clip_val", type=float, default=1.0, help="gradient-norm clip value")
-    p.add_argument("--epochs", type=int, default=400, help="training epochs")
+    p.add_argument("--lr", type=float, default=0.0012, help="AdamW learning rate")
+    p.add_argument("--start_factor", type=float, default=0.011, help="linear warmup start factor")
+    p.add_argument("--warmup_epochs", type=int, default=30, help="linear warmup epochs (must be < --epochs)")
+    p.add_argument("--cosine_annealing", type=int, default=0, help="cosine-anneal after warmup (0 disables)")
+    p.add_argument("--gradient_clip_val", type=float, default=7, help="gradient-norm clip value")
+    p.add_argument("--epochs", type=int, default=2000, help="training epochs")
     p.add_argument(
         "--steps_per_epoch", type=int, default=64, help="train batches per epoch (bounds the infinite streams)"
     )
@@ -231,12 +232,27 @@ def main(args):
         n_stds=args.sample_stds,
     )
     family = family_factory()
+    # A process-safe counter of ground-truth operator point-evaluations (the training budget), shared
+    # only by the families that generate training data: counting_factory bakes it in, so every
+    # streaming worker + the on-policy/expert streams increment the same total, while the main `family`
+    # (validation + collate) and the one-time bootstrap/val/test build stay counter-free (family_factory).
+    operator_counter = SharedCounter()
+    counting_factory = functools.partial(
+        MarkovTrafficEquilibrium,
+        dataset.base_graph,
+        noise_scale=args.noise_scale,
+        reference_equilibrium=reference_equilibrium,
+        reference_spread=reference_spread,
+        n_stds=args.sample_stds,
+        operator_counter=operator_counter,
+    )
     (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_dataset(
         family_factory,
         bootstrap_inst,
         val_inst,
         test_inst,
         args.points_per_instance,
+        stream_factory=counting_factory,
     )
     print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
@@ -306,7 +322,7 @@ def main(args):
         rollout_instances = [family.sample_params() for _ in range(args.n_rollout_instances)]
         buffer_size = args.n_rollout_instances * args.points_per_instance
         rollout_stream = OnPolicyOperatorStream(
-            family_factory,
+            counting_factory,
             normalizer,
             model,
             rollout_instances,
@@ -324,7 +340,7 @@ def main(args):
         # the uniform loader's route-choice-solving workers; it yields both the expert trajectory and
         # the equilibrium solutions.
         expert_stream = ExpertOperatorStream(
-            family_factory,
+            counting_factory,
             normalizer,
             args.train_algo,
             args.h,
@@ -344,6 +360,8 @@ def main(args):
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
     # --algos to skip the sweep for fast field-only tuning (rel_err metrics still logged).
     callbacks = [RolloutCallback(family, name, args.n_steps, args.h) for name in args.algos]
+    # Log the cumulative training-data operator point-evaluation budget each step (see OperatorCountCallback).
+    callbacks.append(OperatorCountCallback(operator_counter))
     # Stop when the val loss stops improving; tolerant like the source setup (a rollout can log a
     # non-finite residual without aborting the run). cos_err/mag_ratio are reported as diagnostics.
     callbacks.append(
@@ -362,15 +380,17 @@ def main(args):
     elif args.logger == "wandb":
         # Tag the run with game=traffic so its config is comparable to train_field_mlp.py's runs
         # (which log --game); this script is traffic-only, so it's a fixed constant.
-        logger = WandbLogger(
-            experiment=wandb.init(
-                project="learn-to-solve-games",
-                group=args.exp,
-                config={**vars(args), "game": "traffic"},
-                dir=save_dir,
-            ),
-            save_dir=save_dir,
+        run = wandb.init(
+            project="learn-to-solve-games",
+            group=args.exp,
+            config={**vars(args), "game": "traffic"},
+            dir=save_dir,
         )
+        # Declare the operator budget so it can be *selected* as a custom x-axis in any panel (e.g.
+        # plot val/mse against the number of ground-truth operator evaluations spent) -- without
+        # forcing it as the default x-axis for any metric.
+        run.define_metric("train/operator_evals")
+        logger = WandbLogger(experiment=run, save_dir=save_dir)
     else:
         logger = CSVLogger(save_dir=save_dir)
     # Save the best (by val/mse) + last checkpoint so a run's weights survive for downstream analysis.
