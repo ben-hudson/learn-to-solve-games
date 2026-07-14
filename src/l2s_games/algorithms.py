@@ -1,9 +1,14 @@
 """
-Each algorithm carries its own state and exposes ``.step(z, v) -> z_next``,
-where ``z`` is the current iterate (any shape) and ``v`` is the vector field.
-To add your own, copy a class, implement ``.step``, and register it in
-``ALGORITHMS``.
+Game-optimization dynamics as a small class hierarchy.
+
+Each algorithm is an ``Algorithm`` subclass carrying its own state and step size ``h``, and exposing
+``step(z, v) -> z_next``, where ``z`` is the current iterate (any shape) and ``v`` is the vector
+field. Every constructor takes ``h`` first (subclasses add their own extra hyperparameters), so the
+``ALGORITHMS`` registry can build any of them uniformly as ``ALGORITHMS[name](h, **kwargs)``. To add
+your own, subclass ``Algorithm``, implement ``step``, and register the class in ``ALGORITHMS``.
 """
+
+from abc import ABC, abstractmethod
 
 import torch
 
@@ -12,7 +17,22 @@ def _identity(z):
     return z
 
 
-class SimpleProjection:
+class Algorithm(ABC):
+    """Base game-dynamics update: holds the step size ``h`` and exposes ``step(z, v) -> z_next``.
+
+    The shared contract behind the ``ALGORITHMS`` registry: ``h`` is always the first constructor
+    argument, so every algorithm builds uniformly as ``ALGORITHMS[name](h, **kwargs)``.
+    """
+
+    def __init__(self, h):
+        self.h = h
+
+    @abstractmethod
+    def step(self, z, v):
+        """One update from iterate ``z`` under field ``v``, returning the next iterate."""
+
+
+class SimpleProjection(Algorithm):
     """Basic projection method for a variational inequality: a forward step along the field,
     then a projection back onto the feasible set -- ``z <- project(z + h v(z))``.
 
@@ -24,30 +44,28 @@ class SimpleProjection:
     supplied there instead and ``project`` left at its default."""
 
     def __init__(self, h, project=None):
-        self.h = h
+        super().__init__(h)
         self.project = project if project is not None else _identity
 
     def step(self, z, v):
         return self.project(z + self.h * v(z))
 
 
-class ExtraGradient:
+class ExtraGradient(Algorithm):
     """Extragradient: a lookahead step, then a step taken from the lookahead
     point. Converges on rotational fields where plain GD diverges."""
-
-    def __init__(self, h):
-        self.h = h
 
     def step(self, z, v):
         z_half = z + self.h * v(z)
         return z + self.h * v(z_half)
 
 
-class Optimistic:
+class Optimistic(Algorithm):
     """Optimistic gradient descent (extrapolation from the past gradient)."""
 
     def __init__(self, h):
-        self.h, self.prev = h, None
+        super().__init__(h)
+        self.prev = None
 
     def step(self, z, v):
         g = v(z)
@@ -58,11 +76,12 @@ class Optimistic:
         return z_next
 
 
-class Momentum:
+class Momentum(Algorithm):
     """Heavy-ball momentum."""
 
     def __init__(self, h, beta=0.9):
-        self.h, self.beta, self.m = h, beta, None
+        super().__init__(h)
+        self.beta, self.m = beta, None
 
     def step(self, z, v):
         g = v(z)
@@ -70,13 +89,14 @@ class Momentum:
         return z + self.h * self.m
 
 
-class Consensus:
+class Consensus(Algorithm):
     """Consensus optimization (Mescheder et al. 2017): follow the modified
     field  v - gamma * J^T v = v - gamma * grad(0.5 * ||v||^2),
     which adds a contractive component and damps the rotation."""
 
     def __init__(self, h, gamma=1.0):
-        self.h, self.gamma = h, gamma
+        super().__init__(h)
+        self.gamma = gamma
 
     def step(self, z, v):
         g = v(z)
@@ -87,14 +107,13 @@ class Consensus:
         return z + self.h * (g - self.gamma * consensus_term)
 
 
-# Each constructor forwards **kwargs to its algorithm class, so callers can override the extra
-# hyperparameters (momentum beta, consensus gamma) while the class-level defaults still apply when
-# none are passed -- e.g. ALGORITHMS["momentum"](h) keeps beta=0.9, ALGORITHMS["momentum"](h, beta=0.5)
-# overrides it.
+# Names map straight to the classes: every constructor takes ``h`` first plus optional extra
+# hyperparameters, so ``ALGORITHMS[name](h)`` uses the class-level defaults (beta=0.9, gamma=1.0)
+# and ``ALGORITHMS[name](h, beta=0.5)`` overrides them.
 ALGORITHMS = {
-    "projection": lambda h, **kwargs: SimpleProjection(h, **kwargs),
-    "extragradient": lambda h, **kwargs: ExtraGradient(h, **kwargs),
-    "optimistic": lambda h, **kwargs: Optimistic(h, **kwargs),
-    "momentum": lambda h, **kwargs: Momentum(h, **kwargs),
-    "consensus": lambda h, **kwargs: Consensus(h, **kwargs),
+    "projection": SimpleProjection,
+    "extragradient": ExtraGradient,
+    "optimistic": Optimistic,
+    "momentum": Momentum,
+    "consensus": Consensus,
 }
