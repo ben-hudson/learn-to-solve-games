@@ -31,7 +31,7 @@ from l2s_games.data import UniformSampledOperatorStream, build_dataset, collate_
 from l2s_games.dynamics import simulate
 from l2s_games.envs import make_game
 from l2s_games.models import MLPFieldModel
-from l2s_games.rollout_sampling import OnPolicyOperatorStream
+from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
 
 
@@ -58,8 +58,12 @@ def build_parser():
     p.add_argument("--val-every-n-epochs", type=int, default=10, help="run validation (+ rollout viz) every N epochs")
     p.add_argument("--batch-uniform", type=int, default=256, help="minibatch size for the uniform stream")
     p.add_argument("--batch-rollout", type=int, default=768, help="minibatch size for the on-policy rollout stream")
+    p.add_argument("--batch-expert", type=int, default=768, help="minibatch size for the expert-demonstration stream")
     p.add_argument(
         "--steps-per-epoch", type=int, default=64, help="train batches per epoch (bounds the infinite streams)"
+    )
+    p.add_argument(
+        "--n-workers", type=int, default=4, help="workers for the picklable (uniform + expert) loaders (0 = serial)"
     )
     # dynamics comparison (same knobs as the sandbox)
     p.add_argument("--h", type=float, default=0.1, help="algorithm step size")
@@ -76,23 +80,29 @@ def build_parser():
     p.add_argument(
         "--sources",
         nargs="+",
-        choices=["uniform", "rollout"],
+        choices=["uniform", "rollout", "expert"],
         default=["uniform"],
         help="training data sources, each its own stream+dataloader: 'uniform' samples the domain "
         "uniformly (baseline); 'rollout' trains on points visited by rolling out the current learned "
-        "field (on-policy), refreshed every --refresh-every epochs. Combine both to blend them (the mix "
-        "is set by --batch-uniform / --batch-rollout)",
+        "field (on-policy), refreshed every --refresh-every epochs; 'expert' trains on the path a "
+        "converging algorithm takes on the *true* field plus the equilibrium solutions. Combine them "
+        "to blend (the mix is set by --batch-uniform / --batch-rollout / --batch-expert)",
     )
+    # Both rollout-based sources generate training points by rolling out the SAME converging algorithm
+    # -- 'rollout' on the learned field, 'expert' on the true operator -- so they share --train-algo.
+    # consensus is excluded: jacrev does not compose through the analytic operator the expert rolls out.
     p.add_argument(
-        "--rollout-algo",
-        choices=list(ALGORITHMS),
+        "--train-algo",
+        choices=[name for name in ALGORITHMS if name != "consensus"],
         default="extragradient",
-        help="algorithm rolled out on the learned field to generate on-policy points (also used for the "
-        "rollout viz); it shapes the sampling distribution -- projection spirals on RPS, extragradient/"
-        "consensus converge",
+        help="converging algorithm rolled out to generate training points, on the learned field (the "
+        "on-policy 'rollout' source, also used for the rollout viz) and on the *true* field (the "
+        "'expert' source); it shapes the sampling distribution -- projection spirals on RPS, "
+        "extragradient converges",
     )
     p.add_argument("--refresh-every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
     p.add_argument("--n-rollout-instances", type=int, default=128, help="instances rolled out per buffer refresh")
+    p.add_argument("--n-expert-instances", type=int, default=128, help="instances rolled out jointly per expert batch")
     p.add_argument("--n-viz-instances", type=int, default=3, help="held-out instances shown in the rollout viz")
     # logging (ported from train_field_gnn.py): wandb logs viz as images, csv saves them as PNGs to disk
     p.add_argument("--logger", choices=["wandb", "csv"], default="csv", help="metrics/viz sink")
@@ -217,7 +227,7 @@ def main(args):
                 normalizer,
                 model,
                 rollout_instances,
-                args.rollout_algo,
+                args.train_algo,
                 args.h,
                 args.n_steps,
                 buffer_size,
@@ -227,7 +237,22 @@ def main(args):
         )
         if game.domain_dim == 2:
             viz_instances = [game.sample_params() for _ in range(args.n_viz_instances)]
-            callbacks.append(VizRolloutCallback(game, viz_instances, args.rollout_algo, args.h, args.n_steps, save_dir))
+            callbacks.append(VizRolloutCallback(game, viz_instances, args.train_algo, args.h, args.n_steps, save_dir))
+    if "expert" in args.sources:
+        # The expert stream rolls out the *analytic* operator (no model), so it is picklable and runs
+        # on workers; it yields both the expert trajectory and the equilibrium solutions.
+        streams["expert"] = (
+            ExpertOperatorStream(
+                family_factory,
+                normalizer,
+                args.train_algo,
+                args.h,
+                args.n_steps,
+                args.n_expert_instances,
+                args.points_per_instance,
+            ),
+            args.batch_expert,
+        )
 
     trainer = L.Trainer(
         max_epochs=args.epochs,
@@ -244,7 +269,18 @@ def main(args):
         not in args.algorithms,  # validation rolls out consensus, whose grad term needs autograd
     )
     collate = collate_examples(game)
-    train_loaders = {k: DataLoader(ds, batch_size=b, collate_fn=collate) for k, (ds, b) in streams.items()}
+    # The uniform + expert streams are picklable (no model ref), so they run on --n-workers workers;
+    # the on-policy stream holds a live model and must stay in-process (num_workers=0).
+    train_loaders = {
+        k: DataLoader(
+            ds,
+            batch_size=b,
+            collate_fn=collate,
+            num_workers=0 if k == "rollout" else args.n_workers,
+            persistent_workers=k != "rollout" and args.n_workers > 0,
+        )
+        for k, (ds, b) in streams.items()
+    }
     trainer.fit(
         model,
         train_loaders,

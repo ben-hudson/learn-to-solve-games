@@ -41,6 +41,11 @@ def _join(root, name):
 _NOISED_ATTRS = ("free_flow_time", "capacity")  # TODO: add demand back in once everything is working
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
 _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost/flow, when present
+# Node-coordinate attrs that ``from_networkx`` carries off the TNTP graph (positions + PyG's x/y
+# aliases). Nothing in the pipeline reads them, but they are float64 and ``collate_fn`` would stack
+# them into the batch -- where float64 breaks the device transfer (MPS rejects float64). Dropped in
+# ``model_input`` so no float64 ever reaches a batch (and the batch stays leaner).
+_DROPPED_NODE_ATTRS = ("x", "y", "X", "Y")
 
 
 def load_sioux_falls_base_graph(root, scaling=1000.0):
@@ -236,9 +241,13 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         """Raw input item: the instance graph with the domain point attached as ``.cost``.
 
         Featurization (per-edge features + line-graph structure) is deferred to ``transform`` so it
-        runs lazily per access -- see the note in ``transforms.py``.
+        runs lazily per access -- see the note in ``transforms.py``. Unused float64 node-coordinate
+        attrs are dropped here (see ``_UNUSED_NODE_ATTRS``) so they never reach the collated batch.
         """
         item = graph.clone()
+        for attr in _DROPPED_NODE_ATTRS:
+            if attr in item:
+                del item[attr]
         item.cost = torch.as_tensor(cost, dtype=torch.float32)
         return item
 

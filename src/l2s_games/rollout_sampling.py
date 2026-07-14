@@ -1,24 +1,66 @@
-"""On-policy training points: roll out the *learned* field, sample the operator along it.
+"""Training points from *rolling out* a field: on-policy (learned field) and expert (true field).
 
-The uniform pipeline (``data.build_dataset``) trains on points drawn uniformly over the
-domain. ``OnPolicyOperatorStream`` (below) instead samples the points a solver *actually
-visits*: it rolls out the current model's field with a pluggable algorithm from random starts
-and evaluates the ground-truth operator at the visited states, so the model is trained on the
-state distribution its own field induces. The field changes as it trains, so the stream
-regenerates its buffer periodically -- one refreshing stream per training loader.
+The uniform pipeline (``data.build_dataset``) trains on points drawn uniformly over the domain.
+The two streams here instead sample the points a *solver actually visits*, rolling out a batch of
+instances jointly and evaluating the ground-truth operator at the visited states:
 
-Everything runs through the existing family seams -- ``model_input`` / ``transform`` /
-``collate_fn`` (conditioning), ``batched_field`` (the batched learned field, real units),
-``project`` (off the collated batch), ``simulate`` + ``ALGORITHMS`` (the rollout), and
-``operator`` (the per-instance target) -- so it is blind to the concrete representation and
-works for both the flat (RPS/matrix) and graph (traffic) families.
+- ``OnPolicyOperatorStream`` rolls out the **current learned field**, so the model is trained on the
+  state distribution its own field induces. The field changes as it trains, so the stream refreshes
+  its buffer periodically. It holds a live model ref (``num_workers=0``).
+- ``ExpertOperatorStream`` rolls out the **true operator** with a converging algorithm, exposing both
+  the expert *trajectory* (the path a good solver takes) and the *equilibrium solution* (the
+  converged endpoint). It is model-free -- holds only the picklable ``family_factory`` -- so it runs
+  on ``DataLoader`` workers, which it must: the rollout is ``n_steps`` operator solves.
+
+Both share the same batched machinery (``batched_rollout`` + ``trajectory_examples``), differing only
+in *which* batched field is rolled out. Everything runs through the existing family seams --
+``model_input`` / ``transform`` / ``collate_fn`` (conditioning), ``batched_field`` (the batched
+learned field, real units) or ``operator`` (the batched analytic field), ``params_from_batch`` /
+``project`` (off the collated batch), ``simulate`` + ``ALGORITHMS`` (the rollout) -- so they are blind
+to the concrete representation and work for both the flat (RPS/matrix) and graph (traffic) families.
 """
 
 import torch
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.data import OperatorStream, normalize_input
+from l2s_games.data import OperatorStream, examples_at_points, normalize_input
 from l2s_games.dynamics import simulate
+
+
+def batched_rollout(family, batch, field, algo, n_steps, z0):
+    """Roll out ``-field`` over the whole instance batch; returns the trajectory ``[T+1, B, d]`` (CPU).
+
+    ``field`` is a batched real-unit field ``v(Z): [B, d] -> [B, d]`` (the learned batched field for
+    the on-policy collector, the batched analytic operator for the expert), rolled out in descent
+    (``-field``, toward the operator's zero) with an **already-constructed** ``algo`` instance -- so
+    this makes no assumption about the algorithm's constructor (extra params like momentum ``beta``
+    are the caller's concern). ``simulate`` detaches every iterate, so no graph leaks into data
+    loading; consensus manages its own autograd internally (caller runs with inference_mode off).
+    """
+    project = lambda z: family.project(batch, z)
+    return simulate(lambda z: -field(z), algo, z0, n_steps, project=project).cpu()
+
+
+def trajectory_examples(family, instances, traj, n_points):
+    """Raw ``(model_input, target)`` examples from ``n_points`` states subsampled across a rollout.
+
+    Flattens the trajectory ``[T+1, B, d]`` over time and instances, tracking each row's instance so
+    its params drive the target solve, subsamples ``n_points`` of the visited states, then solves the
+    analytic operator per instance over its picked points (one solve per instance) via
+    ``examples_at_points``. The assembled examples are shuffled so a minibatch is not dominated by a
+    single instance.
+    """
+    n_steps, n_inst = traj.shape[0], traj.shape[1]
+    flat_points = traj.reshape(n_steps * n_inst, -1)  # [(T+1)*B, d]
+    flat_inst = torch.arange(n_inst).repeat(n_steps)  # instance index per flat row
+    pick = torch.randint(0, flat_points.shape[0], (n_points,))
+    points, picked_inst = flat_points[pick], flat_inst[pick]
+    examples = []
+    for b, inst in enumerate(instances):
+        pts = points[picked_inst == b]  # [m, d]
+        if pts.shape[0] > 0:
+            examples += examples_at_points(family, inst, pts)
+    return [examples[i] for i in torch.randperm(len(examples))]
 
 
 class OnPolicyOperatorStream(OperatorStream):
@@ -29,8 +71,7 @@ class OnPolicyOperatorStream(OperatorStream):
     ``_rollout_buffer``, then cycles that buffer for the rest of the epoch. The per-epoch length is
     bounded by ``Trainer(limit_train_batches=...)``, not by buffer exhaustion, so the epoch always has
     the same number of batches (which Lightning fixes from epoch 0). Rolling out at epoch start
-    mirrors the old ``on_train_epoch_start`` timing; ``simulate`` detaches every iterate, so no graph
-    leaks into data loading.
+    mirrors the old ``on_train_epoch_start`` timing.
 
     Holds a **live** ``model`` reference (weights update in place, so it always rolls out the current
     field), which requires ``num_workers=0`` -- the model cannot be pickled to a worker process.
@@ -51,23 +92,18 @@ class OnPolicyOperatorStream(OperatorStream):
     def _rollout_buffer(self, family):
         """Fresh raw ``(model_input, target)`` examples for the on-policy training buffer.
 
-        Rolls out ``-learned_field`` (descent, matching ``RolloutCallback``) with
-        ``ALGORITHMS[self.algo]`` from one uniform start per instance, then samples ``buffer_size`` of
-        the visited states. The target at each chosen point is the analytic operator, unnegated -- the
-        model regresses the operator itself, exactly as the uniform pipeline does. Uniform coverage
-        (exploration / cold-start, while the field is near-random) is supplied by the sibling
+        Rolls out the *learned* batched field (on the model's device) from one uniform start per
+        instance, then delegates the shared subsample + per-instance target solve to
+        ``trajectory_examples``. The target is the analytic operator, unnegated -- the model regresses
+        the operator itself, exactly as the uniform pipeline does. Uniform coverage (exploration /
+        cold-start, while the field is near-random) is supplied by the sibling
         ``UniformSampledOperatorStream``, so this stream is purely on-policy.
 
-        Representation-agnostic: it drives the same family seams the validation rollout uses
-        (``model_input`` -> ``transform`` -> ``collate_fn`` for the batch, ``batched_field`` for the
-        learned field, ``params_from_batch`` / ``project`` off the collated batch, ``operator`` for the
-        targets), so it works for flat games and graph instances alike. Targets are solved once per
-        instance over its picked points (one route-choice solve per instance for traffic), then the
-        assembled examples are shuffled so a minibatch is not dominated by a single instance.
+        The model (hence the learned field) lives on this device; the rollout must run there, while
+        featurization here and the operator solve inside ``trajectory_examples`` stay on CPU (the
+        stream's normalizer stats and the raw instances are CPU). ``batched_rollout`` returns the
+        trajectory on CPU.
         """
-        # The model (hence the learned field) lives on this device; the rollout must run there, while
-        # featurization above and the operator solve below stay on CPU (the stream's normalizer stats
-        # and the raw instances are CPU, matching every other stream). See the two moves below.
         device = next(self.model.parameters()).device
         # One uniform start per instance; the seed also sizes the collated batch (batched_field_input
         # overwrites the point columns with the rollout state each step, so the seed value is arbitrary).
@@ -80,31 +116,8 @@ class OnPolicyOperatorStream(OperatorStream):
         # the batch is a plain dict of tensors for every family, so move it entry-wise.
         batch = {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in family.collate_fn(items).items()}
         field = self.model.batched_field(family, batch)
-        project = lambda z: family.project(batch, z)
-        # simulate() detaches every iterate, so the trajectory is a set of sample locations with no
-        # graph; consensus manages its own autograd internally (caller runs with inference_mode off).
-        traj = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0.to(device), self.n_steps, project=project)  # [T+1,B,d]
-
-        # Back to CPU (a single ~20MB copy per refresh) so the per-instance operator solve + model_input
-        # below run on CPU against the CPU raw instances -- the operator path the uniform stream uses.
-        traj = traj.cpu()
-        # Flatten the trajectory, tracking each row's instance so targets + model_input use its params.
-        n_steps, n_inst = traj.shape[0], traj.shape[1]
-        flat_points = traj.reshape(n_steps * n_inst, -1)  # [(T+1)*B, d]
-        flat_inst = torch.arange(n_inst).repeat(n_steps)  # instance index per flat row
-        pick = torch.randint(0, flat_points.shape[0], (self.buffer_size,))
-        points, picked_inst = flat_points[pick], flat_inst[pick]
-
-        # Solve the operator per instance over its picked points, then assemble + shuffle the examples.
-        examples = []
-        with torch.no_grad():
-            for b, inst in enumerate(self.instances):
-                pts = points[picked_inst == b]  # [m, d]
-                if pts.shape[0] == 0:
-                    continue
-                targets = family.operator(inst, pts)
-                examples += [(family.model_input(inst, pts[j]), targets[j]) for j in range(pts.shape[0])]
-        return [examples[i] for i in torch.randperm(len(examples))]
+        traj = batched_rollout(family, batch, field, ALGORITHMS[self.algo](self.h), self.n_steps, z0.to(device))
+        return trajectory_examples(family, self.instances, traj, self.buffer_size)
 
     def _raw_stream(self, family):
         self._epoch += 1
@@ -112,3 +125,86 @@ class OnPolicyOperatorStream(OperatorStream):
             self._buffer = self._rollout_buffer(family)
         while True:
             yield from self._buffer
+
+
+class ExpertOperatorStream(OperatorStream):
+    """Infinite stream of expert demonstrations: roll out the *true* operator, sample along it + z*.
+
+    Unlike ``OnPolicyOperatorStream`` (which rolls out the *learned* field and so holds a live model),
+    the expert rolls out the ground-truth operator with a converging algorithm, so it holds only the
+    picklable ``family_factory`` and runs on ``DataLoader`` workers (``num_workers > 0``) -- essential
+    because the rollout is ``n_steps`` operator solves (each an expensive route-choice solve for
+    traffic). Being model-free the expert distribution is stationary, so it streams fresh instance
+    batches continuously like ``UniformSampledOperatorStream`` -- no buffer/refresh.
+
+    Each rollout draws ``n_instances`` fresh instances and rolls them out **jointly** (one batched
+    operator solve per step over the whole batch), then yields ordinary ``(model_input, operator)``
+    examples at:
+
+    - ``n_instances * points_per_instance`` states subsampled along the trajectory (the expert path),
+      when ``include_trajectory``, and
+    - the converged endpoint ``z*`` (the equilibrium solution), one per instance -- all ``n_instances``
+      solved in a single batched operator call -- when ``include_solution``.
+
+    Both are plain operator examples, so they blend into the same regression MSE. The two ``include_*``
+    gates let a future solutions-only baseline select just the equilibria by config, not a rewrite.
+    ``algo`` must be non-Jacobian (``consensus`` is excluded: ``jacrev`` does not compose through the
+    analytic traffic operator); ``algo_kwargs`` overrides its extra hyperparameters (e.g. momentum
+    ``beta``) picklably through the registry.
+    """
+
+    def __init__(
+        self,
+        family_factory,
+        normalizer,
+        algo,
+        h,
+        n_steps,
+        n_instances,
+        points_per_instance,
+        algo_kwargs=None,
+        include_trajectory=True,
+        include_solution=True,
+    ):
+        super().__init__(family_factory, normalizer)
+        self.algo = algo
+        self.h = h
+        self.n_steps = n_steps
+        self.n_instances = n_instances
+        self.points_per_instance = points_per_instance
+        self.algo_kwargs = algo_kwargs or {}
+        self.include_trajectory = include_trajectory
+        self.include_solution = include_solution
+
+    def _expert_batch(self, family):
+        """Roll out a fresh batch of instances on the true operator; return trajectory + solution examples."""
+        instances = [family.sample_params() for _ in range(self.n_instances)]
+        z0 = torch.stack([family.sample_domain(inst, 1)[0] for inst in instances])  # [B, d]
+        items = [
+            normalize_input(family.model_input(inst, z), family.transform, self.normalizer)
+            for inst, z in zip(instances, z0)
+        ]
+        # All-CPU (no model), so no device move; params_from_batch points the operator at the batch's
+        # real-unit attrs -- the same batched analytic path the validation RolloutCallback uses.
+        batch = family.collate_fn(items)
+        params = family.params_from_batch(batch)
+        algo = ALGORITHMS[self.algo](self.h, **self.algo_kwargs)  # fresh instance per rollout
+        field = lambda z: family.operator(params, z)
+        traj = batched_rollout(family, batch, field, algo, self.n_steps, z0)  # [T+1, B, d]
+
+        examples = []
+        if self.include_trajectory:
+            examples += trajectory_examples(family, instances, traj, self.n_instances * self.points_per_instance)
+        if self.include_solution:
+            # Each instance's converged endpoint traj[-1, b] is its equilibrium solution z*; solve the
+            # operator (~0 there) for all B distinct endpoints in ONE batched call -- batching the B
+            # instances together, the same way the rollout does -- not one solve per instance.
+            z_star = traj[-1]  # [B, d]
+            with torch.no_grad():
+                residuals = family.operator(params, z_star)
+            examples += [(family.model_input(inst, z_star[b]), residuals[b]) for b, inst in enumerate(instances)]
+        return examples
+
+    def _raw_stream(self, family):
+        while True:
+            yield from self._expert_batch(family)

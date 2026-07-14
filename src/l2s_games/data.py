@@ -167,17 +167,26 @@ def collate_examples(family):
     return functools.partial(_collate_examples, family.collate_fn)
 
 
-def _solve_instance(family, params, points_per_instance):
-    """The ``(raw input item, target)`` examples for one instance: sample points, solve the operator.
+def examples_at_points(family, params, points):
+    """Raw ``(model_input, target)`` examples for one instance at explicit ``points``.
 
-    The operator (an expensive route-choice solve for traffic) is run **once, jointly for all points**
-    of the instance, then sliced per point. Shared by the eager ``_examples_for_instances`` and the
-    streaming generator (which calls it with ``points_per_instance=1``).
+    The operator (an expensive route-choice solve for traffic) is run **once, jointly for all
+    points**, then sliced per point. The single place that pairs a domain point with its operator
+    target, shared by the uniform sampler (``_solve_instance``) and the rollout collectors (on-policy
+    + expert, see ``rollout_sampling``), so every source builds examples identically.
     """
-    points = family.sample_domain(params, points_per_instance)
     with torch.no_grad():
         targets = family.operator(params, points)
     return [(family.model_input(params, points[j]), targets[j]) for j in range(len(points))]
+
+
+def _solve_instance(family, params, points_per_instance):
+    """The ``(raw input item, target)`` examples for one instance: sample points, solve the operator.
+
+    Shared by the eager ``_examples_for_instances`` and the streaming generator (which calls it with
+    ``points_per_instance=1``).
+    """
+    return examples_at_points(family, params, family.sample_domain(params, points_per_instance))
 
 
 def _examples_for_instances(family, instances, points_per_instance):

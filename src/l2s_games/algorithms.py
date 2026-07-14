@@ -87,10 +87,14 @@ class Consensus:
         return z + self.h * (g - self.gamma * consensus_term)
 
 
+# Each constructor forwards **kwargs to its algorithm class, so callers can override the extra
+# hyperparameters (momentum beta, consensus gamma) while the class-level defaults still apply when
+# none are passed -- e.g. ALGORITHMS["momentum"](h) keeps beta=0.9, ALGORITHMS["momentum"](h, beta=0.5)
+# overrides it.
 ALGORITHMS = {
-    "projection": lambda h: SimpleProjection(h),
-    "extragradient": lambda h: ExtraGradient(h),
-    "optimistic": lambda h: Optimistic(h),
-    "momentum": lambda h: Momentum(h, beta=0.9),
-    "consensus": lambda h: Consensus(h, gamma=1.0),
+    "projection": lambda h, **kwargs: SimpleProjection(h, **kwargs),
+    "extragradient": lambda h, **kwargs: ExtraGradient(h, **kwargs),
+    "optimistic": lambda h, **kwargs: Optimistic(h, **kwargs),
+    "momentum": lambda h, **kwargs: Momentum(h, **kwargs),
+    "consensus": lambda h, **kwargs: Consensus(h, **kwargs),
 }

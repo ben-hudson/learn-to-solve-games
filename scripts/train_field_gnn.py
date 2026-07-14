@@ -20,7 +20,7 @@ batch sizes ``--batch_uniform`` / ``--batch_rollout``):
   unbounded instance diversity rather than a fixed set (see ``data.build_streaming_dataset`` /
   ``UniformSampledOperatorStream``).
 - ``rollout`` (on-policy): trains on the cost points a solver actually visits when rolling out the
-  *current* learned field with ``--rollout_algo`` from uniform starts, refreshed every
+  *current* learned field with ``--train_algo`` from uniform starts, refreshed every
   ``--refresh_every`` epochs (see ``rollout_sampling.OnPolicyOperatorStream``). It holds a live model
   ref, so its loader runs with ``num_workers=0``.
 
@@ -51,9 +51,16 @@ from l2s_games.data import build_streaming_dataset, collate_examples, split_inst
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.models import GraphormerFieldModel, MLPFieldModel
-from l2s_games.rollout_sampling import OnPolicyOperatorStream
+from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 
 torch.set_float32_matmul_precision("medium")
+
+
+def _single_thread_worker(_worker_id):
+    """Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe the
+    cores and thrash, causing bursty/stalling batch delivery. A module-level function (not a local
+    lambda) so it is picklable under the ``spawn`` start method (macOS)."""
+    torch.set_num_threads(1)
 
 
 def build_parser():
@@ -142,26 +149,33 @@ def build_parser():
     )
     p.add_argument("--batch_uniform", type=int, default=128, help="minibatch size for the uniform stream")
     p.add_argument("--batch_rollout", type=int, default=128, help="minibatch size for the on-policy rollout stream")
+    p.add_argument("--batch_expert", type=int, default=128, help="minibatch size for the expert-demonstration stream")
     # data sources (one stream + dataloader per source; see data.OperatorStream subclasses)
     p.add_argument(
         "--sources",
         nargs="+",
-        choices=["uniform", "rollout"],
+        choices=["uniform", "rollout", "expert"],
         default=["uniform"],
         help="training data sources, each its own stream+dataloader: 'uniform' samples the domain "
         "uniformly (baseline); 'rollout' trains on points visited by rolling out the current learned "
-        "field (on-policy), refreshed every --refresh_every epochs. Combine both to blend them (the mix "
-        "is set by --batch_uniform / --batch_rollout)",
+        "field (on-policy), refreshed every --refresh_every epochs; 'expert' trains on the path a "
+        "converging algorithm takes on the *true* field plus the equilibrium solutions. Combine them "
+        "to blend (the mix is set by --batch_uniform / --batch_rollout / --batch_expert)",
     )
+    # Both rollout-based sources generate training points by rolling out the SAME converging algorithm
+    # -- 'rollout' on the learned field, 'expert' on the true operator -- so they share --train_algo.
+    # consensus is excluded: jacrev does not compose through the analytic operator the expert rolls out.
     p.add_argument(
-        "--rollout_algo",
-        choices=list(ALGORITHMS),
+        "--train_algo",
+        choices=[name for name in ALGORITHMS if name != "consensus"],
         default="projection",
-        help="algorithm rolled out on the learned field to generate on-policy points; it shapes the "
+        help="converging algorithm rolled out to generate training points, on the learned field (the "
+        "on-policy 'rollout' source) and on the *true* field (the 'expert' source); it shapes the "
         "sampling distribution (projection is the traffic damped fixed point). Reuses --h / --n_steps",
     )
     p.add_argument("--refresh_every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
     p.add_argument("--n_rollout_instances", type=int, default=128, help="instances rolled out per buffer refresh")
+    p.add_argument("--n_expert_instances", type=int, default=128, help="instances rolled out jointly per expert batch")
     # early stopping on the field relative error (no MAPE here -- we regress the operator field)
     p.add_argument("--patience_epochs", type=int, default=40, help="early-stopping patience in epochs")
     p.add_argument("--val_every_n_epochs", type=int, default=10, help="run validation every N epochs")
@@ -282,9 +296,7 @@ def main(args):
             num_workers=args.n_workers,
             persistent_workers=args.n_workers > 0,
             collate_fn=collate,
-            # Single-thread each worker's route-choice solve: N multi-threaded workers oversubscribe
-            # the cores and thrash, causing bursty/stalling batch delivery.
-            worker_init_fn=lambda _worker_id: torch.set_num_threads(1),
+            worker_init_fn=_single_thread_worker,
         )
     }
     if "rollout" in args.sources:
@@ -298,7 +310,7 @@ def main(args):
             normalizer,
             model,
             rollout_instances,
-            args.rollout_algo,
+            args.train_algo,
             args.h,
             args.n_steps,
             buffer_size,
@@ -306,6 +318,27 @@ def main(args):
         )
         train_loaders["rollout"] = DataLoader(
             rollout_stream, batch_size=args.batch_rollout, num_workers=0, collate_fn=collate
+        )
+    if "expert" in args.sources:
+        # The expert stream rolls out the *analytic* operator (no model), so it is picklable and keeps
+        # the uniform loader's route-choice-solving workers; it yields both the expert trajectory and
+        # the equilibrium solutions.
+        expert_stream = ExpertOperatorStream(
+            family_factory,
+            normalizer,
+            args.train_algo,
+            args.h,
+            args.n_steps,
+            args.n_expert_instances,
+            args.points_per_instance,
+        )
+        train_loaders["expert"] = DataLoader(
+            expert_stream,
+            batch_size=args.batch_expert,
+            num_workers=args.n_workers,
+            persistent_workers=args.n_workers > 0,
+            collate_fn=collate,
+            worker_init_fn=_single_thread_worker,
         )
     # Each validation epoch rolls out the learned field per algorithm on the held-out val batch and
     # logs the analytic residual at the endpoint (plus train/val_mse and train/val_rel_err). Pass no
