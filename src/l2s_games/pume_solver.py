@@ -82,18 +82,31 @@ class PUMESolver:
         )
         self._flow_mapping = FlowMapping(B_sa_l=scipy.sparse.identity(num_links, format="csr"))
 
-    def solve(self, instance: torch_geometric.data.Data):
-        """Solve ``instance`` to user equilibrium; returns ``(costs, flows)`` in real units."""
-        free_flow_time = instance.free_flow_time.double()
-        supply = InverseBPRSupply(
-            free_flow_time=free_flow_time,
-            capacity=torch.clamp(instance.capacity.double(), min=1e-8),
-            alpha=instance.b.double(),
-            beta=instance.power.double(),
+    def _make_supply(self, free_flow_time, capacity, b, power):
+        """Build the supply operator ``z(c)`` for one instance's BPR parameters.
+
+        The single seam an asymmetric subclass overrides: base supply is separable ``InverseBPRSupply``
+        (diagonal Jacobian, potential VI); an ``AsymmetricBPRSupply`` swaps in here to make the
+        excess-supply operator non-potential.
+        """
+        return InverseBPRSupply(
+            free_flow_time=free_flow_time.double(),
+            capacity=torch.clamp(capacity.double(), min=1e-8),
+            alpha=b.double(),
+            beta=power.double(),
             eps=1e-6,
         )
 
-        cost_lower = free_flow_time.detach().numpy()
+    def build_model(self, free_flow_time, capacity, b, power, demand) -> PUMEModel:
+        """Assemble the ``PUMEModel`` for one instance's per-edge BPR params + OD demand.
+
+        The topology-dependent pieces (PUMCM models, reward/flow mappings) are shared from ``__init__``;
+        only the per-instance supply, cost box, and demand loader are built here. Reused by ``solve``
+        (offline equilibrium) and by the PUME traffic family's operator (excess-supply field eval).
+        """
+        supply = self._make_supply(free_flow_time, capacity, b, power)
+
+        cost_lower = free_flow_time.double().detach().numpy()
         # Cap cost below the exp(-cost) float64 underflow cliff (~709): an unbounded upper lets the
         # iterate run away, after which demand snaps to zero and the solve stalls without recovering.
         cost_upper = np.full_like(cost_lower, 700.0, dtype=np.float64)
@@ -102,10 +115,10 @@ class PUMESolver:
             pumcm_models=self._pumcm_models,
             flow_mappings=self._flow_mapping.B_sa_l,
             reward_provider=lambda costs, _destination_idx: self._reward_mapping.rewards(costs),
-            initial_states_list=list(instance.demand.double().unbind(dim=0)),
+            initial_states_list=list(demand.double().unbind(dim=0)),
             reward_invariant=True,
         )
-        model = PUMEModel(
+        return PUMEModel(
             pumcm_models=self._pumcm_models,
             supply_func=supply,
             reward_mapping=self._reward_mapping,
@@ -113,6 +126,13 @@ class PUMESolver:
             cost_bounds=(cost_lower, cost_upper),
             demand_loader=demand_loader,
         )
+
+    def solve(self, instance: torch_geometric.data.Data):
+        """Solve ``instance`` to user equilibrium; returns ``(costs, flows)`` in real units."""
+        model = self.build_model(
+            instance.free_flow_time, instance.capacity, instance.b, instance.power, instance.demand
+        )
+        cost_lower = instance.free_flow_time.double().detach().numpy()
 
         result = model.solve(
             c_initial=torch.as_tensor(cost_lower, dtype=torch.float64) * 1.1,
