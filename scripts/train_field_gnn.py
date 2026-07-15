@@ -16,7 +16,7 @@ batch sizes ``--batch_uniform`` / ``--batch_rollout``):
 
 - ``uniform`` (baseline): every step draws a fresh instance and solves the operator jointly for
   ``--points_per_instance`` cost points sampled **uniformly** over the calibrated domain box (see
-  ``MarkovTrafficEquilibrium.sample_domain``) inside ``DataLoader`` workers -- so the model sees
+  ``PUMEMarkovTrafficEquilibrium.sample_domain``) inside ``DataLoader`` workers -- so the model sees
   unbounded instance diversity rather than a fixed set (see ``data.build_streaming_operator_dataset`` /
   ``UniformSampledOperatorStream``).
 - ``rollout`` (on-policy): trains on the cost points a solver actually visits when rolling out the
@@ -27,9 +27,10 @@ batch sizes ``--batch_uniform`` / ``--batch_rollout``):
 The normalizer is fit once on a fixed bootstrap set (``--bootstrap_instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
-every algorithm in ``--algos`` -- the analytic residual ``||costs - bpr(demand_flow(-costs))||`` at
-the endpoint of a projected rollout of that algorithm on the learned field. The whole val batch of
-instances is solved at once (see ``FieldModel.batched_field`` / ``MarkovTrafficEquilibrium.operator``).
+every algorithm in ``--algos`` -- the analytic operator residual ``||E(c)||`` (PUME excess supply
+``z(c) - x(c)``, supply-diagonal preconditioned unless ``--no-precondition``) at the endpoint of a
+projected rollout of that algorithm on the learned field. The whole val batch of instances is solved
+at once (see ``FieldModel.batched_field`` / ``PUMEMarkovTrafficEquilibrium.operator``).
 
     python scripts/train_field_gnn.py --n_workers 4
 """
@@ -54,7 +55,7 @@ from l2s_games.data import (
     split_instances,
 )
 from l2s_games.datasets import SolvedInstanceDataset
-from l2s_games.envs.traffic import MarkovTrafficEquilibrium
+from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
 from l2s_games.models import FieldModel, GraphormerBackbone, MLPBackbone, SolutionModel
 from l2s_games.operator_count import SharedCounter
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
@@ -92,8 +93,15 @@ def build_parser():
         "--n_workers", type=int, default=7, help="streaming dataloader workers (0 = serial; changes the stream)"
     )
     p.add_argument("--noise_scale", type=float, default=0.2, help="multiplicative attribute noise")
+    p.add_argument(
+        "--precondition",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="rescale the PUME excess-supply field by the supply-diagonal metric (M^-1 E) so the stiff "
+        "flow residual is well-scaled for the rollout algorithms; --no-precondition uses the raw field",
+    )
     p.add_argument("--seed", type=int, default=None, help="global seed")
-    # domain coverage (see MarkovTrafficEquilibrium.sample_domain): the range is calibrated from the
+    # domain coverage (see PUMEMarkovTrafficEquilibrium.sample_domain): the range is calibrated from the
     # bootstrap split's equilibria -- per-edge mean (center) and std (spread) -- and sampled within
     # --sample_stds sigma of that mean. --equilibrium_margin/--equilibrium_spread are the uncalibrated
     # fallback only (used when a family is built without a calibrated range, e.g. the sandbox).
@@ -190,7 +198,7 @@ def build_parser():
         default="projection",
         help="converging algorithm rolled out to generate training points, on the learned field (the "
         "on-policy 'rollout' source) and on the *true* field (the 'expert'/solution source); it shapes "
-        "the sampling distribution (projection is the traffic damped fixed point). Reuses --h / --n_steps",
+        "the sampling distribution (projection descends the preconditioned excess supply). Reuses --h / --n_steps",
     )
     p.add_argument("--refresh_every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
     p.add_argument("--n_rollout_instances", type=int, default=128, help="instances rolled out per buffer refresh")
@@ -237,17 +245,18 @@ def main(args):
     bootstrap_inst, val_inst, test_inst = split_instances(
         instances, (args.bootstrap_instances, args.n_val_instances, args.n_test_instances)
     )
-    reference_equilibrium, reference_spread = MarkovTrafficEquilibrium.calibrate_range(bootstrap_inst)
+    reference_equilibrium, reference_spread = PUMEMarkovTrafficEquilibrium.calibrate_range(bootstrap_inst)
     # A picklable factory (base graph + calibrated tensors) the streaming dataset ships to each worker,
-    # which builds its own family + route-choice solver lazily -- nothing solver-related is pickled. The
+    # which builds its own family + PUME solver lazily -- nothing solver-related is pickled. The
     # main process also needs one live family for collate_fn and the validation rollout callbacks.
     family_factory = functools.partial(
-        MarkovTrafficEquilibrium,
+        PUMEMarkovTrafficEquilibrium,
         dataset.base_graph,
         noise_scale=args.noise_scale,
         reference_equilibrium=reference_equilibrium,
         reference_spread=reference_spread,
         n_stds=args.sample_stds,
+        precondition=args.precondition,
     )
     family = family_factory()
     # A process-safe counter of ground-truth operator point-evaluations (the training budget), shared
@@ -256,13 +265,14 @@ def main(args):
     # (validation + collate) and the one-time bootstrap/val/test build stay counter-free (family_factory).
     operator_counter = SharedCounter()
     counting_factory = functools.partial(
-        MarkovTrafficEquilibrium,
+        PUMEMarkovTrafficEquilibrium,
         dataset.base_graph,
         noise_scale=args.noise_scale,
         reference_equilibrium=reference_equilibrium,
         reference_spread=reference_spread,
         n_stds=args.sample_stds,
         operator_counter=operator_counter,
+        precondition=args.precondition,
     )
     # 'full' amortization regresses z* directly: its fixed splits use the cached equilibria and its
     # only train source is the expert solution stream (built below). 'partial' regresses the operator
@@ -430,12 +440,12 @@ def main(args):
     if args.debug:
         logger = None
     elif args.logger == "wandb":
-        # Tag the run with game=traffic so its config is comparable to train_field_mlp.py's runs
+        # Tag the run with game=pume_traffic so its config is comparable to train_field_mlp.py's runs
         # (which log --game); this script is traffic-only, so it's a fixed constant.
         run = wandb.init(
             project="learn-to-solve-games",
             group=args.exp,
-            config={**vars(args), "game": "traffic"},
+            config={**vars(args), "game": "pume_traffic"},
             dir=save_dir,
         )
         # Declare the operator budget so it can be *selected* as a custom x-axis in any panel (e.g.

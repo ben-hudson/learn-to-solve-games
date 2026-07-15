@@ -99,12 +99,15 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
 
         ``index`` selects the per-instance BPR attrs + demand from a batched ``params`` (rank-2), or is
         ``None`` for a single-instance ``params`` (rank-1). ``build_model`` reuses the shared PUMCM
-        structure, so only the light per-instance supply/demand wrapper is assembled here.
+        structure, so only the light per-instance supply/demand wrapper is assembled here. PUME solves
+        on CPU float64 (it cannot run on MPS, which rejects float64), so every input is moved to CPU --
+        a no-op for the CPU tensors of data generation, and the move the on-device validation sweep needs.
         """
-        pick = (lambda name: params[name][index]) if index is not None else (lambda name: params[name])
+        row = (lambda name: params[name][index]) if index is not None else (lambda name: params[name])
+        pick = lambda name: row(name).cpu()
         free_flow_time, capacity, b, power = (pick(name) for name in _EDGE_ATTRS)
         model = self.solver.build_model(free_flow_time, capacity, b, power, pick("demand"))
-        c = cost.double()
+        c = cost.cpu().double()
         if not self.precondition:
             return model.compute_excess_supply(c)
         # Split the excess supply so the demand solve is reused by the metric floor (one demand solve,
@@ -143,6 +146,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         ``__init__``; only the supply/demand wrapper is per row.
         """
         costs = torch.as_tensor(costs, dtype=torch.float32)
+        device = costs.device  # PUME solves on CPU; hand the result back on the caller's device
         single = costs.dim() == 1
         costs = costs.unsqueeze(0) if single else costs
         batch_size = costs.shape[0]
@@ -150,7 +154,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         per_instance = params["free_flow_time"].dim() == 2
         residuals = torch.stack(
             [self._excess_supply(params, row if per_instance else None, costs[row]) for row in range(batch_size)]
-        ).float()
+        ).float().to(device)
         return residuals.squeeze(0) if single else residuals
 
     def project(self, params, costs):
