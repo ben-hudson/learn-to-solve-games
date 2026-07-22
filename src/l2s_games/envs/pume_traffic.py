@@ -79,8 +79,9 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
             self.reference_equilibrium = self.base_graph.Cost * equilibrium_margin
             self.reference_spread = equilibrium_spread * self.reference_equilibrium
         self.n_stds = n_stds
-        # The PUME operator backend: builds the per-destination PUMCM demand models once from the
-        # (shared) topology; per-instance supply + demand are rebuilt per operator call in `build_model`.
+        # The PUME operator backend: builds the per-destination PUMCM demand models + a persistent
+        # demand loader once from the (shared) topology; only the per-instance supply is rebuilt per
+        # operator call in `build_model`, with this instance's OD threaded into the demand solve per call.
         self.solver = PUMESolver(self.base_graph, **(solver_kwargs or {}))
 
     def sample_params(self):
@@ -99,20 +100,26 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
 
         ``index`` selects the per-instance BPR attrs + demand from a batched ``params`` (rank-2), or is
         ``None`` for a single-instance ``params`` (rank-1). ``build_model`` reuses the shared PUMCM
-        structure, so only the light per-instance supply/demand wrapper is assembled here. PUME solves
-        on CPU float64 (it cannot run on MPS, which rejects float64), so every input is moved to CPU --
-        a no-op for the CPU tensors of data generation, and the move the on-device validation sweep needs.
+        structure *and* the shared (persistent) demand loader, so only the light per-instance supply is
+        assembled here; this instance's OD is threaded into the demand solve per call via
+        ``compute_demand(initial_states_list=...)`` rather than baked into a fresh loader (which leaked).
+        PUME solves on CPU float64 (it cannot run on MPS, which rejects float64), so every input is moved
+        to CPU -- a no-op for the CPU tensors of data generation, and the move the on-device validation
+        sweep needs.
         """
         row = (lambda name: params[name][index]) if index is not None else (lambda name: params[name])
         pick = lambda name: row(name).cpu()
         free_flow_time, capacity, b, power = (pick(name) for name in _EDGE_ATTRS)
-        model = self.solver.build_model(free_flow_time, capacity, b, power, pick("demand"))
+        od = list(pick("demand").double().unbind(dim=0))
+        model = self.solver.build_model(free_flow_time, capacity, b, power)
         c = cost.cpu().double()
+        # One demand solve, reused for both the residual and (when preconditioning) the metric floor.
+        # E = z(c) - x(c); the per-instance OD is passed here (the shared loader carries a placeholder).
+        demand = model.compute_demand(c, initial_states_list=od)
+        supply = model.compute_supply(c)
         if not self.precondition:
-            return model.compute_excess_supply(c)
-        # Split the excess supply so the demand solve is reused by the metric floor (one demand solve,
-        # not two): E = z(c) - x(c), then apply PUME's supply-diagonal metric M^{-1} to E.
-        supply, demand = model.compute_supply(c), model.compute_demand(c)
+            return supply - demand
+        # Apply PUME's supply-diagonal metric M^{-1} to the excess supply E.
         return self._supply_diagonal_metric(model.supply_operator, c, demand).apply_inverse(supply - demand)
 
     @staticmethod
@@ -164,7 +171,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
     def params_from_batch(self, batch):
         """The operator's params from the dense model batch: point ``edge_index`` at the physical
         topology (the batch's own ``edge_index`` is the Graphormer line graph). Per-edge attrs pass
-        through as-is; ``build_model`` reads only the BPR attrs + demand, so the topology field is
+        through as-is; the operator reads only the BPR attrs + demand, so the topology field is
         carried for interface parity with a raw instance graph.
         """
         return {**batch, "edge_index": batch["physical_edge_index"]}
@@ -232,7 +239,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         The Graphormer uses dense attention over one fixed topology, so a batch is stacked tensors plus
         the shared (line-graph) ``edge_index`` and physical ``physical_edge_index`` -- both identical
         across the batch, so stored once un-stacked. The real-unit BPR/demand params survive the stack,
-        which the operator's per-instance ``build_model`` needs.
+        which the operator's per-instance supply + per-call OD solve needs.
         """
         shared = ("edge_index", "physical_edge_index")  # one topology across the batch -- store once
         batch = {key: items[0][key] for key in shared}
