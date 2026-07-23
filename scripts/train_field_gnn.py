@@ -147,22 +147,33 @@ def build_parser():
     p.add_argument("--dim_ff", type=int, default=512, help="feed-forward dim (graphormer only)")
     # No --dropout / --weight_decay: the streaming pipeline sees a fresh instance every step, so it
     # can't overfit -- both are hardcoded to 0 (no regularization) at model construction.
-    # loss norm: the model always predicts in asinh space; --loss picks the norm the error is measured
-    # in. "asinh_mse" (default) compares in asinh space; "l2"/"huber"/"rel_l2" compare in real units
-    # (via sinh, in asinh-scale units) -- the norm the rollout-residual bound controls. "huber" is the
-    # stable default of the real variants; "rel_l2" is FNO-style per-sample relative L2 with an eps floor.
+    # loss norm: the model predicts in the normalizer's target space (global scale + --target_warp);
+    # --loss picks the norm the error is measured in. "mse_target" (default) compares in that target
+    # space; "mse_real"/"huber"/"rel_l2" compare in real units *in scale units* (undo the warp only) --
+    # the norm the rollout-residual bound controls. "huber" is the stable default of the real variants;
+    # "rel_l2" is FNO-style per-sample relative L2 with an eps floor. (Under --target_warp none,
+    # "mse_target" == "mse_real".) "mse" is space-qualified because it is offered in both spaces;
+    # "huber"/"rel_l2" are real-space only, hence unqualified.
     p.add_argument(
         "--loss",
-        choices=["asinh_mse", "l2", "huber", "rel_l2"],
-        default="asinh_mse",
-        help="training loss norm (asinh space vs. real-unit L2/Huber/relative-L2)",
+        choices=["mse_target", "mse_real", "huber", "rel_l2"],
+        default="mse_target",
+        help="training loss norm (target space vs. real-unit MSE/Huber/relative-L2)",
     )
-    p.add_argument("--huber_delta_scale", type=float, default=1.0, help="huber knee, in asinh-scale units")
+    p.add_argument("--huber_delta_scale", type=float, default=1.0, help="huber knee, in scale units")
     p.add_argument(
         "--rel_eps",
         type=float,
         default=1.0,
-        help="rel_l2 denominator floor, in asinh-scale units (caps near-eq up-weighting)",
+        help="rel_l2 denominator floor, in scale units (caps near-eq up-weighting)",
+    )
+    p.add_argument(
+        "--target_warp",
+        choices=["asinh", "none"],
+        default="asinh",
+        help="element-wise warp on the (always-applied) global field-target scale: 'asinh' compresses "
+        "the tail (default); 'none' is linear (preserves the field's direction). Partial amortization "
+        "only -- the 'full' path standardizes z* and ignores this",
     )
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
     p.add_argument("--lr", type=float, default=0.0012, help="AdamW learning rate")
@@ -224,11 +235,12 @@ def build_parser():
         help="dynamics algorithms rolled out on the learned field each val epoch, logging the analytic "
         "endpoint residual val/{algo}/residual (pass --algos with no value for fast field-only training)",
     )
-    # h=0.05 sits above the stability threshold for the stiffer instances -- simGD then oscillates
-    # at a ~8e-2 residual floor even on the true operator; h=0.02/1000 converges to ~1e-6 on every
-    # val instance, so the learned-field residual is measured against a reachable target.
-    p.add_argument("--h", type=float, default=0.02, help="algorithm step size (damped fixed point)")
-    p.add_argument("--n_steps", type=int, default=1000, help="iterations for the rollout")
+    # Tuned for the PUME preconditioned excess-supply operator (see scripts/tune_pume_rollout.py):
+    # projection's stability ceiling is between h=0.2 and h=0.4, and h=0.1 gives a clean monotone
+    # decay reaching the equilibrium (rel-dist <0.01 by ~step 200, residual still dropping at 500).
+    # The old h=0.02/1000 was sized for the raw cost-space operator and badly under-steps here.
+    p.add_argument("--h", type=float, default=0.1, help="algorithm step size (damped fixed point)")
+    p.add_argument("--n_steps", type=int, default=500, help="iterations for the rollout")
     return p
 
 
@@ -290,6 +302,7 @@ def main(args):
             test_inst,
             args.points_per_instance,
             stream_factory=counting_factory,
+            warp=args.target_warp,
         )
     print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 

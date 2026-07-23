@@ -5,7 +5,7 @@ An *amortized model* wraps a backbone network (a plain ``nn.Module`` mapping the
 subclass the generic base, differing in *what* the prediction means:
 
 - ``FieldModel`` predicts the operator **field** ``operator(params, point)`` -- a heavy-tailed vector
-  field with an equilibrium at ``F=0``. It owns the field-specific pieces: the asinh-space loss
+  field with an equilibrium at ``F=0``. It owns the field-specific pieces: the target-space loss
   variants, the direction/magnitude field metrics, and the ``batched_field`` / ``conditioned_field``
   seams a solver rolls out.
 - ``SolutionModel`` predicts the **solution** ``z*`` directly (full amortization). ``z*`` is a
@@ -127,21 +127,26 @@ class AmortizedModel(L.LightningModule):
 class FieldModel(AmortizedModel):
     """Predicts the operator field ``operator(params, point)`` -- rolled out by a solver to reach ``z*``.
 
-    Adds the field-specific pieces on top of the generic regressor: the asinh-space loss variants (the
-    model predicts in the normalizer's asinh target space), the direction/magnitude field metrics, and
-    the ``batched_field`` / ``conditioned_field`` seams that make a trained model a drop-in field for
-    ``simulate`` / plotting.
+    Adds the field-specific pieces on top of the generic regressor: the loss variants (the model
+    predicts in the normalizer's target space -- global-standardized, warped per ``--target_warp``),
+    the direction/magnitude field metrics, and the ``batched_field`` / ``conditioned_field`` seams that
+    make a trained model a drop-in field for ``simulate`` / plotting.
     """
 
-    def __init__(self, net, lr, loss="asinh_mse", huber_delta_scale=1.0, rel_eps=1.0, **kwargs):
+    def __init__(self, net, lr, loss="mse_target", huber_delta_scale=1.0, rel_eps=1.0, **kwargs):
         super().__init__(net, lr, **kwargs)
-        # Which norm the training loss measures error in (the model always *predicts* in asinh space;
-        # the normalizer's asinh target scaler is untouched). "asinh_mse" (default) compares in asinh
-        # space; the real-space variants ("l2"/"huber"/"rel_l2") compare in real units *in scale units*
-        # via sinh (the inverse of the normalizer's asinh minus the scale factor) -- the norm the
-        # rollout-residual bound controls. Staying in scale units (sinh, not scale*sinh) keeps the loss
-        # O(1) so lr transfers. huber is the stable default of the real variants.
-        assert loss in ("asinh_mse", "l2", "huber", "rel_l2"), loss
+        # Which norm the training loss measures error in. The model predicts in the normalizer's target
+        # space (a global scale + optional warp). "mse_target" (default) compares there directly; the
+        # real-space variants ("mse_real"/"huber"/"rel_l2") compare in *scaled* real units via
+        # _scaled_real (undo the warp only, not the scale) -- the norm the rollout-residual bound
+        # controls. Staying in scale units keeps the loss O(1) so lr transfers. huber is the stable
+        # default of the real variants. (Under --target_warp none the warp is identity, so "mse_target"
+        # and "mse_real" coincide.)
+        # Naming: "mse" is the only norm offered in both spaces, so each variant is space-qualified
+        # ("_target" = warped target space, "_real" = real/unwarped scaled space); "huber"/"rel_l2" are
+        # real-space only, hence unqualified. "rel_l2"'s "l2" is the FNO relative-L2 *norm*, not the
+        # squared-error "mse_real".
+        assert loss in ("mse_target", "mse_real", "huber", "rel_l2"), loss
         self.loss = loss
         self.huber_delta_scale = huber_delta_scale
         self.rel_eps = rel_eps
@@ -156,8 +161,8 @@ class FieldModel(AmortizedModel):
 
         def v(z):
             inputs = family.batched_field_input(batch, z, self.normalizer)
-            # De-standardize into real units; the asinh target scaler's inverse (sinh) is smooth, so
-            # this stays jacrev-transparent for Consensus.
+            # De-standardize into real units; the target scaler's inverse (scale, and sinh if the warp
+            # is asinh) is smooth, so this stays jacrev-transparent for Consensus.
             return self.inverse_target(self(inputs))
 
         return v
@@ -207,24 +212,35 @@ class FieldModel(AmortizedModel):
         mag_err = (pred_norm - true_norm).abs()[keep].mean()
         return cos_err, mag_err
 
+    def _scaled_real(self, z):
+        """Map the model's target-space value to *scaled* real units by undoing only the warp.
+
+        The normalizer's target round-trip is scale-then-warp; this inverts just the warp, leaving the
+        value in scale units (real / scale) -- O(1), so the huber/rel knobs and lr transfer. For
+        ``--target_warp asinh`` this is ``sinh(z)``; for ``none`` (no warp) it is the identity.
+        """
+        warp = self.normalizer.target_warp
+        return warp.inverse_transform(z) if warp is not None else z
+
     def _compute_loss(self, prediction, targets):
         """The optimized training loss under the configured norm (see ``__init__``).
 
-        ``prediction``/``targets`` are in asinh space. ``sinh`` inverts the normalizer's asinh (up to
-        the scale factor), so ``sinh(y) = real_units / scale`` -- comparing there measures the real-unit
-        error the rollout-residual bound controls, kept in scale units so it stays O(1) (lr transfers).
-        ``rel_l2`` is the operator-learning-standard relative L2 (FNO), per sample, with a ``rel_eps``
-        floor so the vanishing target at the equilibrium doesn't detonate the ratio (and which also
-        down-weights the large-field samples where ``sinh`` gradients would otherwise blow up).
+        ``prediction``/``targets`` are in the normalizer's target space. ``_scaled_real`` undoes the
+        warp (``sinh`` for asinh, identity for none), giving ``real_units / scale`` -- comparing there
+        measures the real-unit error the rollout-residual bound controls, kept in scale units so it
+        stays O(1) (lr transfers). ``rel_l2`` is the operator-learning-standard relative L2 (FNO), per
+        sample, with a ``rel_eps`` floor so the vanishing target at the equilibrium doesn't detonate the
+        ratio (and which also down-weights large-field samples where an asinh warp's gradients would
+        otherwise blow up).
         """
-        if self.loss == "asinh_mse":
+        if self.loss == "mse_target":
             return F.mse_loss(prediction, targets)
-        if self.loss == "l2":
-            return F.mse_loss(torch.sinh(prediction), torch.sinh(targets))
+        pred_r, true_r = self._scaled_real(prediction), self._scaled_real(targets)
+        if self.loss == "mse_real":
+            return F.mse_loss(pred_r, true_r)
         if self.loss == "huber":
-            return F.huber_loss(torch.sinh(prediction), torch.sinh(targets), delta=self.huber_delta_scale)
-        # rel_l2: per-sample ||sinh(pred) - sinh(target)|| / sqrt(||sinh(target)||^2 + eps^2), mean over batch.
-        pred_r, true_r = torch.sinh(prediction), torch.sinh(targets)
+            return F.huber_loss(pred_r, true_r, delta=self.huber_delta_scale)
+        # rel_l2: per-sample ||pred_r - true_r|| / sqrt(||true_r||^2 + eps^2), mean over batch.
         num = (pred_r - true_r).norm(dim=-1)
         den = (true_r.norm(dim=-1).square() + self.rel_eps**2).sqrt()
         return (num / den).mean()
@@ -239,7 +255,7 @@ class SolutionModel(AmortizedModel):
     """Predicts the equilibrium solution ``z*`` directly from parameters (full amortization).
 
     ``z*`` is a generic regression target (a per-edge cost vector, standardized like the inputs), so
-    training uses the base's plain MSE -- none of the field-specific asinh loss or field metrics apply.
+    training uses the base's plain MSE -- none of the field-specific loss or field metrics apply.
     Instead of a rollable field it exposes ``solve``: the direct, de-standardized, feasible prediction.
     """
 

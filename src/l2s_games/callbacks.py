@@ -106,13 +106,16 @@ class OperatorCountCallback(L.Callback):
     register it as a ``wandb.define_metric`` step_metric at the call site to plot other metrics
     against the budget.
 
-    Logged at the **epoch boundary** with ``on_epoch=True`` (not per training batch), so it lands on
-    the same logging step as the epoch-aggregated metrics it exists to be plotted against -- the model
-    logs ``train/loss`` / ``train/mse`` with ``on_step=False, on_epoch=True`` and the val metrics
-    ``on_epoch=True`` (see ``models.base`` and ``FieldRolloutCallback``). Logged per training batch instead,
-    the budget occupied its own logging steps that no ``on_epoch`` metric ever shared, so selecting it
-    as a custom wandb x-axis returned "no data" (nothing to pair against). Per-epoch is also the right
-    granularity: every plottable metric here is per-epoch.
+    Logged from **two** epoch-boundary hooks with ``on_epoch=True`` -- once in ``on_train_epoch_end``
+    (pairing with ``train/loss`` / ``train/mse``) and once in ``on_validation_epoch_end`` (pairing with
+    the ``val/*`` metrics). Both are needed because Lightning's ``WandbLogger.log_metrics`` does *not*
+    forward a ``step`` to ``wandb.log`` -- it lets wandb auto-increment ``_step`` once per
+    ``log_metrics`` call. The training-epoch flush and the validation-loop flush are separate
+    ``log_metrics`` calls, so they land on *different* ``_step`` s: logging the budget only at
+    ``on_train_epoch_end`` put it on the train flush's step, which no ``val/*`` metric ever shares, so
+    selecting it as the custom x-axis for a val metric returned "no data" (nothing to pair against).
+    Logging it in the validation flush too puts a copy on the val metrics' step (validation does not
+    touch the training family's counter, so the value matches the same epoch's train-flush value).
     """
 
     def __init__(self, counter, key="train/operator_evals"):
@@ -121,6 +124,10 @@ class OperatorCountCallback(L.Callback):
         self.key = key
 
     def on_train_epoch_end(self, trainer, pl_module):
+        pl_module.log(self.key, float(self.counter.value), on_step=False, on_epoch=True)
+
+    def on_validation_epoch_end(self, trainer, pl_module):
+        # Shares the validation flush's wandb _step so val/* metrics can be plotted against the budget.
         pl_module.log(self.key, float(self.counter.value), on_step=False, on_epoch=True)
 
 

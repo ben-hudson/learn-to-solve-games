@@ -50,55 +50,83 @@ class Standardizer(nn.Module):
         return x * self.std + self.mean
 
 
-class AsinhScaler(nn.Module):
-    """Odd, zero-preserving tail compressor for the heavy-tailed operator field.
+class GlobalStandardizer(nn.Module):
+    """Global (isotropic) affine normalizer ``(x - mean) / std``, fit with a single scalar mean/std.
 
-    ``transform(y) = asinh(y / scale)``; ``inverse_transform(z) = scale * sinh(z)``. It is ~linear
-    near 0 (so the equilibrium ``F = 0`` and small-field fidelity are preserved: ``0 -> 0``) and
-    logarithmic for ``|y| >> scale`` (so BPR's blow-up tail is smoothly compressed rather than
-    hard-clipped). ``scale`` is a single *global* robust magnitude (median ``|y|``) fit on the train
-    split, which sets where the linear->log knee sits. It is deliberately **global (isotropic), not
-    per-edge**: an isotropic scale preserves the field's direction and cross-edge relative magnitude
-    (what the dynamics act on), whereas a per-edge scale would warp the field's geometry; and
-    **scale-only (no mean)**, so the equilibrium zero is untouched. Smooth and invertible, so it stays
-    jacrev-transparent in the inference field. ``scale`` is a registered buffer so it moves with the
-    module (onto the model's device) and serializes into ``state_dict``.
+    Unlike ``Standardizer`` (per-feature mean/std), ``fit`` pools over **all** axes -- every edge *and*
+    every sample -- to one scalar ``mean`` and one scalar ``std``. That isotropy is the point: a single
+    scale preserves the field's cross-edge relative magnitude (and, with ``center=False``, its
+    direction), whereas a per-edge scale would warp the field geometry the dynamics act on.
+    ``center=False`` forces ``mean = 0`` -- zero-preserving, so the operator field's equilibrium
+    (``F = 0``) is untouched; the field target uses this. ``center=True`` keeps the mean (for a generic
+    target, or -- later -- global feature standardization, which this class is general enough to serve).
+
+    Scale trade-off: ``std`` is the conventional unit-variance choice and reusable for features, but is
+    inflated by heavy tails; a robust ``median|y|`` (what the old ``AsinhScaler`` used) would resist the
+    operator's blow-up tail better. The PUME operator is only mildly heavy-tailed, so ``std`` is fine
+    here. ``mean``/``std`` are registered buffers (they move with the module and serialize).
     """
 
-    def __init__(self, scale):
+    def __init__(self, mean, std):
         super().__init__()
-        self.register_buffer("scale", scale)
+        self.register_buffer("mean", mean)
+        self.register_buffer("std", std)
 
     @classmethod
-    def fit(cls, y):
-        # one global typical magnitude; median is robust to the blow-up tail we compress
-        scale = y.abs().median()
-        return cls(scale if scale > 0 else torch.ones_like(scale))
+    def fit(cls, x, center=True):
+        mean = x.mean() if center else torch.zeros((), dtype=x.dtype)  # single scalar over all edges+samples
+        std = x.std()
+        return cls(mean, std if std > 0 else torch.ones_like(std))
 
-    def transform(self, y):
-        return torch.asinh(y / self.scale)
+    def transform(self, x):
+        return (x - self.mean) / self.std
 
     def inverse_transform(self, z):
-        return self.scale * torch.sinh(z)
+        return z * self.std + self.mean
+
+
+class AsinhWarp(nn.Module):
+    """Stateless, invertible tail-compressing warp: ``transform(z) = asinh(z)``, ``inverse = sinh``.
+
+    Composed by ``Normalizer`` *after* the (fitted) target scale, so ``asinh(y/scale)`` factors as this
+    warp on the scaled target. Odd and zero-preserving (``0 -> 0``, so the equilibrium is untouched) and
+    ~linear near 0 / logarithmic in the tail (compresses a heavy-tailed field smoothly rather than
+    hard-clipping). Smooth and invertible, so it stays jacrev-transparent in the inference field. No
+    fitted state -- the warp is a config choice (see ``--target_warp``), not learned from data.
+    """
+
+    def transform(self, z):
+        return torch.asinh(z)
+
+    def inverse_transform(self, w):
+        return torch.sinh(w)
 
 
 class Normalizer(nn.Module):
-    """The fitted feats standardizer and target scaler the model trains and predicts through.
+    """The fitted feats standardizer and target scaler (+ optional warp) the model trains/predicts through.
 
-    ``input`` / ``target`` are submodules, so a ``Normalizer`` owned by a model (see
-    ``FieldModel``) moves to the model's device and serializes into ``state_dict`` automatically.
+    ``input`` / ``target`` / ``target_warp`` are submodules, so a ``Normalizer`` owned by a model (see
+    ``FieldModel``) moves to the model's device and serializes into ``state_dict`` automatically. The
+    target round-trip is a two-stage composition: a fitted scale (``target``) and an optional stateless
+    nonlinearity (``target_warp``, ``None`` = no warp), applied scale-then-warp and inverted
+    warp-then-scale. Both stages must invert at inference, which is why the warp lives here rather than
+    in the one-directional dataset ``transform``s.
     """
 
-    def __init__(self, input, target):
+    def __init__(self, input, target, target_warp=None):
         super().__init__()
         self.input = input
         self.target = target
+        self.target_warp = target_warp
 
     def transform_target(self, y):
-        """Compress the heavy-tailed real-unit target into the network's regression space (asinh)."""
-        return self.target.transform(y)
+        """Scale the real-unit target, then apply the optional warp -- the network's regression space."""
+        z = self.target.transform(y)
+        return self.target_warp.transform(z) if self.target_warp is not None else z
 
     def inverse_target(self, y):
+        if self.target_warp is not None:
+            y = self.target_warp.inverse_transform(y)
         return self.target.inverse_transform(y)
 
 
@@ -194,19 +222,25 @@ def _examples_for_instances(family, instances, points_per_instance):
     return [example for params in instances for example in _solve_instance(family, params, points_per_instance)]
 
 
-def _fit_normalizer(family, examples, target_scaler=AsinhScaler):
-    """Fit the feats standardizer and the target scaler on the (transformed) train examples.
+def _fit_normalizer(
+    family, examples, target_scaler=functools.partial(GlobalStandardizer.fit, center=False), warp="none"
+):
+    """Fit the feats standardizer and the target scaler (+ optional warp) on the train examples.
 
-    Feats are per-feature standardized. ``target_scaler`` picks the target normalization: the default
-    ``AsinhScaler`` asinh-compresses the heavy-tailed operator *field* with a robust scale so the BPR
-    tail is tamed without a hard clip; the solution baseline passes ``Standardizer`` instead, treating
-    the equilibrium ``z*`` as a generic per-feature-standardized regression target (see
-    ``build_streaming_solution_dataset``).
+    Feats are per-feature standardized. ``target_scaler`` is a fit-callable ``targets -> module``: the
+    default global-standardizes the operator *field* target with ``mean = 0`` (zero-preserving,
+    isotropic); the solution baseline passes ``Standardizer.fit`` instead, treating the equilibrium
+    ``z*`` as a generic per-feature-standardized target (see ``build_streaming_solution_dataset``).
+    ``warp`` composes an optional stateless nonlinearity on the scaled target: ``"asinh"`` adds
+    ``AsinhWarp`` (tames a heavy tail; the GNN field default), ``"none"`` adds nothing. The default is
+    ``"none"``; the ``asinh`` default lives on ``build_streaming_operator_dataset`` (the GNN path), so
+    the eager ``build_dataset`` (flat games) trains on the plain scaled target.
     """
     transform = family.transform
     feats = torch.stack([transform(_clone(raw))["feats"] for raw, _ in examples])
     targets = torch.stack([target for _, target in examples])
-    return Normalizer(Standardizer.fit(feats), target_scaler.fit(targets))
+    target_warp = AsinhWarp() if warp == "asinh" else None
+    return Normalizer(Standardizer.fit(feats), target_scaler(targets), target_warp)
 
 
 def build_dataset(family, n_train, n_val, n_test, points_per_instance):
@@ -290,12 +324,20 @@ def split_instances(instances, counts):
 
 
 def build_streaming_operator_dataset(
-    family_factory, bootstrap_instances, val_instances, test_instances, points_per_instance, stream_factory=None
+    family_factory,
+    bootstrap_instances,
+    val_instances,
+    test_instances,
+    points_per_instance,
+    stream_factory=None,
+    warp="asinh",
 ):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
 
     Operator-field target (``--amortization partial``): the model regresses the operator value at a
     domain point. The sibling ``build_streaming_solution_dataset`` builds the ``z*``-target variant.
+    ``warp`` selects the target nonlinearity composed on the (global-standardized) field target --
+    ``"asinh"`` (default, the GNN's tail-compressing behavior; see ``--target_warp``) or ``"none"``.
 
     The bootstrap / val / test instances are pre-solved and passed in (split from a cached
     ``SolvedInstanceDataset``); this builds their ``(input, target)`` examples with the family's
@@ -318,7 +360,7 @@ def build_streaming_operator_dataset(
     # alone (the sampled cost point is overwritten by the rollout state), so >1 point is redundant.
     val = _examples_for_instances(family, val_instances, 1)
     test = _examples_for_instances(family, test_instances, 1)
-    normalizer = _fit_normalizer(family, bootstrap)
+    normalizer = _fit_normalizer(family, bootstrap, warp=warp)
     train_ds = UniformSampledOperatorStream(stream_factory, normalizer, points_per_instance)
     val_ds, test_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test))
     # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
@@ -345,16 +387,16 @@ def build_streaming_solution_dataset(family_factory, bootstrap_instances, val_in
     The solution-target sibling of ``build_streaming_operator_dataset``. The fixed splits use each
     instance's cached ``equilibrium_cost`` (exact and free), and the normalizer's target scaler is a
     per-feature ``Standardizer`` fit on those equilibria -- ``z*`` is a generic regression target, not
-    a field, so it does not use the field's ``AsinhScaler``. There is no ``train_ds`` -- the streaming
-    train part is the expert solution stream (``ExpertOperatorStream(solution_target=True)``), built in
-    the training script with its counting family + algorithm args. Pair with ``collate_examples(family)``
-    for the DataLoaders.
+    a field, so it uses neither the field's global scale nor a warp. There is no ``train_ds`` -- the
+    streaming train part is the expert solution stream (``ExpertOperatorStream(solution_target=True)``),
+    built in the training script with its counting family + algorithm args. Pair with
+    ``collate_examples(family)`` for the DataLoaders.
     """
     family = family_factory()
     bootstrap, val, test = (
         solution_examples(family, instances) for instances in (bootstrap_instances, val_instances, test_instances)
     )
-    normalizer = _fit_normalizer(family, bootstrap, target_scaler=Standardizer)
+    normalizer = _fit_normalizer(family, bootstrap, target_scaler=Standardizer.fit, warp="none")
     val_ds, test_ds, bootstrap_ds = (
         OperatorDataset(split, family.transform, normalizer) for split in (val, test, bootstrap)
     )
