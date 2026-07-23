@@ -1,10 +1,12 @@
 {
+  "python-envs.defaultEnvManager": "ms-python.python:conda",
+  "python-envs.defaultPackageManager": "ms-python.python:conda",
+  "python-envs.terminal.autoActivationType": "command",
+  "python.terminal.activateEnvironment": true,
+  "python.terminal.useEnvFile": true,
+  "python.testing.pytestEnabled": true,
+  "python.testing.unittestEnabled": false,
   "python.testing.pytestArgs": [
     "tests"
-  ],
-  "python.testing.unittestEnabled": false,
-  "python.testing.pytestEnabled": true,
-  "python.terminal.useEnvFile": true,
-  "python-envs.defaultEnvManager": "ms-python.python:conda",
-  "python-envs.defaultPackageManager": "ms-python.python:conda"
+  ]
 }
