@@ -231,7 +231,7 @@ def build_parser():
         "--algos",
         nargs="*",
         choices=list(ALGORITHMS),
-        default=list(ALGORITHMS),
+        default=["projection", "consensus"],
         help="dynamics algorithms rolled out on the learned field each val epoch, logging the analytic "
         "endpoint residual val/{algo}/residual (pass --algos with no value for fast field-only training)",
     )

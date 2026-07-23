@@ -17,7 +17,6 @@ import copy
 
 import lightning as L
 import torch
-from torch import nn
 from torch.nn import functional as F
 
 from l2s_games.data import normalize_input
@@ -56,7 +55,6 @@ class AmortizedModel(L.LightningModule):
         self.start_factor = start_factor
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
-        self.loss_fn = nn.MSELoss()
 
     def forward(self, inputs):
         return self.net(inputs)
@@ -84,12 +82,18 @@ class AmortizedModel(L.LightningModule):
         prediction = torch.cat([self(inputs) for inputs, _ in batch.values()])
         targets = torch.cat([targets for _, targets in batch.values()])
         loss = self._compute_loss(prediction, targets)
-        # Log the optimized loss plus the plain MSE under a fixed name (comparable across loss modes).
-        # Only these are logged on train: under the streaming pipeline every batch is a fresh unseen
-        # instance, so a train relative error is not a fit signal (it just re-estimates val_rel_err).
+        # Log the optimized loss plus the plain MSE in *real* units (de-standardized via inverse_target,
+        # matching val/mse) under a fixed name (comparable across loss modes). Only these are logged on
+        # train: under the streaming pipeline every batch is a fresh unseen instance, so a train relative
+        # error is not a fit signal (it just re-estimates val_rel_err).
         self.log("train/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=targets.shape[0])
+        real_prediction, real_targets = self.inverse_target(prediction), self.inverse_target(targets)
         self.log(
-            "train/mse", self.loss_fn(prediction, targets), on_step=False, on_epoch=True, batch_size=targets.shape[0]
+            "train/mse",
+            F.mse_loss(real_prediction, real_targets),
+            on_step=False,
+            on_epoch=True,
+            batch_size=targets.shape[0],
         )
         return loss
 
@@ -97,9 +101,14 @@ class AmortizedModel(L.LightningModule):
         inputs, targets = batch
         batch_size = targets.shape[0]
         prediction = self(inputs)
-        # val/mse is always the plain MSE (fixed across loss modes -> comparable + a stable monitor);
-        # val/loss is the optimized loss (equals val/mse when the loss is plain MSE).
-        self.log("val/mse", self.loss_fn(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size)
+        # val/mse is the plain MSE in *real* units (de-standardized via inverse_target, so it sits on
+        # the same axes as cos_err/mag_err) -- always plain MSE regardless of --loss, so it stays
+        # comparable across loss modes and makes a stable monitor. val/loss is the optimized loss, which
+        # lives in the normalizer's target/scaled space (see _compute_loss), so the two do not coincide.
+        real_prediction, real_targets = self.inverse_target(prediction), self.inverse_target(targets)
+        self.log(
+            "val/mse", F.mse_loss(real_prediction, real_targets), on_epoch=True, prog_bar=True, batch_size=batch_size
+        )
         self.log(
             "val/loss", self._compute_loss(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size
         )
