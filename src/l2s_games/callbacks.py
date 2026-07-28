@@ -28,13 +28,29 @@ from l2s_games.viz import plot_trajectory_arrows
 def _log_equilibrium_metrics(pl_module, family, inputs, z_end, name, equilibrium):
     """Log the two endpoint metrics at an equilibrium estimate ``z_end`` (mean over the batch, per epoch).
 
-    ``val/{name}/residual`` -- the analytic operator norm ``||operator(params, z_end)||`` (zero at a
-    true equilibrium) -- and ``val/{name}/eq_dist`` -- the distance ``||z_end - equilibrium||`` to the
-    reference ``z*``. Shared by the field (rollout) and solution (direct) callbacks so both sit on the
-    same axes and neither reimplements the scoring.
+    ``val/{name}/residual`` -- the **natural map** norm ``||z_end - project(z_end - operator(z_end))||``
+    of the *analytic* operator -- and ``val/{name}/eq_dist`` -- the distance ``||z_end - equilibrium||``
+    to the reference ``z*``. Shared by the field (rollout) and solution (direct) callbacks so both sit
+    on the same axes and neither reimplements the scoring.
+
+    The natural map rather than the bare ``||operator||`` because the feasible set is constrained
+    (traffic clamps ``costs >= free_flow_time``): at a boundary solution the operator points out of the
+    feasible set, so its norm stays bounded away from zero there while the natural map vanishes. Both
+    are exact solution certificates on the interior -- they coincide wherever no constraint is active,
+    so this only changes the metric at the boundary.
+
+    Taken with a **unit** step, which is a convention: the natural map's zero set is the solution set
+    for any step ``h > 0``, so ``h`` sets only the scale. ``1`` because (a) an algorithm's ``h`` is
+    tuned damping (a solver knob), and a convergence measure that inherited it would rescale when the
+    step size changed, breaking comparability across the algorithm sweep and against the solution model
+    (which has no rollout, hence no ``h``); and (b) the default preconditioned PUME operator is already
+    in domain (cost) units, so ``h`` is a dimensionless damping factor whose undamped value is 1 -- this
+    is the residual of the undamped preconditioned fixed-point iteration. Under ``--no-precondition``
+    the raw flow-residual operator is not cost-scaled, so the *magnitude* is arbitrary (the zero is not).
     """
     params = family.params_from_batch(inputs)
-    residual = family.operator(params, z_end).norm(dim=-1).mean()
+    natural_map = z_end - family.project(params, z_end - family.operator(params, z_end))
+    residual = natural_map.norm(dim=-1).mean()
     eq_dist = (z_end - equilibrium).norm(dim=-1).mean()
     batch_size = z_end.shape[0]
     pl_module.log(f"val/{name}/residual", residual, on_epoch=True, batch_size=batch_size)
