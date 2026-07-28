@@ -33,6 +33,7 @@ from l2s_games.envs.traffic import (
     _EDGE_ATTRS,
     _DROPPED_NODE_ATTRS,
     _NOISED_ATTRS,
+    _SOLUTION_ATTRS,
     _canonicalize,
     load_sioux_falls_base_graph,  # re-exported for callers/tests that build the base graph
 )
@@ -86,6 +87,11 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
 
     def sample_params(self):
         graph = self.base_graph.clone()
+        # The base graph's cached equilibrium does not survive noising -- drop it so a streamed
+        # instance lacks the key rather than carrying a stale z* (see traffic._SOLUTION_ATTRS).
+        for attr in _SOLUTION_ATTRS:
+            if attr in graph:
+                del graph[attr]
         for attr in _NOISED_ATTRS:
             value = getattr(graph, attr)
             if self.noise_type == "normal":
@@ -180,6 +186,16 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         """Rollout start for the validation sweep: the example's uniformly sampled cost point ``[B, E]``
         (feasible by construction; ``project`` still clamps)."""
         return batch["cost"]
+
+    def eq_from_batch(self, batch):
+        """Reference ``z*`` for ``eq_dist``: each instance's offline-solved ``equilibrium_cost`` ``[B, E]``.
+
+        Same cost-space equilibrium as the sibling family (the preconditioned excess-supply operator
+        shares its root), so the reasoning is identical -- see
+        ``MarkovTrafficEquilibrium.eq_from_batch``. Present only on the fixed splits built from
+        ``SolvedInstanceDataset``; streamed instances have it dropped in ``sample_params``.
+        """
+        return batch["equilibrium_cost"]
 
     @staticmethod
     def calibrate_range(instances):

@@ -42,6 +42,11 @@ def _join(root, name):
 _NOISED_ATTRS = ("free_flow_time", "capacity")  # TODO: add demand back in once everything is working
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
 _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost/flow, when present
+# The offline-solved equilibrium ``SolvedInstanceDataset`` caches on each instance -- the ground truth
+# the validation sweep's ``eq_dist`` measures against (see ``eq_from_batch``). Dropped in
+# ``sample_params``: a noised clone of the base graph does *not* inherit the base graph's equilibrium,
+# so a streamed instance must lack these keys rather than carry a stale value under them.
+_SOLUTION_ATTRS = ("equilibrium_cost", "equilibrium_flow")
 # Node-coordinate attrs that ``from_networkx`` carries off the TNTP graph (positions + PyG's x/y
 # aliases). Nothing in the pipeline reads them, but they are float64 and ``collate_fn`` would stack
 # them into the batch -- where float64 breaks the device transfer (MPS rejects float64). Dropped in
@@ -139,6 +144,12 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
 
     def sample_params(self):
         graph = self.base_graph.clone()
+        # The base graph's cached equilibrium does not survive noising, so drop it: a streamed
+        # instance must *lack* these keys, not carry the base graph's stale z* under them
+        # (``SolvedInstanceDataset.process`` assigns the instance's own solve after sampling).
+        for attr in _SOLUTION_ATTRS:
+            if attr in graph:
+                del graph[attr]
         for attr in _NOISED_ATTRS:
             value = getattr(graph, attr)
             if self.noise_type == "normal":
@@ -215,6 +226,21 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         trains on. Feasible by construction (``>= free_flow_time``); ``project`` still clamps.
         """
         return batch["cost"]
+
+    def eq_from_batch(self, batch):
+        """Reference ``z*`` for ``eq_dist``: each instance's offline-solved ``equilibrium_cost`` ``[B, E]``.
+
+        The cost-space equilibrium is nowhere near the origin (``||z*|| ~ 98`` on Sioux Falls), and the
+        spread *between* instances (``~29``) dwarfs the distance a converged rollout leaves on the
+        table (``<1``), so any shared reference -- the origin, the calibrated ``reference_equilibrium``
+        mean -- would swamp the metric. Each instance's own ``z*`` is the only reference on the right
+        scale. It rides the batch for free: ``model_input`` clones the whole instance graph and
+        ``collate_fn`` stacks every tensor attribute, so the value stays row-aligned with the rollout
+        endpoint. Only the fixed splits built from ``SolvedInstanceDataset`` carry it -- streamed
+        instances have it dropped in ``sample_params``, so a misdirected sweep raises ``KeyError``
+        instead of quietly scoring against the wrong equilibrium.
+        """
+        return batch["equilibrium_cost"]
 
     @staticmethod
     def calibrate_range(instances):

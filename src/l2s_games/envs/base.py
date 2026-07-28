@@ -76,8 +76,10 @@ class VariationalInequalityFamily(ABC):
 
     # --- batched validation-sweep seams ------------------------------------------------------------
     # ``params_from_batch`` / ``batched_field_input`` / ``initial_point`` build the per-family inputs
-    # the equilibrium rollout consumes from a dense collated batch. There is no universal default (a
-    # flat game and a graph batch splice points differently), so each family implements its own.
+    # the equilibrium rollout consumes from a dense collated batch. There is no universal default for
+    # those three (a flat game and a graph batch splice points differently), so each family implements
+    # its own; ``eq_from_batch`` does have one (the chart origin) and is overridden only where the
+    # equilibrium is not at zero.
 
     @abstractmethod
     def params_from_batch(self, batch):
@@ -95,6 +97,19 @@ class VariationalInequalityFamily(ABC):
         ``sample_domain`` at build time), so the sweep starts from the same uniform-domain
         distribution the on-policy collector trains on, fixed across epochs.
         """
+
+    def eq_from_batch(self, batch):
+        """The reference equilibrium ``z*`` the validation sweep measures ``eq_dist`` against.
+
+        Defaults to the origin, which is exact for the Nash-centered charts of the normal-form games
+        (see ``rps``): recentering on the Nash puts the equilibrium at zero, so no per-instance
+        reference is needed. Families whose equilibrium is *not* at zero override this to read their
+        own per-instance ``z*`` off the batch -- traffic returns the offline-solved
+        ``equilibrium_cost`` cached on each instance. Returning a batch-carried tensor (rather than a
+        constructor argument) keeps the reference row-aligned with the rollout endpoint by
+        construction, with no assumption about split order or shuffling.
+        """
+        return 0.0
 
 
 @dataclass(frozen=True)
