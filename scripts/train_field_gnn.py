@@ -12,19 +12,23 @@ jointly (no graph inductive bias), for benchmarking how much the Graphormer's st
 
 Training data is **streamed** from one or more sources selected with ``--sources`` (each its own
 stream + dataloader, blended by Lightning's ``CombinedLoader``; the mix is set by the per-source
-batch sizes ``--batch_uniform`` / ``--batch_rollout``):
+batch sizes ``--batch_uniform`` / ``--batch_fixed`` / ``--batch_rollout``):
 
 - ``uniform`` (baseline): every step draws a fresh instance and solves the operator jointly for
   ``--points_per_instance`` cost points sampled **uniformly** over the calibrated domain box (see
   ``PUMEMarkovTrafficEquilibrium.sample_domain``) inside ``DataLoader`` workers -- so the model sees
   unbounded instance diversity rather than a fixed set (see ``data.build_streaming_operator_dataset`` /
   ``UniformSampledOperatorStream``).
+- ``fixed``: the same uniform point sampling over a **fixed** set of ``--n_train_instances`` instances
+  drawn once at startup, so instance diversity is bounded while the points stay fresh -- the knob for
+  asking how many parametrizations amortization needs (see
+  ``instance_sampling.FixedInstanceOperatorStream``).
 - ``rollout`` (on-policy): trains on the cost points a solver actually visits when rolling out the
   *current* learned field with ``--train_algo`` from uniform starts, refreshed every
   ``--refresh_every`` epochs (see ``rollout_sampling.OnPolicyOperatorStream``). It holds a live model
   ref, so its loader runs with ``num_workers=0``.
 
-The normalizer is fit once on a fixed bootstrap set (``--bootstrap_instances``); val/test stay fixed.
+The normalizer is fit once on a fixed calibration set (``--n_cal_instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
 every algorithm in ``--algos`` -- the analytic operator residual ``||E(c)||`` (PUME excess supply
@@ -56,6 +60,7 @@ from l2s_games.data import (
 )
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
+from l2s_games.instance_sampling import FixedInstanceOperatorStream
 from l2s_games.models import FieldModel, GraphormerBackbone, MLPBackbone, SolutionModel
 from l2s_games.operator_count import SharedCounter
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
@@ -73,20 +78,28 @@ def _single_thread_worker(_worker_id):
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # dataset: a cached SolvedInstanceDataset (see scripts/generate_traffic_dataset.py) is loaded and
-    # split into bootstrap/val/test instances. Training still streams fresh instances on the fly (one
-    # point each); the splits fit the normalizer + calibrate the sampling range (bootstrap) and measure
-    # generalization (val/test). Epoch length is --steps_per_epoch.
+    # split into cal/val/test instances. Training still streams fresh instances on the fly (one
+    # point each) unless --sources fixed pins them; the splits fit the normalizer + calibrate the
+    # sampling range (cal) and measure generalization (val/test). Epoch length is --steps_per_epoch.
     p.add_argument("--dataset_root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load")
     p.add_argument(
-        "--bootstrap_instances", type=int, default=128, help="bootstrap split size (normalizer + calibration)"
+        "--n_cal_instances", type=int, default=128, help="calibration split size (normalizer + range calibration)"
     )
     p.add_argument("--n_val_instances", type=int, default=128, help="validation split size")
     p.add_argument("--n_test_instances", type=int, default=128, help="held-out test split size")
+    # The 'fixed' source's instance set is sampled fresh from the family (not split off the cache), so
+    # its size is independent of the cache and of the cal/val/test splits.
+    p.add_argument(
+        "--n_train_instances",
+        type=int,
+        default=1024,
+        help="instances in the fixed training set (the 'fixed' source), sampled once at startup",
+    )
     p.add_argument(
         "--points_per_instance",
         type=int,
         default=32,
-        help="cost points solved jointly per streamed train instance (also bootstrap density for the "
+        help="cost points solved jointly per streamed train instance (also calibration density for the "
         "normalizer fit); val/test always solve each instance once",
     )
     p.add_argument(
@@ -102,7 +115,7 @@ def build_parser():
     )
     p.add_argument("--seed", type=int, default=None, help="global seed")
     # domain coverage (see PUMEMarkovTrafficEquilibrium.sample_domain): the range is calibrated from the
-    # bootstrap split's equilibria -- per-edge mean (center) and std (spread) -- and sampled within
+    # calibration split's equilibria -- per-edge mean (center) and std (spread) -- and sampled within
     # --sample_stds sigma of that mean. --equilibrium_margin/--equilibrium_spread are the uncalibrated
     # fallback only (used when a family is built without a calibrated range, e.g. the sandbox).
     p.add_argument(
@@ -186,19 +199,21 @@ def build_parser():
         "--steps_per_epoch", type=int, default=64, help="train batches per epoch (bounds the infinite streams)"
     )
     p.add_argument("--batch_uniform", type=int, default=128, help="minibatch size for the uniform stream")
+    p.add_argument("--batch_fixed", type=int, default=128, help="minibatch size for the fixed-instance stream")
     p.add_argument("--batch_rollout", type=int, default=128, help="minibatch size for the on-policy rollout stream")
     p.add_argument("--batch_expert", type=int, default=128, help="minibatch size for the expert-demonstration stream")
     # data sources (one stream + dataloader per source; see data.OperatorStream subclasses)
     p.add_argument(
         "--sources",
         nargs="+",
-        choices=["uniform", "rollout", "expert"],
-        default=["uniform"],
+        choices=["uniform", "fixed", "rollout", "expert"],
+        default=["fixed"],
         help="training data sources, each its own stream+dataloader: 'uniform' samples the domain "
-        "uniformly (baseline); 'rollout' trains on points visited by rolling out the current learned "
-        "field (on-policy), refreshed every --refresh_every epochs; 'expert' trains on the path a "
+        "uniformly over fresh instances (baseline); 'fixed' samples it the same way but over a fixed set "
+        "of --n_train_instances instances; 'rollout' trains on points visited by rolling out the current "
+        "learned field (on-policy), refreshed every --refresh_every epochs; 'expert' trains on the path a "
         "converging algorithm takes on the *true* field plus the equilibrium solutions. Combine them "
-        "to blend (the mix is set by --batch_uniform / --batch_rollout / --batch_expert)",
+        "to blend (the mix is set by --batch_uniform / --batch_fixed / --batch_rollout / --batch_expert)",
     )
     # Both rollout-based sources generate training points by rolling out the SAME converging algorithm
     # -- 'rollout' on the learned field, 'expert' on the true operator -- so they share --train_algo.
@@ -249,15 +264,15 @@ def main(args):
     if args.seed is None:
         args.seed = torch.randint(0, 2**31 - 1, (1,)).item()
     L.seed_everything(args.seed, workers=True)
-    # Load the cached solved instances and split them into bootstrap/val/test. The bootstrap split's
+    # Load the cached solved instances and split them into cal/val/test. The calibration split's
     # equilibria calibrate the streaming sampling range (per-edge mean + std); the calibrated tensors
     # are baked into the picklable factory so every worker shares the same range.
     dataset = SolvedInstanceDataset(args.dataset_root)
     instances = list(dataset)
-    bootstrap_inst, val_inst, test_inst = split_instances(
-        instances, (args.bootstrap_instances, args.n_val_instances, args.n_test_instances)
+    cal_inst, val_inst, test_inst = split_instances(
+        instances, (args.n_cal_instances, args.n_val_instances, args.n_test_instances)
     )
-    reference_equilibrium, reference_spread = PUMEMarkovTrafficEquilibrium.calibrate_range(bootstrap_inst)
+    reference_equilibrium, reference_spread = PUMEMarkovTrafficEquilibrium.calibrate_range(cal_inst)
     # A picklable factory (base graph + calibrated tensors) the streaming dataset ships to each worker,
     # which builds its own family + PUME solver lazily -- nothing solver-related is pickled. The
     # main process also needs one live family for collate_fn and the validation rollout callbacks.
@@ -274,7 +289,7 @@ def main(args):
     # A process-safe counter of ground-truth operator point-evaluations (the training budget), shared
     # only by the families that generate training data: counting_factory bakes it in, so every
     # streaming worker + the on-policy/expert streams increment the same total, while the main `family`
-    # (validation + collate) and the one-time bootstrap/val/test build stay counter-free (family_factory).
+    # (validation + collate) and the one-time cal/val/test build stay counter-free (family_factory).
     operator_counter = SharedCounter()
     counting_factory = functools.partial(
         PUMEMarkovTrafficEquilibrium,
@@ -290,29 +305,29 @@ def main(args):
     # only train source is the expert solution stream (built below). 'partial' regresses the operator
     # field, with the uniform stream as its always-on train source. train_ds is None under 'full'.
     if args.amortization == "full":
-        (val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_solution_dataset(
-            family_factory, bootstrap_inst, val_inst, test_inst
+        (val_ds, test_ds, cal_ds), normalizer = build_streaming_solution_dataset(
+            family_factory, cal_inst, val_inst, test_inst
         )
         train_ds = None
     else:
-        (train_ds, val_ds, test_ds, bootstrap_ds), normalizer = build_streaming_operator_dataset(
+        (train_ds, val_ds, test_ds, cal_ds), normalizer = build_streaming_operator_dataset(
             family_factory,
-            bootstrap_inst,
+            cal_inst,
             val_inst,
             test_inst,
             args.points_per_instance,
             stream_factory=counting_factory,
             warp=args.target_warp,
         )
-    print(f"streaming train   bootstrap: {len(bootstrap_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
+    print(f"streaming train   cal: {len(cal_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
-    # Size the backbone from one transformed bootstrap example (line-graph structure + feature width);
+    # Size the backbone from one transformed calibration example (line-graph structure + feature width);
     # the train stream is iterable, so it cannot be indexed. The same backbone feeds either task:
     # --amortization picks the Field vs Solution task wrapper (different target + validation), and only
     # the Field task takes the --loss knobs (the solution task is plain MSE on a standardized z*). The
     # mlp is the whole-graph flat baseline: flatten the fixed network's per-edge feats [E, k] to one
     # vector and predict every edge jointly (out_features = E).
-    sample, _ = bootstrap_ds[0]
+    sample, _ = cal_ds[0]
     if args.model == "graphormer":
         net = GraphormerBackbone(
             n_feats=sample["feats"].shape[-1],
@@ -388,6 +403,23 @@ def main(args):
             train_loaders["uniform"] = DataLoader(
                 train_ds,
                 batch_size=args.batch_uniform,
+                num_workers=args.n_workers,
+                persistent_workers=args.n_workers > 0,
+                collate_fn=collate,
+                worker_init_fn=_single_thread_worker,
+            )
+        if "fixed" in args.sources:
+            # Bounded instance diversity: the instance set is drawn once here (reproducible under the
+            # global seed) and shipped to every worker, while the domain points stay freshly sampled --
+            # so this differs from the uniform source only in pinning the parametrizations. Model-free,
+            # so it keeps the route-choice-solving workers.
+            fixed_instances = [family.sample_params() for _ in range(args.n_train_instances)]
+            fixed_stream = FixedInstanceOperatorStream(
+                counting_factory, normalizer, fixed_instances, args.points_per_instance
+            )
+            train_loaders["fixed"] = DataLoader(
+                fixed_stream,
+                batch_size=args.batch_fixed,
                 num_workers=args.n_workers,
                 persistent_workers=args.n_workers > 0,
                 collate_fn=collate,

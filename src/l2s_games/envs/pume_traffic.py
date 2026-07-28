@@ -70,7 +70,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         # Cumulative point-evaluation counter; the no-op LocalCounter default keeps `operator`
         # branch-free (see traffic.MarkovTrafficEquilibrium for the shared-counter streaming setup).
         self.operator_counter = operator_counter or LocalCounter()
-        # Domain-sampling range: reference_equilibrium/spread (calibrated from bootstrap equilibria)
+        # Domain-sampling range: reference_equilibrium/spread (calibrated from the calibration equilibria)
         # center and scale the cost box, else fall back to the shipped reference cost. See sample_domain.
         if reference_equilibrium is not None and reference_spread is not None:
             self.reference_equilibrium = torch.as_tensor(reference_equilibrium, dtype=torch.float32)

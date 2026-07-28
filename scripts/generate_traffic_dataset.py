@@ -3,8 +3,8 @@ generate_traffic_dataset.py
 
 Pre-compute and cache a dataset of noised SiouxFalls instances, each solved to user equilibrium by
 ``PUMESolver``. Solving is the expensive part, so this is run once, offline; training then loads the
-cache, splits it into bootstrap / val / test, and calibrates the streaming sampling range from the
-bootstrap equilibria (see ``MarkovTrafficEquilibrium.calibrate_range`` and ``train_field_gnn.py``).
+cache, splits it into cal / val / test, and calibrates the streaming sampling range from the
+calibration equilibria (see ``MarkovTrafficEquilibrium.calibrate_range`` and ``train_field_gnn.py``).
 
     python scripts/generate_traffic_dataset.py 1024 data/sioux_falls/solved
 

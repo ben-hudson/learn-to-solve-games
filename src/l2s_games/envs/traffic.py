@@ -117,7 +117,7 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         # family_factory scopes the total to training-data generation (see operator_count.py).
         self.operator_counter = operator_counter or LocalCounter()
         # Domain sampling must span the whole path the rollout traverses -- from the free-flow-time
-        # start up to the equilibrium. ``reference_equilibrium`` (per-edge mean of the bootstrap
+        # start up to the equilibrium. ``reference_equilibrium`` (per-edge mean of the calibration
         # equilibria) and ``reference_spread`` (their per-edge std) center and scale that range; they
         # are calibrated once in the main process (see ``calibrate_range``) and passed in so every
         # streaming worker shares the same range. See sample_domain. When they are not supplied (the
@@ -233,7 +233,7 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
 
         Each edge's cost is drawn uniformly in ``[free_flow_time, ceiling]``, where the per-edge
         ``ceiling = reference_equilibrium + n_stds * reference_spread`` is calibrated from the
-        bootstrap equilibria (per-edge mean ``reference_equilibrium`` and std ``reference_spread``;
+        calibration equilibria (per-edge mean ``reference_equilibrium`` and std ``reference_spread``;
         see ``calibrate_range``). This spans the whole segment the rollout traverses -- from the
         free-flow-time start up to (a few sigma above) the equilibrium -- as a flat box rather than
         the earlier equilibrium-ball-plus-reach sampler. ``hi`` is floored at ``free_flow_time`` so

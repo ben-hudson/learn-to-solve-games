@@ -325,7 +325,7 @@ def split_instances(instances, counts):
 
 def build_streaming_operator_dataset(
     family_factory,
-    bootstrap_instances,
+    cal_instances,
     val_instances,
     test_instances,
     points_per_instance,
@@ -339,33 +339,33 @@ def build_streaming_operator_dataset(
     ``warp`` selects the target nonlinearity composed on the (global-standardized) field target --
     ``"asinh"`` (default, the GNN's tail-compressing behavior; see ``--target_warp``) or ``"none"``.
 
-    The bootstrap / val / test instances are pre-solved and passed in (split from a cached
+    The cal / val / test instances are pre-solved and passed in (split from a cached
     ``SolvedInstanceDataset``); this builds their ``(input, target)`` examples with the family's
-    (calibrated) ``sample_domain`` + ``operator``. The normalizer is fit once on the **bootstrap**
+    (calibrated) ``sample_domain`` + ``operator``. The normalizer is fit once on the **calibration**
     examples, then frozen and shared with the stream and the fixed val/test splits -- preserving the
     fit-on-a-fixed-sample invariant while training draws unbounded fresh instances. Val/test stay
     fixed so their metrics are stable across epochs. ``points_per_instance`` drives the train stream
-    (points solved jointly per fresh instance) and the bootstrap density; val/test always solve each
+    (points solved jointly per fresh instance) and the calibration density; val/test always solve each
     instance once -- the equilibrium rollout depends only on the instance, so extra points there just
     repeat identical rollouts. Pair with ``collate_examples(family)`` for the DataLoaders.
 
     ``stream_factory`` builds the train stream's per-worker family; it defaults to ``family_factory``.
     Pass a distinct factory (e.g. one carrying an operator-call counter) to instrument the train
-    stream without counting the one-time bootstrap/val/test build, which always uses ``family_factory``.
+    stream without counting the one-time cal/val/test build, which always uses ``family_factory``.
     """
     stream_factory = stream_factory or family_factory
     family = family_factory()
-    bootstrap = _examples_for_instances(family, bootstrap_instances, points_per_instance)
+    cal = _examples_for_instances(family, cal_instances, points_per_instance)
     # Solve each fixed val/test instance once: the rollout residual is a function of the instance
     # alone (the sampled cost point is overwritten by the rollout state), so >1 point is redundant.
     val = _examples_for_instances(family, val_instances, 1)
     test = _examples_for_instances(family, test_instances, 1)
-    normalizer = _fit_normalizer(family, bootstrap, warp=warp)
+    normalizer = _fit_normalizer(family, cal, warp=warp)
     train_ds = UniformSampledOperatorStream(stream_factory, normalizer, points_per_instance)
     val_ds, test_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test))
-    # The bootstrap set (a fixed FieldDataset) doubles as the model-sizing sample source.
-    bootstrap_ds = OperatorDataset(bootstrap, family.transform, normalizer)
-    return (train_ds, val_ds, test_ds, bootstrap_ds), normalizer
+    # The calibration set (a fixed FieldDataset) doubles as the model-sizing sample source.
+    cal_ds = OperatorDataset(cal, family.transform, normalizer)
+    return (train_ds, val_ds, test_ds, cal_ds), normalizer
 
 
 def solution_examples(family, instances):
@@ -381,8 +381,8 @@ def solution_examples(family, instances):
     ]
 
 
-def build_streaming_solution_dataset(family_factory, bootstrap_instances, val_instances, test_instances):
-    """Fixed val/test/bootstrap ``z*``-target ``FieldDataset``s plus the fitted ``Normalizer``.
+def build_streaming_solution_dataset(family_factory, cal_instances, val_instances, test_instances):
+    """Fixed cal/val/test ``z*``-target ``FieldDataset``s plus the fitted ``Normalizer``.
 
     The solution-target sibling of ``build_streaming_operator_dataset``. The fixed splits use each
     instance's cached ``equilibrium_cost`` (exact and free), and the normalizer's target scaler is a
@@ -393,11 +393,9 @@ def build_streaming_solution_dataset(family_factory, bootstrap_instances, val_in
     ``collate_examples(family)`` for the DataLoaders.
     """
     family = family_factory()
-    bootstrap, val, test = (
-        solution_examples(family, instances) for instances in (bootstrap_instances, val_instances, test_instances)
+    cal, val, test = (
+        solution_examples(family, instances) for instances in (cal_instances, val_instances, test_instances)
     )
-    normalizer = _fit_normalizer(family, bootstrap, target_scaler=Standardizer.fit, warp="none")
-    val_ds, test_ds, bootstrap_ds = (
-        OperatorDataset(split, family.transform, normalizer) for split in (val, test, bootstrap)
-    )
-    return (val_ds, test_ds, bootstrap_ds), normalizer
+    normalizer = _fit_normalizer(family, cal, target_scaler=Standardizer.fit, warp="none")
+    val_ds, test_ds, cal_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test, cal))
+    return (val_ds, test_ds, cal_ds), normalizer

@@ -49,19 +49,20 @@ class ConcatConditioning:
 
     The raw item (from a flat family's ``model_input``) carries ``point`` and ``params``; this
     appends the instance ``params`` to the domain ``point`` so one field model can represent the
-    whole family. Returns a fresh ``{"feats": ...}`` item.
+    whole family. Returns the item with ``feats`` added, everything it already carried untouched.
     """
 
     def __call__(self, item):
-        point = torch.as_tensor(item["point"], dtype=torch.float32)
-        params = torch.as_tensor(item["params"], dtype=torch.float32)
+        point, params = item["point"], item["params"]
         conditioning = params.expand(*point.shape[:-1], params.shape[-1])
-        # Keep the raw params alongside feats so the collated batch can supply per-instance params
-        # to the analytic operator during the validation equilibrium sweep. Keep the raw (un-
-        # standardized) point too -- it stays inside feats (the coordinate the field is evaluated
-        # at), but the collated batch also needs it raw as the validation rollout's start iterate
-        # (mirrors how traffic keeps a raw ``cost`` alongside the standardized cost in ``feats[0]``).
-        return {"feats": torch.cat([point, conditioning], dim=-1), "params": params, "point": point}
+        # Only ``feats`` is added -- every key the raw item carries rides along. The raw params are what
+        # let the collated batch supply per-instance params to the analytic operator during the
+        # validation equilibrium sweep; the raw (un-standardized) point also sits inside feats (the
+        # coordinate the field is evaluated at), but the batch needs it raw as the validation rollout's
+        # start iterate (mirrors how traffic keeps a raw ``cost`` alongside the standardized cost in
+        # ``feats[0]``). An ``instance_index`` diagnostic tag rides along the same way, matching the
+        # graph transform, which mutates its ``Data`` in place.
+        return dict(item, feats=torch.cat([point, conditioning], dim=-1))
 
 
 def demand_edge_features(graph):

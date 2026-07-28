@@ -6,8 +6,8 @@ offline, and persist the results as a PyG ``InMemoryDataset``. ``download`` solv
 solves each with ``solve_fn`` (storing the equilibrium under ``equilibrium_cost`` / ``equilibrium_flow``
 so it does not collide with the sampled domain point ``.cost`` set by ``model_input``), and caches the
 list in ``instances.pt``. A later read -- ``SolvedInstanceDataset(root)`` with no callables -- just
-reloads the cache. The training script splits the loaded instances into bootstrap / val / test and
-calibrates the streaming sampling range from the bootstrap equilibria (see ``calibrate_range``).
+reloads the cache. The training script splits the loaded instances into cal / val / test and
+calibrates the streaming sampling range from the calibration equilibria (see ``calibrate_range``).
 """
 
 import torch
