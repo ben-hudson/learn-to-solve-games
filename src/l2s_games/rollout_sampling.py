@@ -12,18 +12,25 @@ instances jointly and evaluating the ground-truth operator at the visited states
   converged endpoint). It is model-free -- holds only the picklable ``family_factory`` -- so it runs
   on ``DataLoader`` workers, which it must: the rollout is ``n_steps`` operator solves.
 
-Both share the same batched machinery (``batched_rollout`` + ``trajectory_examples``), differing only
-in *which* batched field is rolled out. Everything runs through the existing family seams --
-``model_input`` / ``transform`` / ``collate_fn`` (conditioning), ``batched_field`` (the batched
-learned field, real units) or ``operator`` (the batched analytic field), ``params_from_batch`` /
-``project`` (off the collated batch), ``simulate`` + ``ALGORITHMS`` (the rollout) -- so they are blind
-to the concrete representation and work for both the flat (RPS/matrix) and graph (traffic) families.
+Both share ``batched_rollout``, differing in *which* batched field is rolled out -- and that difference
+decides where their training targets come from. The expert rolls out the ground truth, so the operator
+values the algorithm consumes **are** the regression targets: a ``RecordedField`` keeps them and the
+rollout doubles as the data collection, ~1 eval per example. The on-policy stream rolls out the
+*learned* field, whose values are worthless as targets, so it must subsample the visited states and
+re-solve the true operator there (``trajectory_examples``) -- which is why only it still pays that
+second solve.
+
+Everything runs through the existing family seams -- ``model_input`` / ``transform`` / ``collate_fn``
+(conditioning), ``batched_field`` (the batched learned field, real units) or ``operator_and_metric``
+(the batched analytic field), ``params_from_batch`` / ``project`` (off the collated batch), ``simulate``
++ ``ALGORITHMS`` (the rollout) -- so they are blind to the concrete representation and work for both the
+flat (RPS/matrix) and graph (traffic) families.
 """
 
 import torch
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.data import OperatorStream, examples_at_points, normalize_input
+from l2s_games.data import OperatorStream, SolvedGroup, examples_at_points, group_examples, normalize_input
 from l2s_games.dynamics import simulate
 
 
@@ -41,6 +48,71 @@ def batched_rollout(family, batch, field, algo, n_steps, z0):
     return simulate(lambda z: -field(z), algo, z0, n_steps, project=project).cpu()
 
 
+class RecordedField:
+    """A batched analytic field that keeps every ``(state, value, metric)`` triple it is asked for.
+
+    Rolling out the ground-truth operator already pays one solve per visited state, and those solves
+    *are* the regression targets -- but ``simulate`` returns only the iterates, so they used to be
+    discarded and a subsample of the trajectory re-solved (``trajectory_examples``). Recording them
+    instead makes the expert rollout its own data collection: ``n_steps`` evals, ``n_steps`` examples.
+
+    Recording at the **field** level rather than per step is what keeps this algorithm-agnostic:
+    ``extragradient`` calls the field twice per step (at the iterate and at the lookahead) and both are
+    legitimate ``(state, operator value)`` pairs, while ``projection`` calls it once. The negation for
+    descent stays outside (``batched_rollout`` rolls out ``-field``), so the retained values are the
+    unnegated operator -- the target convention the whole pipeline regresses.
+
+    ``groups`` slices the recording per instance, since the constraint and the conditioning are both
+    per-instance. One caveat, documented rather than filtered: the states are exactly the ones the
+    algorithm queried, and ``extragradient``'s lookahead is unprojected, so under that algorithm some
+    can lie outside the feasible set. Under ``projection`` (the default) the field only ever sees
+    projected iterates, so every recorded state is feasible.
+    """
+
+    def __init__(self, family, params):
+        self.family = family
+        self.params = params
+        self.states, self.values, self.metrics = [], [], []
+
+    def __call__(self, z):
+        values, metrics = self.family.operator_and_metric(self.params, z)
+        self.states.append(z.detach().clone())
+        self.values.append(values)
+        self.metrics.append(metrics)
+        return values
+
+    def groups(self, instances):
+        """One ``SolvedGroup`` per instance: its recorded states, values and metrics, ``[K, d]`` each.
+
+        The recordings stack to ``[K, B, d]`` (``K`` field calls over the ``B``-instance batch), so
+        instance ``b``'s group is column ``b`` of each stack.
+        """
+        states, values, metrics = (torch.stack(record) for record in (self.states, self.values, self.metrics))
+        return [SolvedGroup(inst, states[:, b], values[:, b], metrics[:, b]) for b, inst in enumerate(instances)]
+
+
+def _with_endpoints(instances, groups, points, targets, metrics):
+    """Extend each instance's group with its equilibrium endpoint (or make a group of just the endpoint).
+
+    Keeps one group per instance -- and so one ``INSTANCE_INDEX`` per instance, and a uniform group width
+    for the interleaved yield -- rather than appending the endpoints as separate groups.
+    """
+    endpoints = [
+        SolvedGroup(inst, points[b, None], targets[b, None], metrics[b, None]) for b, inst in enumerate(instances)
+    ]
+    if not groups:  # the solutions-only baseline: no trajectory was kept
+        return endpoints
+    return [
+        SolvedGroup(
+            group.params,
+            torch.cat([group.points, endpoint.points]),
+            torch.cat([group.targets, endpoint.targets]),
+            torch.cat([group.metrics, endpoint.metrics]),
+        )
+        for group, endpoint in zip(groups, endpoints)
+    ]
+
+
 def trajectory_examples(family, instances, traj, n_points):
     """Raw ``(model_input, target)`` examples from ``n_points`` states subsampled across a rollout.
 
@@ -49,6 +121,10 @@ def trajectory_examples(family, instances, traj, n_points):
     analytic operator per instance over its picked points (one solve per instance) via
     ``examples_at_points``. The assembled examples are shuffled so a minibatch is not dominated by a
     single instance.
+
+    The **on-policy** collector's path: it rolls out the learned field, so the values that rollout
+    produced are not ground truth and the visited states have to be re-solved here. The expert rolls out
+    the ground truth and keeps its values instead (``RecordedField``), paying no second solve.
     """
     n_steps, n_inst = traj.shape[0], traj.shape[1]
     flat_points = traj.reshape(n_steps * n_inst, -1)  # [(T+1)*B, d]
@@ -142,7 +218,7 @@ class ExpertOperatorStream(OperatorStream):
     traffic).
 
     Like ``OnPolicyOperatorStream`` it owns a buffer refreshed every ``refresh_every`` epochs (its
-    ``__iter__``): one ``_expert_batch`` solve per refresh window, cycled for the rest of the window,
+    ``_raw_stream``): one ``_expert_batch`` solve per refresh window, cycled for the rest of the window,
     so a solved chunk trains the model across epochs instead of being regenerated-and-discarded every
     time the epoch (bounded by ``Trainer(limit_train_batches=...)``) ends mid-chunk. This keeps the
     logged operator-eval budget equal to the distinct solves the model actually trains on, rather than
@@ -154,10 +230,13 @@ class ExpertOperatorStream(OperatorStream):
     operator solve per step over the whole batch), then yields ordinary ``(model_input, operator)``
     examples at:
 
-    - ``n_instances * points_per_instance`` states subsampled along the trajectory (the expert path),
-      when ``include_trajectory``, and
+    - **every** state the rollout evaluated the operator at, when ``include_trajectory`` -- kept by
+      ``RecordedField`` as one ``SolvedGroup`` per instance rather than re-solved, so a window costs
+      ``n_instances * (n_steps + 1)`` evals and yields that many examples (~1 example per eval, where
+      subsampling-and-re-solving yielded one per ``n_steps / points_per_instance``), and
     - the converged endpoint ``z*`` (the equilibrium solution), one per instance -- all ``n_instances``
-      solved in a single batched operator call -- when ``include_solution``.
+      solved in a single batched operator call -- when ``include_solution``. That solve is the ``+ 1``
+      above and is genuinely extra: ``traj[-1]`` is the one state the algorithm never queried.
 
     Both are plain operator examples, so they blend into the same regression MSE. The two ``include_*``
     gates let a solutions-only baseline select just the equilibria by config, not a rewrite.
@@ -182,7 +261,6 @@ class ExpertOperatorStream(OperatorStream):
         h,
         n_steps,
         n_instances,
-        points_per_instance,
         refresh_every,
         algo_kwargs=None,
         include_trajectory=True,
@@ -198,7 +276,6 @@ class ExpertOperatorStream(OperatorStream):
         self.h = h
         self.n_steps = n_steps
         self.n_instances = n_instances
-        self.points_per_instance = points_per_instance
         self.refresh_every = refresh_every
         self.algo_kwargs = algo_kwargs or {}
         self.include_trajectory = include_trajectory
@@ -208,7 +285,13 @@ class ExpertOperatorStream(OperatorStream):
         self._epoch = -1
 
     def _expert_batch(self, family):
-        """Roll out a fresh batch of instances on the true operator; return trajectory + solution examples."""
+        """Roll out a fresh batch of instances on the true operator; return ``(groups, examples)``.
+
+        ``groups`` hold the operator-target demonstrations -- one ``SolvedGroup`` per instance, carrying
+        the states the rollout evaluated plus the equilibrium endpoint. ``examples`` hold the ``z*``-target
+        ones, which are not operator values and so are not groups. Exactly one of the two is populated by
+        each of the configurations in use (``partial`` -> groups, ``full`` -> examples).
+        """
         instances = [family.sample_params() for _ in range(self.n_instances)]
         z0 = torch.stack([family.sample_domain(inst, 1)[0] for inst in instances])  # [B, d]
         items = [
@@ -220,12 +303,15 @@ class ExpertOperatorStream(OperatorStream):
         batch = family.collate_fn(items)
         params = family.params_from_batch(batch)
         algo = ALGORITHMS[self.algo](self.h, **self.algo_kwargs)  # fresh instance per rollout
-        field = lambda z: family.operator(params, z)
+        # Keep the operator values the rollout consumes when they are the targets we want. Under
+        # solution_target they are not (z* is), so the plain field is used there and nothing is retained.
+        recorder = None if self.solution_target else RecordedField(family, params)
+        field = recorder if recorder is not None else lambda z: family.operator(params, z)
         traj = batched_rollout(family, batch, field, algo, self.n_steps, z0)  # [T+1, B, d]
 
-        examples = []
+        groups, examples = [], []
         if self.include_trajectory:
-            examples += trajectory_examples(family, instances, traj, self.n_instances * self.points_per_instance)
+            groups = recorder.groups(instances)
         if self.include_solution:
             z_star = traj[-1]  # [B, d] -- each instance's converged endpoint is its equilibrium solution
             if self.solution_target:
@@ -235,11 +321,12 @@ class ExpertOperatorStream(OperatorStream):
                 examples += [(family.model_input(inst, inst.free_flow_time), z_star[b]) for b, inst in enumerate(instances)]
             else:
                 # Operator-field target: solve the operator (~0 there) for all B distinct endpoints in
-                # ONE batched call -- batching the B instances together, as the rollout does.
+                # ONE batched call -- batching the B instances together, as the rollout does. This is the
+                # one solve the recording cannot supply: traj[-1] is the state the algorithm never queried.
                 with torch.no_grad():
-                    residuals = family.operator(params, z_star)
-                examples += [(family.model_input(inst, z_star[b]), residuals[b]) for b, inst in enumerate(instances)]
-        return examples
+                    residuals, metrics = family.operator_and_metric(params, z_star)
+                groups = _with_endpoints(instances, groups, z_star, residuals, metrics)
+        return groups, examples
 
     def _raw_stream(self, family):
         # Refresh the buffer at epoch start (once per refresh_every epochs), then cycle it -- one
@@ -251,5 +338,13 @@ class ExpertOperatorStream(OperatorStream):
         self._epoch += 1
         if self._buffer is None or self._epoch % self.refresh_every == 0:
             self._buffer = self._expert_batch(family)
+        groups, examples = self._buffer
+        # Every group holds the same number of points (one rollout, one endpoint solve), so a flat
+        # permutation over group x point decodes by divmod -- interleaving the instances so a minibatch is
+        # a mix rather than one instance's consecutive states, as the old shuffled example list was.
+        width = len(groups[0].points) if groups else 0
         while True:
-            yield from self._buffer
+            for flat in torch.randperm(len(groups) * width).tolist():
+                index, point = divmod(flat, width)
+                yield from group_examples(family, groups[index], index=index, order=[point])
+            yield from examples

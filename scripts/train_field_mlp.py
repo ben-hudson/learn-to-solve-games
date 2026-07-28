@@ -241,7 +241,9 @@ def main(args):
             callbacks.append(VizRolloutCallback(game, viz_instances, args.train_algo, args.h, args.n_steps, save_dir))
     if "expert" in args.sources:
         # The expert stream rolls out the *analytic* operator (no model), so it is picklable and runs
-        # on workers; it yields both the expert trajectory and the equilibrium solutions.
+        # on workers; it yields both the expert trajectory and the equilibrium solutions. It keeps the
+        # operator values its rollout consumes as the targets (the rolled-out field is the ground truth),
+        # so it takes no points_per_instance -- every visited state is an example.
         streams["expert"] = (
             ExpertOperatorStream(
                 family_factory,
@@ -250,7 +252,6 @@ def main(args):
                 args.h,
                 args.n_steps,
                 args.n_expert_instances,
-                args.points_per_instance,
                 args.refresh_every,
             ),
             args.batch_expert,

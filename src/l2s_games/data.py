@@ -17,6 +17,7 @@ call site.
 """
 
 import functools
+from typing import Any, NamedTuple
 
 import torch
 from torch import nn
@@ -26,6 +27,12 @@ from torch.utils.data import Dataset, IterableDataset, default_collate, random_s
 # examples_at_points. Lives here (not in monotonicity.py, its consumer) so the data layer owns its own
 # schema and nothing in the pipeline imports the constraint code.
 METRIC_DIAGONAL = "metric_diagonal"
+# Item key for the index of the example's instance within its source's instance set -- stable across
+# epochs, and what the monotonicity constraint groups same-instance points by. Diagnostics-only for the
+# model (the backbones read only feats + structure); it rides along on the collated batch. Lives here
+# with METRIC_DIAGONAL for the same reason -- and because group_examples sets it, so a home in a module
+# that imports this one would be a cycle.
+INSTANCE_INDEX = "instance_index"
 
 
 class Standardizer(nn.Module):
@@ -200,29 +207,70 @@ def collate_examples(family):
     return functools.partial(_collate_examples, family.collate_fn)
 
 
-def examples_at_points(family, params, points):
-    """Raw ``(model_input, target)`` examples for one instance at explicit ``points``.
+class SolvedGroup(NamedTuple):
+    """One instance's solved points: ``params`` plus ``points`` / ``targets`` / ``metrics``, each ``[K, d]``.
 
-    The operator (an expensive route-choice solve for traffic) is run **once, jointly for all
-    points**, then sliced per point. The single place that pairs a domain point with its operator
-    target, shared by the uniform sampler (``_solve_instance``) and the rollout collectors (on-policy
-    + expert, see ``rollout_sampling``), so every source builds examples identically.
+    The unit every *buffered* source retains (see ``caching.CachedOperatorStream`` and the expert stream
+    in ``rollout_sampling``). Deliberately **not** a list of ``(model_input, target)`` examples:
+    ``model_input`` clones the instance per point -- ~13 KB for a traffic graph -- so a buffer of examples
+    costs ``K`` times what a group does, which for a million cached traffic points is 13 GB rather than
+    1.3 GB. ``group_examples`` rebuilds the examples one at a time, at yield time, so the clone is
+    transient and only the tensors are held.
+    """
 
-    Each item is tagged with ``metric_diagonal``: the per-coordinate diagonal that maps the operator's
-    value back to the family's **raw** (unpreconditioned) field, i.e. ``metric_diagonal * target`` (see
-    ``VariationalInequalityFamily.operator_and_metric``; all ones for families that are already raw).
-    It rides along for the monotonicity constraint, which must be stated about the raw field -- the
-    preconditioned one is not monotone. It comes out of the same solve as the target, so it is free, and
-    the tag is set by key access so it works for a PyG ``Data`` and a plain dict alike.
+    params: Any
+    points: torch.Tensor
+    targets: torch.Tensor
+    metrics: torch.Tensor
+
+
+def solve_group(family, params, points):
+    """Solve the operator jointly for one instance's ``points`` -> a ``SolvedGroup``.
+
+    The single place a domain point is paired with its operator target: the operator (an expensive
+    route-choice solve for traffic) runs **once for all points**, and the metric diagonal falls out of
+    the same call, so it is free (see ``VariationalInequalityFamily.operator_and_metric``).
     """
     with torch.no_grad():
         targets, metrics = family.operator_and_metric(params, points)
-    examples = []
-    for j in range(len(points)):
-        item = family.model_input(params, points[j])
-        item[METRIC_DIAGONAL] = metrics[j]
-        examples.append((item, targets[j]))
-    return examples
+    return SolvedGroup(params, points, targets, metrics)
+
+
+def sample_group(family, params, n):
+    """``solve_group`` at ``n`` freshly sampled domain points -- one instance's worth of training data."""
+    return solve_group(family, params, family.sample_domain(params, n))
+
+
+def group_examples(family, group, index=None, order=None):
+    """Iterate a ``SolvedGroup`` into raw ``(model_input, target)`` examples, one per point.
+
+    Each item is tagged with ``METRIC_DIAGONAL``: the per-coordinate diagonal that maps the operator's
+    value back to the family's **raw** (unpreconditioned) field, i.e. ``metric_diagonal * target`` (all
+    ones for families that are already raw). It rides along for the monotonicity constraint, which must
+    be stated about the raw field -- the preconditioned one is not monotone. ``index``, when given, adds
+    the ``INSTANCE_INDEX`` tag. Both are set by key access, so this works for a PyG ``Data`` (traffic)
+    and a plain dict (flat games) alike.
+
+    ``order`` picks which point comes out when: the cached sources reshuffle it per pass so the
+    monotonicity pairs -- matched by halves within an instance -- vary without any new solves.
+    """
+    order = range(len(group.points)) if order is None else order
+    for j in order:
+        item = family.model_input(group.params, group.points[j])
+        item[METRIC_DIAGONAL] = group.metrics[j]
+        if index is not None:
+            item[INSTANCE_INDEX] = torch.tensor(index)
+        yield item, group.targets[j]
+
+
+def examples_at_points(family, params, points, index=None):
+    """A list of raw ``(model_input, target)`` examples for one instance at explicit ``points``.
+
+    ``solve_group`` + ``group_examples`` for the sources that build their examples eagerly (the fixed
+    splits, the fixed-instance stream and the on-policy collector, which must re-solve because it rolls
+    out the *learned* field). Buffered sources hold the group instead and skip this.
+    """
+    return list(group_examples(family, solve_group(family, params, points), index=index))
 
 
 def _solve_instance(family, params, points_per_instance):
@@ -231,7 +279,7 @@ def _solve_instance(family, params, points_per_instance):
     Shared by the eager ``_examples_for_instances`` and the streaming ``UniformSampledOperatorStream``,
     both of which pass the full ``points_per_instance`` so one solve amortizes over that many points.
     """
-    return examples_at_points(family, params, family.sample_domain(params, points_per_instance))
+    return list(group_examples(family, sample_group(family, params, points_per_instance)))
 
 
 def _examples_for_instances(family, instances, points_per_instance):
@@ -347,6 +395,8 @@ def build_streaming_operator_dataset(
     points_per_instance,
     stream_factory=None,
     warp="none",
+    cache_instances=0,
+    refresh_every=1,
 ):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
 
@@ -370,6 +420,11 @@ def build_streaming_operator_dataset(
     ``stream_factory`` builds the train stream's per-worker family; it defaults to ``family_factory``.
     Pass a distinct factory (e.g. one carrying an operator-call counter) to instrument the train
     stream without counting the one-time cal/val/test build, which always uses ``family_factory``.
+
+    ``cache_instances > 0`` swaps the unbounded uniform stream for the **cached** one (see
+    ``caching.CachedOperatorStream``): that many fresh instances are solved per ``refresh_every``-epoch
+    window and then reused, so the train operator budget is set by config rather than growing with the
+    epoch count. ``0`` (the default) keeps the unbounded stream.
     """
     stream_factory = stream_factory or family_factory
     family = family_factory()
@@ -379,7 +434,16 @@ def build_streaming_operator_dataset(
     val = _examples_for_instances(family, val_instances, 1)
     test = _examples_for_instances(family, test_instances, 1)
     normalizer = _fit_normalizer(family, cal, warp=warp)
-    train_ds = UniformSampledOperatorStream(stream_factory, normalizer, points_per_instance)
+    if cache_instances > 0:
+        # Imported here: caching.py builds on this module's OperatorStream + group helpers, so a
+        # module-level import would be a cycle.
+        from l2s_games.caching import CachedOperatorStream
+
+        train_ds = CachedOperatorStream(
+            stream_factory, normalizer, points_per_instance, n_instances=cache_instances, refresh_every=refresh_every
+        )
+    else:
+        train_ds = UniformSampledOperatorStream(stream_factory, normalizer, points_per_instance)
     val_ds, test_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test))
     # The calibration set (a fixed FieldDataset) doubles as the model-sizing sample source.
     cal_ds = OperatorDataset(cal, family.transform, normalizer)

@@ -28,6 +28,21 @@ batch sizes ``--batch_uniform`` / ``--batch_fixed`` / ``--batch_rollout``):
   ``--refresh_every`` epochs (see ``rollout_sampling.OnPolicyOperatorStream``). It holds a live model
   ref, so its loader runs with ``num_workers=0``.
 
+``--cache`` bounds the two sampling sources' operator budget (see ``caching.CachedOperatorStream``):
+they otherwise resample on every visit and so spend evals per epoch forever, capped only by
+``--epochs``. Under it, ``--n_train_instances`` instances x ``--points_per_instance`` points are solved
+per ``--refresh_every``-epoch window and then reused, so the budget is config-set:
+
+    uniform / fixed + --cache   n_workers * n_train_instances * points_per_instance * windows
+    expert                      n_workers * n_expert_instances * (n_steps + 1) * windows
+    rollout                     n_rollout_instances * (n_steps + points_per_instance) * windows
+    full (--amortization full)  n_workers * n_expert_instances * n_steps * windows
+
+with ``windows = ceil(epochs / refresh_every)`` (one buffer per worker: PyTorch does not shard iterable
+datasets). The ``expert`` source is ~1 example per eval -- it keeps the operator values its rollout of
+the *true* field consumes instead of re-solving a subsample -- while ``full`` pays ``n_steps`` evals per
+``z*`` label. ``train/operator_evals`` logs the running total (see ``OperatorCountCallback``).
+
 The normalizer is fit once on a fixed calibration set (``--n_cal_instances``); val/test stay fixed.
 
 Each validation epoch logs, over the held-out validation set, the field relative error plus -- for
@@ -51,6 +66,7 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
+from l2s_games.caching import CachedOperatorStream
 from l2s_games.callbacks import FieldRolloutCallback, OperatorCountCallback, SolutionPredictionCallback
 from l2s_games.data import (
     build_streaming_operator_dataset,
@@ -100,14 +116,28 @@ def build_parser():
         "--n_train_instances",
         type=int,
         default=1024,
-        help="instances in the fixed training set (the 'fixed' source), sampled once at startup",
+        help="instances in the fixed training set (the 'fixed' source), sampled once at startup; under "
+        "--cache it also sizes the 'uniform' source's per-refresh-window draw",
     )
     p.add_argument(
         "--points_per_instance",
         type=int,
         default=32,
-        help="cost points solved jointly per streamed train instance (also calibration density for the "
-        "normalizer fit); val/test always solve each instance once",
+        help="cost points solved jointly per streamed train instance for the 'uniform' / 'fixed' / "
+        "'rollout' sources (also calibration density for the normalizer fit); val/test always solve each "
+        "instance once, and the 'expert' source keeps every state its rollout visits instead",
+    )
+    # Bounded operator budget for the two *sampling* sources (see l2s_games/caching.py). They otherwise
+    # resample on every visit -- fresh instances ('uniform') or fresh points on fixed instances ('fixed')
+    # -- so they spend steps_per_epoch * batch evals per epoch forever and the only cap is --epochs, which
+    # ties the data budget to the optimization budget. The rollout sources already bound their spend with
+    # a per-window buffer; this gives the sampling sources the same bound.
+    p.add_argument(
+        "--cache",
+        action="store_true",
+        help="freeze the sampled (instance, point) pairs per refresh window instead of resampling every "
+        "visit, so the train operator budget is n_workers * n_train_instances * points_per_instance * "
+        "ceil(epochs / refresh_every) -- set by config rather than growing with --epochs",
     )
     p.add_argument(
         "--n_workers", type=int, default=7, help="streaming dataloader workers (0 = serial; changes the stream)"
@@ -365,6 +395,8 @@ def main(args):
             args.points_per_instance,
             stream_factory=counting_factory,
             warp=args.target_warp,
+            cache_instances=args.n_train_instances if args.cache else 0,
+            refresh_every=args.refresh_every,
         )
     print(f"streaming train   cal: {len(cal_ds)}   val: {len(val_ds)}   test: {len(test_ds)}")
 
@@ -442,7 +474,6 @@ def main(args):
             args.h,
             args.n_steps,
             args.n_expert_instances,
-            args.points_per_instance,
             args.refresh_every,
             include_trajectory=False,
             solution_target=True,
@@ -464,7 +495,9 @@ def main(args):
         train_loaders = {}
         if "uniform" in args.sources:
             # Fresh uniform-domain samples -- cold-start coverage while the learned field is near-random,
-            # and the picklable stream keeps its route-choice-solving workers.
+            # and the picklable stream keeps its route-choice-solving workers. Under --cache this is the
+            # bounded variant (built in build_streaming_operator_dataset): the same fresh-sample
+            # distribution while it fills, then reused rather than resampled.
             train_loaders["uniform"] = DataLoader(
                 train_ds,
                 batch_size=args.batch_uniform,
@@ -477,11 +510,21 @@ def main(args):
             # Bounded instance diversity: the instance set is drawn once here (reproducible under the
             # global seed) and shipped to every worker, while the domain points stay freshly sampled --
             # so this differs from the uniform source only in pinning the parametrizations. Model-free,
-            # so it keeps the route-choice-solving workers.
+            # so it keeps the route-choice-solving workers. --cache freezes the points too, bounding the
+            # budget; the instance set is the same either way.
             fixed_instances = [family.sample_params() for _ in range(args.n_train_instances)]
-            fixed_stream = FixedInstanceOperatorStream(
-                counting_factory, normalizer, fixed_instances, args.points_per_instance
-            )
+            if args.cache:
+                fixed_stream = CachedOperatorStream(
+                    counting_factory,
+                    normalizer,
+                    args.points_per_instance,
+                    instances=fixed_instances,
+                    refresh_every=args.refresh_every,
+                )
+            else:
+                fixed_stream = FixedInstanceOperatorStream(
+                    counting_factory, normalizer, fixed_instances, args.points_per_instance
+                )
             train_loaders["fixed"] = DataLoader(
                 fixed_stream,
                 batch_size=args.batch_fixed,
@@ -511,7 +554,9 @@ def main(args):
         if "expert" in args.sources:
             # The expert stream rolls out the *analytic* operator (no model), so it is picklable and
             # keeps the route-choice-solving workers; it yields both the expert trajectory and the
-            # equilibrium solutions.
+            # equilibrium solutions. Because the rolled-out field *is* the ground truth, the values the
+            # rollout consumes are kept as the targets (RecordedField) rather than re-solved, so its
+            # budget is n_expert_instances * (n_steps + 1) per window -- one example per evaluation.
             expert_stream = ExpertOperatorStream(
                 counting_factory,
                 normalizer,
@@ -519,7 +564,6 @@ def main(args):
                 args.h,
                 args.n_steps,
                 args.n_expert_instances,
-                args.points_per_instance,
                 args.refresh_every,
             )
             train_loaders["expert"] = DataLoader(

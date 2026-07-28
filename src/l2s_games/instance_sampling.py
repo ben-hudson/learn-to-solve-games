@@ -8,17 +8,19 @@ distribution identical to the uniform stream's (a fresh ``sample_domain`` draw p
 for asking how many distinct parametrizations amortization actually needs, with the point sampling
 held constant.
 
-Each example is tagged with ``instance_index`` -- the position of its instance in the passed
-``instances`` list, stable across epochs and workers. It is **diagnostics-only**: the backbones read
-only ``feats`` and the graph structure, so the tag rides along on the collated batch (see the traffic
-``collate_fn``, which stacks every tensor attribute) without ever reaching the network.
+Each example is tagged with ``INSTANCE_INDEX`` (see ``data.py``, which owns the key and sets it) -- the
+position of its instance in the passed ``instances`` list, stable across epochs and workers. It is
+**diagnostics-only**: the backbones read only ``feats`` and the graph structure, so the tag rides along
+on the collated batch (see the traffic ``collate_fn``, which stacks every tensor attribute) without ever
+reaching the network.
+
+For a *bounded* budget over the same fixed instance set -- the points frozen too, rather than redrawn
+each visit -- see ``caching.CachedOperatorStream``.
 """
 
 import torch
 
 from l2s_games.data import OperatorStream, examples_at_points
-
-INSTANCE_INDEX = "instance_index"
 
 
 class FixedInstanceOperatorStream(OperatorStream):
@@ -45,8 +47,4 @@ class FixedInstanceOperatorStream(OperatorStream):
             for index in torch.randperm(len(self.instances)).tolist():
                 params = self.instances[index]
                 points = family.sample_domain(params, self.points_per_instance)
-                for raw, target in examples_at_points(family, params, points):
-                    # Key access (not attribute) so this stays representation-agnostic: it tags a PyG
-                    # Data (traffic) and a plain dict (flat games) alike.
-                    raw[INSTANCE_INDEX] = torch.tensor(index)
-                    yield raw, target
+                yield from examples_at_points(family, params, points, index=index)

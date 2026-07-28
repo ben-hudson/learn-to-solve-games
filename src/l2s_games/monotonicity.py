@@ -37,8 +37,7 @@ a tuning problem.
 import cooper
 import torch
 
-from l2s_games.data import METRIC_DIAGONAL
-from l2s_games.instance_sampling import INSTANCE_INDEX
+from l2s_games.data import INSTANCE_INDEX, METRIC_DIAGONAL
 
 
 def monotonicity_ratios(field, points, normalize=True):
