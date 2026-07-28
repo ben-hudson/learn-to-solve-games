@@ -20,12 +20,18 @@ Three things make it nearly free, and all three are properties of the existing p
 - **The ground truth is checkable for free.** The same computation run on the batch's *targets* must
   come out ~0 in the raw space, which is a correctness gate on this whole path rather than a diagnostic.
 
-The aggregation over an instance's pairs is a **soft maximum** (temperature ``tau``), i.e. approximately
-the worst pair rather than the mean: the requirement is monotonicity *over the training domain*, and a
-mean would let a single bad direction hide behind the satisfied ones. That is only legitimate
-because the ``QuadraticPenalty`` formulation used here has **no dual variable**. A sampled ``max`` is a
-biased estimator of a sup, so with a multiplier there would be nothing well-defined for it to converge
-to; a later switch to ``Lagrangian`` must revisit the aggregation together with the multiplier class.
+The constraint is stated **per pair**, not per instance: the violation tensor holds one entry for every
+matched pair in the batch. Under ``QuadraticPenalty`` that is the natural granularity, because cooper's
+penalty already sums over the violation dimension (``0.5 * mu * sum_p relu(v_p)^2``), and that sum is
+zero *iff every pair is monotone* -- so nothing is averaged away and no aggregation code is needed. This
+is also the granularity the eventual ``ImplicitMultiplier`` wants, since it parametrises one multiplier
+per pair from that pair's features.
+
+Two consequences to keep in mind. ``mu``'s effective scale tracks the number of pairs in a batch, since a
+sum grows with count -- it is not comparable across ``--batch_fixed`` or ``--points_per_instance``
+changes. And the squared hinge's gradient, ``2 * relu(v)``, vanishes as a pair approaches feasibility, so
+the last sliver of violation is only weakly pushed; that is inherent to the quadratic penalty rather than
+a tuning problem.
 """
 
 import cooper
@@ -79,23 +85,15 @@ def monotonicity_violations(field, points, normalize=True):
     return torch.relu(-monotonicity_ratios(field, points, normalize))
 
 
-def soft_max(values, temperature):
-    """Softmax-weighted mean of ``values`` -- the worst entry as ``temperature -> 0``, the mean as it grows.
-
-    A differentiable stand-in for ``max`` that spreads gradient over the worst few entries instead of
-    exactly one, which keeps the signal from being a single-sample statistic.
-    """
-    return torch.sum(torch.softmax(values / temperature, dim=0) * values)
-
-
 class MonotonicityCMP(cooper.ConstrainedMinimizationProblem):
-    """Regression loss subject to per-instance monotonicity of the model's raw field.
+    """Regression loss subject to monotonicity of the model's raw field, one constraint entry per pair.
 
-    One inequality constraint whose violation tensor holds **one entry per instance** present in the
-    batch, so ``cooper`` sees a per-instance statement rather than one batch-wide average. The
-    formulation is ``QuadraticPenalty`` -- no multiplier -- so ``compute_primal_lagrangian()`` returns an
-    ordinary differentiable loss and the training loop needs no dual optimizer; swapping
-    ``formulation_type`` (plus a multiplier) is the upgrade path to a Lagrangian.
+    One inequality constraint whose violation tensor holds **one entry per matched pair** in the batch, so
+    nothing is averaged: ``QuadraticPenalty`` sums the squared hinges, and that sum vanishes only when
+    every pair is monotone. No multiplier, so ``compute_primal_lagrangian()`` returns an ordinary
+    differentiable loss and the training loop needs no dual optimizer; swapping ``formulation_type`` (plus
+    a multiplier) is the upgrade path to a Lagrangian, and a per-pair violation is already the granularity
+    an ``ImplicitMultiplier`` needs.
 
     ``constrain_raw=False`` states the constraint about the preconditioned field the model literally
     predicts, which the operator itself violates -- kept only so the two are comparable.
@@ -105,7 +103,6 @@ class MonotonicityCMP(cooper.ConstrainedMinimizationProblem):
         self,
         model,
         family,
-        temperature,
         tolerance,
         penalty_mu,
         normalize=True,
@@ -114,7 +111,6 @@ class MonotonicityCMP(cooper.ConstrainedMinimizationProblem):
         super().__init__()
         self.model = model
         self.family = family
-        self.temperature = temperature
         self.tolerance = tolerance
         self.normalize = normalize
         self.constrain_raw = constrain_raw
@@ -135,57 +131,59 @@ class MonotonicityCMP(cooper.ConstrainedMinimizationProblem):
         field = self.model.inverse_target(values)
         return field * inputs[METRIC_DIAGONAL] if self.constrain_raw else field
 
-    def _per_instance(self, values, inputs):
-        """Per-instance soft-max violations plus the pooled per-pair violations, grouped by instance.
+    def pair_violations(self, values, inputs):
+        """Per-pair violations for every instance in the batch, concatenated.
 
-        Instances contributing a single point to the batch carry no pair and are skipped; with the fixed
-        stream every instance contributes ``points_per_instance`` of them, so this is an edge case at
-        batch boundaries, not the norm.
+        Pairs are formed **within** an instance -- monotonicity is a property of one operator, so a
+        cross-instance pair is meaningless -- by grouping on ``instance_index``. An instance contributing a
+        single point carries no pair and is skipped; with the fixed stream each contributes
+        ``points_per_instance``, so that is an edge case at batch boundaries rather than the norm.
         """
         field = self.raw_field(values, inputs)
         points = self.family.initial_point(inputs)  # the raw domain point each example carries
         instance_index = inputs[INSTANCE_INDEX]
-        aggregates, pooled = [], []
-        for index in instance_index.unique():
-            rows = instance_index == index
-            if rows.sum() < 2:
-                continue
-            violations = monotonicity_violations(field[rows], points[rows], self.normalize)
-            aggregates.append(soft_max(violations, self.temperature))
-            pooled.append(violations)
-        return torch.stack(aggregates), torch.cat(pooled)
+        groups = [instance_index == index for index in instance_index.unique()]
+        return torch.cat(
+            [
+                monotonicity_violations(field[rows], points[rows], self.normalize)
+                for rows in groups
+                if rows.sum() >= 2
+            ]
+        )
 
     def compute_cmp_state(self, batch):
-        """The regression loss plus one monotonicity violation per instance, over every train source.
+        """The regression loss plus one monotonicity violation per pair, over every train source.
 
         ``batch`` is the ``{source: (inputs, targets)}`` mapping the model trains on, so predictions and
         constraints are built per source and concatenated -- the constraint needs each source's own
         collated inputs (its metric, points and instance tags), which a merged prediction tensor loses.
         """
-        predictions, targets, aggregates, pooled, true_pooled = [], [], [], [], []
+        predictions, targets, violations, true_violations = [], [], [], []
         for inputs, source_targets in batch.values():
             prediction = self.model(inputs)
             predictions.append(prediction)
             targets.append(source_targets)
-            instance_violations, pairs = self._per_instance(prediction, inputs)
-            aggregates.append(instance_violations)
-            pooled.append(pairs)
+            violations.append(self.pair_violations(prediction, inputs))
             # The identical computation on the *targets*: in raw space this must be ~0, which is a
             # correctness gate on the metric wiring, and it floors what the model can be asked to reach.
             with torch.no_grad():
-                true_pooled.append(self._per_instance(source_targets, inputs)[1])
+                true_violations.append(self.pair_violations(source_targets, inputs))
 
         prediction, target = torch.cat(predictions), torch.cat(targets)
-        violation = torch.cat(aggregates) - self.tolerance
+        pair_violations = torch.cat(violations)
         return cooper.CMPState(
             loss=self.model.regression_loss(prediction, target),
             # QuadraticPenalty has no dual variable, so the constraint must declare it contributes
             # nothing to a dual update -- cooper's own sanity check rejects the pairing otherwise.
-            observed_constraints={self.monotone: cooper.ConstraintState(violation=violation, contributes_to_dual_update=False)},
+            observed_constraints={
+                self.monotone: cooper.ConstraintState(
+                    violation=pair_violations - self.tolerance, contributes_to_dual_update=False
+                )
+            },
             misc={
                 "prediction": prediction,
                 "targets": target,
-                "pair_violations": torch.cat(pooled),
-                "true_pair_violations": torch.cat(true_pooled),
+                "pair_violations": pair_violations,
+                "true_pair_violations": torch.cat(true_violations),
             },
         )

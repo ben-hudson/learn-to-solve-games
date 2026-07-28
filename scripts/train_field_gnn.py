@@ -228,13 +228,6 @@ def build_parser():
         "tolerance is independent of pair separation); 'none' uses the raw inner product",
     )
     p.add_argument(
-        "--constraint_temperature",
-        type=float,
-        default=1e-2,
-        help="softmax temperature aggregating an instance's pair violations: ->0 is the worst pair, "
-        "large is the mean (an average is not the requirement, so keep this small)",
-    )
-    p.add_argument(
         "--constraint_tolerance",
         type=float,
         default=1e-3,
@@ -424,7 +417,6 @@ def main(args):
                 **train_kwargs,
                 **loss_kwargs,
                 family=family,
-                temperature=args.constraint_temperature,
                 tolerance=args.constraint_tolerance,
                 penalty_mu=args.penalty_mu,
                 penalty_growth=args.penalty_growth,

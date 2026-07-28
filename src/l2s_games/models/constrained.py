@@ -26,9 +26,16 @@ class ConstrainedFieldModel(FieldModel):
     ``penalty_mu`` is the initial penalty coefficient and is raised multiplicatively whenever an
     instance's violation exceeds ``tolerance`` (``MultiplicativePenaltyCoefficientUpdater``), so the
     exchange rate against the regression loss is found by a feasibility-driven schedule rather than
-    hand-tuned. ``penalty_mu=0`` measures the constraint without acting on it -- the updater keeps a zero
-    coefficient at zero, so training is bit-identical to unconstrained while every monotonicity metric is
-    still logged.
+    hand-tuned. Note that updater's ``has_restart`` default resets the coefficient to ``penalty_mu`` on
+    any fully-feasible step, so it hovers near its initial value rather than escalating; pass
+    ``has_restart=False`` if a ratchet is wanted.
+
+    ``penalty_mu=0`` measures the constraint without acting on it: the penalty term is exactly zero and
+    the updater keeps a zero coefficient at zero, so the objective is *mathematically* identical to
+    unconstrained while every monotonicity metric is still logged. It is not bit-identical -- adding a
+    structurally-zero term changes gradient accumulation order, and the training trajectory is chaotic
+    enough to amplify that over epochs (measured: the two agree to 4 significant figures at epoch 4 and
+    reach the same loss by epoch 19, but diverge mid-run).
     """
 
     def __init__(
@@ -36,7 +43,6 @@ class ConstrainedFieldModel(FieldModel):
         net,
         lr,
         family,
-        temperature=1e-2,
         tolerance=1e-3,
         penalty_mu=1.0,
         penalty_growth=1.01,
@@ -48,7 +54,6 @@ class ConstrainedFieldModel(FieldModel):
         self.cmp = MonotonicityCMP(
             model=self,
             family=family,
-            temperature=temperature,
             tolerance=tolerance,
             penalty_mu=penalty_mu,
             normalize=normalize,
@@ -93,11 +98,11 @@ class ConstrainedFieldModel(FieldModel):
         log("train/loss", lagrangian)
         log("train/regression_loss", cmp_state.loss)
         log("train/mse", F.mse_loss(self.inverse_target(prediction), self.inverse_target(targets)))
-        # The constraint value cooper acts on (per-instance soft-max, tolerance already subtracted); >0
-        # means at least one instance is infeasible.
-        log("monotonicity/violation", next(iter(cmp_state.observed_constraints.values())).violation.max())
+        # The penalized quantity is the *sum* of squared hinges over pairs, so track both its worst entry
+        # and its extent: max alone hides how widespread the violation is, mean alone hides its depth.
         log("monotonicity/max_pair_violation", pair_violations.max())
-        log("monotonicity/frac_pairs_violating", (pair_violations > 0).float().mean())
+        log("monotonicity/mean_pair_violation", pair_violations.mean())
+        log("monotonicity/frac_pairs_violating", (pair_violations > self.cmp.tolerance).float().mean())
         log("monotonicity/true_violation", cmp_state.misc["true_pair_violations"].max())
         log("monotonicity/penalty", self.cmp.monotone.penalty_coefficient.value.max())
 
