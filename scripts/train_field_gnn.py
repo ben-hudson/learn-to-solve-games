@@ -180,13 +180,22 @@ def build_parser():
         default=1.0,
         help="rel_l2 denominator floor, in scale units (caps near-eq up-weighting)",
     )
+    # The warp and --precondition are two tools for the same problem on different axes: the supply
+    # diagonal M^-1 is a per-edge, state-dependent rescale (it flattens the per-edge dynamic range and
+    # the near-free-flow s' blow-up), while asinh is a global element-wise tail compressor. With
+    # preconditioning on -- the default -- the target is already mildly tailed, so the warp has little
+    # left to do and costs real geometry: it is a per-coordinate reweighting, so it does not preserve
+    # inner products (hence not monotonicity), and undoing it for any real-unit quantity puts a cosh
+    # gradient path on large-magnitude samples. Hence 'none' by default; pass 'asinh' to trade the
+    # field's direction for tail compression (e.g. under --no-precondition, where the raw flow residual
+    # is stiff and heavy-tailed).
     p.add_argument(
         "--target_warp",
         choices=["asinh", "none"],
-        default="asinh",
-        help="element-wise warp on the (always-applied) global field-target scale: 'asinh' compresses "
-        "the tail (default); 'none' is linear (preserves the field's direction). Partial amortization "
-        "only -- the 'full' path standardizes z* and ignores this",
+        default="none",
+        help="element-wise warp on the (always-applied) global field-target scale: 'none' (default) is "
+        "linear and preserves the field's direction, leaving the tail to --precondition; 'asinh' "
+        "compresses the tail. Partial amortization only -- the 'full' path standardizes z* and ignores this",
     )
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
     p.add_argument("--lr", type=float, default=0.0012, help="AdamW learning rate")

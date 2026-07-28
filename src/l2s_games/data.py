@@ -232,9 +232,8 @@ def _fit_normalizer(
     isotropic); the solution baseline passes ``Standardizer.fit`` instead, treating the equilibrium
     ``z*`` as a generic per-feature-standardized target (see ``build_streaming_solution_dataset``).
     ``warp`` composes an optional stateless nonlinearity on the scaled target: ``"asinh"`` adds
-    ``AsinhWarp`` (tames a heavy tail; the GNN field default), ``"none"`` adds nothing. The default is
-    ``"none"``; the ``asinh`` default lives on ``build_streaming_operator_dataset`` (the GNN path), so
-    the eager ``build_dataset`` (flat games) trains on the plain scaled target.
+    ``AsinhWarp`` (tames a heavy tail), ``"none"`` (the default everywhere) adds nothing, so the target
+    stays linear in the field and preserves its direction.
     """
     transform = family.transform
     feats = torch.stack([transform(_clone(raw))["feats"] for raw, _ in examples])
@@ -330,14 +329,16 @@ def build_streaming_operator_dataset(
     test_instances,
     points_per_instance,
     stream_factory=None,
-    warp="asinh",
+    warp="none",
 ):
     """A streaming train dataset plus fixed val/test ``FieldDataset``s and the fitted ``Normalizer``.
 
     Operator-field target (``--amortization partial``): the model regresses the operator value at a
     domain point. The sibling ``build_streaming_solution_dataset`` builds the ``z*``-target variant.
     ``warp`` selects the target nonlinearity composed on the (global-standardized) field target --
-    ``"asinh"`` (default, the GNN's tail-compressing behavior; see ``--target_warp``) or ``"none"``.
+    ``"none"`` (default: linear, so the field's direction survives) or ``"asinh"`` (tail compression).
+    The tail is left to the family's supply-diagonal preconditioning, which handles it on the per-edge
+    axis a global warp cannot; see ``--target_warp`` for that trade-off.
 
     The cal / val / test instances are pre-solved and passed in (split from a cached
     ``SolvedInstanceDataset``); this builds their ``(input, target)`` examples with the family's
