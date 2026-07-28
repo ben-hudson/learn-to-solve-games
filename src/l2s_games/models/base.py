@@ -28,7 +28,7 @@ class AmortizedModel(L.LightningModule):
     A batch is ``(inputs, targets)`` where ``inputs`` is whatever the family's ``model_input``
     produces (a dict with at least a ``feats`` entry) and ``self(inputs) = self.net(inputs)`` is the
     prediction, in the normalizer's target space. The loss is plain MSE there; ``FieldModel``
-    overrides ``_compute_loss`` with its field-specific variants.
+    overrides ``regression_loss`` with its field-specific variants.
     """
 
     def __init__(
@@ -67,7 +67,7 @@ class AmortizedModel(L.LightningModule):
         """
         return self.normalizer.inverse_target(y)
 
-    def _compute_loss(self, prediction, targets):
+    def regression_loss(self, prediction, targets):
         """Generic regression loss: MSE in the normalizer's (standardized) target space."""
         return F.mse_loss(prediction, targets)
 
@@ -81,7 +81,7 @@ class AmortizedModel(L.LightningModule):
         # on the model's output tensors, not on the family-specific collated inputs).
         prediction = torch.cat([self(inputs) for inputs, _ in batch.values()])
         targets = torch.cat([targets for _, targets in batch.values()])
-        loss = self._compute_loss(prediction, targets)
+        loss = self.regression_loss(prediction, targets)
         # Log the optimized loss plus the plain MSE in *real* units (de-standardized via inverse_target,
         # matching val/mse) under a fixed name (comparable across loss modes). Only these are logged on
         # train: under the streaming pipeline every batch is a fresh unseen instance, so a train relative
@@ -104,13 +104,13 @@ class AmortizedModel(L.LightningModule):
         # val/mse is the plain MSE in *real* units (de-standardized via inverse_target, so it sits on
         # the same axes as cos_err/mag_err) -- always plain MSE regardless of --loss, so it stays
         # comparable across loss modes and makes a stable monitor. val/loss is the optimized loss, which
-        # lives in the normalizer's target/scaled space (see _compute_loss), so the two do not coincide.
+        # lives in the normalizer's target/scaled space (see regression_loss), so the two do not coincide.
         real_prediction, real_targets = self.inverse_target(prediction), self.inverse_target(targets)
         self.log(
             "val/mse", F.mse_loss(real_prediction, real_targets), on_epoch=True, prog_bar=True, batch_size=batch_size
         )
         self.log(
-            "val/loss", self._compute_loss(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size
+            "val/loss", self.regression_loss(prediction, targets), on_epoch=True, prog_bar=True, batch_size=batch_size
         )
         self._extra_val_metrics(prediction, targets, batch_size)
 
@@ -231,7 +231,7 @@ class FieldModel(AmortizedModel):
         warp = self.normalizer.target_warp
         return warp.inverse_transform(z) if warp is not None else z
 
-    def _compute_loss(self, prediction, targets):
+    def regression_loss(self, prediction, targets):
         """The optimized training loss under the configured norm (see ``__init__``).
 
         ``prediction``/``targets`` are in the normalizer's target space. ``_scaled_real`` undoes the

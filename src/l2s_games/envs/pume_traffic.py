@@ -96,7 +96,12 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         return graph
 
     def _excess_supply(self, params, index, cost):
-        """Excess supply ``z(c) - x(c)`` (optionally supply-diagonal preconditioned) at one cost vector.
+        """``(residual, metric)`` at one cost vector: excess supply ``z(c) - x(c)``, and the diagonal
+        that maps it back to the raw field.
+
+        ``metric * residual`` is always the raw excess supply, so ``metric`` is ``M`` when preconditioning
+        and all ones when not. It comes out of the *same* demand solve as the residual -- the expensive
+        part -- so surfacing it is free; see ``operator_and_metric`` for why anything needs it.
 
         ``index`` selects the per-instance BPR attrs + demand from a batched ``params`` (rank-2), or is
         ``None`` for a single-instance ``params`` (rank-1). ``build_model`` reuses the shared PUMCM
@@ -117,10 +122,12 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         # E = z(c) - x(c); the per-instance OD is passed here (the shared loader carries a placeholder).
         demand = model.compute_demand(c, initial_states_list=od)
         supply = model.compute_supply(c)
+        excess = supply - demand
         if not self.precondition:
-            return supply - demand
-        # Apply PUME's supply-diagonal metric M^{-1} to the excess supply E.
-        return self._supply_diagonal_metric(model.supply_operator, c, demand).apply_inverse(supply - demand)
+            return excess, torch.ones_like(excess)
+        # Apply PUME's supply-diagonal metric M^{-1} to the excess supply E, and hand back M itself.
+        metric = self._supply_diagonal_metric(model.supply_operator, c, demand)
+        return metric.apply_inverse(excess), metric.diag
 
     @staticmethod
     def _supply_diagonal_metric(supply_operator, cost, demand):
@@ -145,12 +152,24 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
     def operator(self, params, costs):
         """PUME excess-supply residual ``z(c) - x(c)`` (zero at equilibrium), one row per cost vector.
 
+        Delegates to ``operator_and_metric`` and drops the metric, so the row loop and the evaluation
+        count live in exactly one place -- calling this costs the same as it always did.
+        """
+        return self.operator_and_metric(params, costs)[0]
+
+    def operator_and_metric(self, params, costs):
+        """``(residuals, metrics)``: the operator plus the diagonal mapping it back to the raw field.
+
         ``costs`` is ``[B, E]`` (one cost vector per instance) or a bare ``[E]`` vector (a batch of
         one). When ``params``' per-edge attrs are rank-2 (``[B, E]``), each cost row is a distinct
         instance (the expert-rollout path); when rank-1 they share one instance (the many-points-per-
         instance dataset path), so one ``PUMEModel`` is reused across the rows. PUME evaluates one cost
         vector at a time, so the batch is a Python loop -- the heavy PUMCM structure is built once in
         ``__init__``; only the supply/demand wrapper is per row.
+
+        ``metrics`` matches ``residuals``' shape and satisfies ``metrics * residuals == raw excess
+        supply``; it falls out of the demand solve the residual already needs, so it is free (see
+        ``VariationalInequalityFamily.operator_and_metric`` for what consumes it).
         """
         costs = torch.as_tensor(costs, dtype=torch.float32)
         device = costs.device  # PUME solves on CPU; hand the result back on the caller's device
@@ -159,10 +178,9 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         batch_size = costs.shape[0]
         self.operator_counter.add(batch_size)  # one point-evaluation per cost vector solved
         per_instance = params["free_flow_time"].dim() == 2
-        residuals = torch.stack(
-            [self._excess_supply(params, row if per_instance else None, costs[row]) for row in range(batch_size)]
-        ).float().to(device)
-        return residuals.squeeze(0) if single else residuals
+        rows = [self._excess_supply(params, row if per_instance else None, costs[row]) for row in range(batch_size)]
+        residuals, metrics = (torch.stack(values).float().to(device) for values in zip(*rows))
+        return (residuals.squeeze(0), metrics.squeeze(0)) if single else (residuals, metrics)
 
     def project(self, params, costs):
         # Subscript access works for both a single graph and the dense batch dict (validation sweep).

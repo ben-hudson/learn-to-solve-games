@@ -61,7 +61,13 @@ from l2s_games.data import (
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
 from l2s_games.instance_sampling import FixedInstanceOperatorStream
-from l2s_games.models import FieldModel, GraphormerBackbone, MLPBackbone, SolutionModel
+from l2s_games.models import (
+    ConstrainedFieldModel,
+    FieldModel,
+    GraphormerBackbone,
+    MLPBackbone,
+    SolutionModel,
+)
 from l2s_games.operator_count import SharedCounter
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 
@@ -78,9 +84,10 @@ def _single_thread_worker(_worker_id):
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     # dataset: a cached SolvedInstanceDataset (see scripts/generate_traffic_dataset.py) is loaded and
-    # split into cal/val/test instances. Training still streams fresh instances on the fly (one
-    # point each) unless --sources fixed pins them; the splits fit the normalizer + calibrate the
-    # sampling range (cal) and measure generalization (val/test). Epoch length is --steps_per_epoch.
+    # split into cal/val/test instances. Training still streams fresh instances on the fly
+    # (--points_per_instance points each, one joint solve) unless --sources fixed pins them; the splits
+    # fit the normalizer + calibrate the sampling range (cal) and measure generalization (val/test).
+    # Epoch length is --steps_per_epoch.
     p.add_argument("--dataset_root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load")
     p.add_argument(
         "--n_cal_instances", type=int, default=128, help="calibration split size (normalizer + range calibration)"
@@ -197,6 +204,44 @@ def build_parser():
         "linear and preserves the field's direction, leaving the tail to --precondition; 'asinh' "
         "compresses the tail. Partial amortization only -- the 'full' path standardizes z* and ignores this",
     )
+    # monotonicity constraint (see l2s_games/monotonicity.py): fit the field subject to the model's raw
+    # field being monotone, <F(x)-F(y), x-y> >= 0, on the training domain. Pairs are the same-instance
+    # points a 'fixed'-source batch already holds, so the constraint adds no solves and no forwards.
+    p.add_argument(
+        "--monotonicity",
+        action="store_true",
+        help="constrain the learned field to be monotone (quadratic penalty; requires --sources fixed)",
+    )
+    p.add_argument(
+        "--constraint_space",
+        choices=["raw", "preconditioned"],
+        default="raw",
+        help="which field the constraint is about: 'raw' maps predictions back through the example's "
+        "metric diagonal (the *unpreconditioned* operator, which is monotone); 'preconditioned' "
+        "constrains what the model literally predicts, which the operator itself violates",
+    )
+    p.add_argument(
+        "--constraint_norm",
+        choices=["ratio", "none"],
+        default="ratio",
+        help="per-pair normalization: 'ratio' divides by ||x-y||^2 (the secant Rayleigh quotient, so the "
+        "tolerance is independent of pair separation); 'none' uses the raw inner product",
+    )
+    p.add_argument(
+        "--constraint_temperature",
+        type=float,
+        default=1e-2,
+        help="softmax temperature aggregating an instance's pair violations: ->0 is the worst pair, "
+        "large is the mean (an average is not the requirement, so keep this small)",
+    )
+    p.add_argument(
+        "--constraint_tolerance",
+        type=float,
+        default=1e-3,
+        help="violation depth treated as satisfied; also the threshold above which the penalty grows",
+    )
+    p.add_argument("--penalty_mu", type=float, default=1.0, help="initial penalty coefficient (0 measures only)")
+    p.add_argument("--penalty_growth", type=float, default=1.01, help="multiplicative penalty growth per step")
     # training (AdamW + linear-warmup->cosine, ported from markov-traffic-eq)
     p.add_argument("--lr", type=float, default=0.0012, help="AdamW learning rate")
     p.add_argument("--start_factor", type=float, default=0.011, help="linear warmup start factor")
@@ -368,7 +413,26 @@ def main(args):
         model = SolutionModel(net, **train_kwargs)
     else:
         loss_kwargs = dict(loss=args.loss, huber_delta_scale=args.huber_delta_scale, rel_eps=args.rel_eps)
-        model = FieldModel(net, **train_kwargs, **loss_kwargs)
+        if args.monotonicity:
+            # The constraint pairs same-instance points *within* a batch, so it needs a source whose
+            # examples carry a stable instance tag and several points per instance: only 'fixed' does
+            # (the uniform stream draws a fresh instance each visit, so its points cannot be grouped).
+            assert args.sources == ["fixed"], f"--monotonicity requires --sources fixed, got {args.sources}"
+            assert args.points_per_instance >= 2, "--monotonicity needs >= 2 points per instance to form a pair"
+            model = ConstrainedFieldModel(
+                net,
+                **train_kwargs,
+                **loss_kwargs,
+                family=family,
+                temperature=args.constraint_temperature,
+                tolerance=args.constraint_tolerance,
+                penalty_mu=args.penalty_mu,
+                penalty_growth=args.penalty_growth,
+                normalize=args.constraint_norm == "ratio",
+                constrain_raw=args.constraint_space == "raw",
+            )
+        else:
+            model = FieldModel(net, **train_kwargs, **loss_kwargs)
     collate = collate_examples(family)
     # Per amortization mode, build the training source loaders and the matching validation callback.
     # training_step concatenates every source into one MSE (Lightning's CombinedLoader), and the

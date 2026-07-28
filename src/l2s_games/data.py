@@ -22,6 +22,11 @@ import torch
 from torch import nn
 from torch.utils.data import Dataset, IterableDataset, default_collate, random_split
 
+# Item key for the per-coordinate diagonal mapping the operator target back to the raw field; see
+# examples_at_points. Lives here (not in monotonicity.py, its consumer) so the data layer owns its own
+# schema and nothing in the pipeline imports the constraint code.
+METRIC_DIAGONAL = "metric_diagonal"
+
 
 class Standardizer(nn.Module):
     """Per-feature ``(x - mean) / std`` map, fit from data, with its inverse.
@@ -202,17 +207,29 @@ def examples_at_points(family, params, points):
     points**, then sliced per point. The single place that pairs a domain point with its operator
     target, shared by the uniform sampler (``_solve_instance``) and the rollout collectors (on-policy
     + expert, see ``rollout_sampling``), so every source builds examples identically.
+
+    Each item is tagged with ``metric_diagonal``: the per-coordinate diagonal that maps the operator's
+    value back to the family's **raw** (unpreconditioned) field, i.e. ``metric_diagonal * target`` (see
+    ``VariationalInequalityFamily.operator_and_metric``; all ones for families that are already raw).
+    It rides along for the monotonicity constraint, which must be stated about the raw field -- the
+    preconditioned one is not monotone. It comes out of the same solve as the target, so it is free, and
+    the tag is set by key access so it works for a PyG ``Data`` and a plain dict alike.
     """
     with torch.no_grad():
-        targets = family.operator(params, points)
-    return [(family.model_input(params, points[j]), targets[j]) for j in range(len(points))]
+        targets, metrics = family.operator_and_metric(params, points)
+    examples = []
+    for j in range(len(points)):
+        item = family.model_input(params, points[j])
+        item[METRIC_DIAGONAL] = metrics[j]
+        examples.append((item, targets[j]))
+    return examples
 
 
 def _solve_instance(family, params, points_per_instance):
     """The ``(raw input item, target)`` examples for one instance: sample points, solve the operator.
 
-    Shared by the eager ``_examples_for_instances`` and the streaming generator (which calls it with
-    ``points_per_instance=1``).
+    Shared by the eager ``_examples_for_instances`` and the streaming ``UniformSampledOperatorStream``,
+    both of which pass the full ``points_per_instance`` so one solve amortizes over that many points.
     """
     return examples_at_points(family, params, family.sample_domain(params, points_per_instance))
 

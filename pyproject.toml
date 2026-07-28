@@ -9,6 +9,7 @@ description = "Learn to solve games."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "cooper-optim",
     "lightning",
     "matplotlib",
     "numpy",
