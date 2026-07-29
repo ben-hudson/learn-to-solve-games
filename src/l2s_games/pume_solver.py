@@ -32,6 +32,16 @@ from pume import PUMEModel, StackedPUMCMDemandLoader
 from pume.operators import InverseBPRSupply
 
 
+# Upper cost bound for the feasible set. The demand side is a recursive logit, so it evaluates
+# ``exp(-cost)``, which underflows float64 around 709; past that the PUMCM value/flow solve degenerates
+# (negative occupancy of order 1e16, which PUMCM clips to zero) and demand snaps to zero, so the operator is
+# numerically undefined there rather than merely large. Equilibria are ~50 and the sampled domain reaches
+# ~80, so this bounds nothing that matters in normal operation -- it exists to stop an unbounded iterate from
+# walking off the cliff. Shared by ``solve``'s ``cost_bounds`` and the family's ``project`` so the two cannot
+# disagree about where the feasible set ends.
+COST_UPPER = 700.0
+
+
 class PUMESolver:
     """PUME-based reference equilibrium solver for a fixed traffic-graph structure."""
 
@@ -139,9 +149,7 @@ class PUMESolver:
         supply = self._make_supply(free_flow_time, capacity, b, power)
 
         cost_lower = free_flow_time.double().detach().numpy()
-        # Cap cost below the exp(-cost) float64 underflow cliff (~709): an unbounded upper lets the
-        # iterate run away, after which demand snaps to zero and the solve stalls without recovering.
-        cost_upper = np.full_like(cost_lower, 700.0, dtype=np.float64)
+        cost_upper = np.full_like(cost_lower, COST_UPPER, dtype=np.float64)  # see COST_UPPER
 
         return PUMEModel(
             pumcm_models=self._pumcm_models,

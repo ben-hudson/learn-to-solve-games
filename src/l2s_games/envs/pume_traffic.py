@@ -38,7 +38,7 @@ from l2s_games.envs.traffic import (
     load_sioux_falls_base_graph,  # re-exported for callers/tests that build the base graph
 )
 from l2s_games.operator_count import LocalCounter
-from l2s_games.pume_solver import PUMESolver
+from l2s_games.pume_solver import COST_UPPER, PUMESolver
 from l2s_games.transforms import traffic_field_transform
 from pume.preconditioning import MetricPreconditioner
 
@@ -189,8 +189,21 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         return (residuals.squeeze(0), metrics.squeeze(0)) if single else (residuals, metrics)
 
     def project(self, params, costs):
+        """Onto the feasible cost box ``[free_flow_time, COST_UPPER]``.
+
+        The upper bound is not cosmetic: past it the recursive-logit demand solve degenerates (see
+        ``COST_UPPER``), so the operator is undefined rather than merely large, and an unbounded rollout that
+        walks off the cliff reports residuals computed from clipped garbage. It is the same bound
+        ``PUMESolver.solve`` gives ``PUMEModel``, so the rollout and the reference solver agree on the
+        feasible set. Nothing in normal operation comes near it -- equilibria are ~50, sampled costs ~80.
+        """
         # Subscript access works for both a single graph and the dense batch dict (validation sweep).
-        return torch.clamp(torch.as_tensor(costs, dtype=torch.float32), min=params["free_flow_time"])
+        free_flow_time = params["free_flow_time"]
+        return torch.clamp(
+            torch.as_tensor(costs, dtype=torch.float32),
+            min=free_flow_time,
+            max=torch.full_like(free_flow_time, COST_UPPER),
+        )
 
     def params_from_batch(self, batch):
         """The operator's params from the dense model batch: point ``edge_index`` at the physical

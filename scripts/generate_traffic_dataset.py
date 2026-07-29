@@ -30,7 +30,7 @@ import lightning as L
 
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs import make_game
-from l2s_games.envs.asym_pume_traffic import build_interaction_matrix
+from l2s_games.envs.asym_pume_traffic import build_interaction_matrix, build_rotation_matrix
 from l2s_games.envs.traffic import load_sioux_falls_base_graph
 
 
@@ -55,9 +55,17 @@ def build_parser():
         "--epsilon",
         type=float,
         default=0.05,
-        help="asym_pume_traffic only: coupling strength of A = (1-eps) I + eps W. Only used here -- the "
-        "resulting matrix is stored with the dataset and read back at training time. <=0.2 measured "
-        "monotone on Sioux Falls, 0.5 is not; see envs/asym_pume_traffic.py",
+        help="asym_pume_traffic only: *multiplicative* coupling strength of A = (1-eps) I + eps W (neighbour "
+        "spillover). Capped by monotonicity: <=0.2 measured monotone on Sioux Falls, 0.5 is not",
+    )
+    p.add_argument(
+        "--kappa",
+        type=float,
+        default=0.0,
+        help="asym_pume_traffic only: *additive* coupling strength of B = kappa S, S antisymmetric of unit "
+        "spectral norm. Monotone at any kappa (<B dc, dc> = 0 exactly) and invisible to the preconditioner, "
+        "so this is the knob for a rotation-dominated field; compare against max f' ~ 46. See "
+        "envs/asym_pume_traffic.py. Both matrices are built here only and stored with the dataset",
     )
     p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
     p.add_argument("--noise-type", choices=["normal", "uniform"], default="normal", help="attribute noise type")
@@ -108,7 +116,10 @@ def main(args):
             "initial_stepsize": args.initial_stepsize,
         },
         **(
-            {"interaction_matrix": build_interaction_matrix(base_graph, args.epsilon)}
+            {
+                "interaction_matrix": build_interaction_matrix(base_graph, args.epsilon),
+                "rotation_matrix": build_rotation_matrix(base_graph, args.kappa),
+            }
             if args.game == "asym_pume_traffic"
             else {}
         ),

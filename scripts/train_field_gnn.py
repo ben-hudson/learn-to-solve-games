@@ -76,6 +76,7 @@ from l2s_games.data import (
 )
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs import GAMES, make_game
+from l2s_games.envs.asym_pume_traffic import coupling_matrices
 from l2s_games.instance_sampling import FixedInstanceOperatorStream
 from l2s_games.models import (
     ConstrainedFieldModel,
@@ -359,22 +360,6 @@ def build_parser():
     return p
 
 
-def operator_kwargs(game, dataset):
-    """The asymmetric family's coupling matrix, read off the dataset that was solved with it.
-
-    Never rebuilt here: ``A``'s values come from an RNG seeded by a PUME default we neither pass nor record,
-    so a reconstruction only *probably* matches the one whose equilibria are cached -- and a mismatch is
-    silent (residual ~5.0 instead of ~1e-3 at a cached equilibrium). A dataset generated before ``A`` was
-    stored has to be regenerated rather than paired with a fresh matrix.
-    """
-    assert "interaction_matrix" in dataset.base_graph, (
-        f"{game} needs the interaction matrix its equilibria were solved with, but this dataset does not "
-        "carry one. Regenerate it:\n"
-        "  python scripts/generate_traffic_dataset.py <n> <root> --game asym_pume_traffic --epsilon <eps>"
-    )
-    return {"interaction_matrix": dataset.base_graph.interaction_matrix}
-
-
 def main(args):
     # workers=True makes Lightning seed each streaming dataloader worker distinctly & reproducibly.
     if args.seed is None:
@@ -398,7 +383,7 @@ def main(args):
         "reference_spread": reference_spread,
         "n_stds": args.sample_stds,
         "precondition": args.precondition,
-        **(operator_kwargs(args.game, dataset) if args.game == "asym_pume_traffic" else {}),
+        **(coupling_matrices(dataset.base_graph) if args.game == "asym_pume_traffic" else {}),
     }
     # A picklable factory (base graph + calibrated tensors) the streaming dataset ships to each worker,
     # which builds its own family + PUME solver lazily -- nothing solver-related is pickled. The

@@ -46,12 +46,13 @@ _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost
 #   - node coordinates that ``from_networkx`` carries off the TNTP graph (positions + PyG's x/y aliases).
 #     Nothing reads them, but they are float64 and stacking them breaks the device transfer (MPS rejects
 #     float64).
-#   - ``interaction_matrix``, the asymmetric family's ``[E, E]`` coupling matrix. It rides on the graph so
-#     dataset generation persists it (see ``asym_pume_traffic``), but the *operator* reads it off the
-#     solver, so the model never needs it -- and stacking it would add an ``[B, E, E]`` tensor per batch.
+#   - ``interaction_matrix`` / ``rotation_matrix``, the asymmetric family's ``[E, E]`` couplings. They ride on
+#     the graph so dataset generation persists them (see ``asym_pume_traffic``), but the *operator* reads them
+#     off the solver, so the model never needs them -- and stacking one would add an ``[B, E, E]`` tensor per
+#     batch.
 # The general rule: anything carried on the graph for persistence or provenance rather than for the model
 # belongs here.
-_DROPPED_ATTRS = ("x", "y", "X", "Y", "interaction_matrix")
+_DROPPED_ATTRS = ("x", "y", "X", "Y", "interaction_matrix", "rotation_matrix")
 
 
 def load_sioux_falls_base_graph(root, scaling=1000.0):

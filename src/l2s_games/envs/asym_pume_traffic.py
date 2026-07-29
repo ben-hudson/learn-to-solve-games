@@ -4,20 +4,29 @@ Identical to ``PUMEMarkovTrafficEquilibrium`` (see ``pume_traffic.py``) in every
 instances, same cost-space domain, same excess-supply residual ``E(c) = z(c) - x(c)``, same conditioning
 seam, same preconditioning -- except that the supply is **non-separable**:
 
-    z(c) = A f(c),    A = (1 - eps) I + eps W
+    z(c) = A f(c) + B c
 
-with ``f`` the element-wise inverse BPR and ``W`` row-stochastic on the link-adjacency graph, so link
-``a``'s supply is a convex combination of its own inverse-BPR flow (weight ``1 - eps``) and its
-neighbours' (total weight ``eps``). Everything is inherited through the ``_make_solver`` hook; only the
-supply operator differs (see ``asymmetric_pume_solver.AsymmetricPUMESolver``).
+with ``f`` the element-wise inverse BPR, ``A = (1 - eps) I + eps W`` a *multiplicative* coupling (``W``
+row-stochastic on the link-adjacency graph, so link ``a``'s supply is a convex combination of its own flow
+and its neighbours'), and ``B = kappa S`` an *additive* one (``S`` antisymmetric). ``A = I`` and ``B = 0``
+recover the separable operator exactly. Everything is inherited through the ``_make_solver`` hook; only the
+supply operator differs (see ``asymmetric_pume_solver``, which explains why the two couplings behave very
+differently and when to reach for each).
 
-**Why this family exists.** ``grad z(c) = A diag(f'(c))`` is non-symmetric whenever ``A`` is, so
-``E(c)`` is not the gradient of any potential and the VI is genuinely a *game* rather than a convex
-minimization in disguise. The repo's other non-potential fields (``toy``'s rotational well, ``rps``) are
-flat 2-D families on the MLP path; this is the first one at traffic scale on the graph path, so the
-game-dynamics comparison has something rotational to bite on there.
+**Why this family exists.** ``grad z(c) = A diag(f'(c)) + B`` is non-symmetric whenever either coupling is
+present, so ``E(c)`` is not the gradient of any potential and the VI is genuinely a *game* rather than a
+convex minimization in disguise. The repo's other non-potential fields (``toy``'s rotational well, ``rps``)
+are flat 2-D families on the MLP path; this is the first one at traffic scale on the graph path.
 
-**Monotonicity is conditional, not guaranteed -- check it for the ``eps`` you use.**
+**Which coupling to use.** ``eps`` is capped by monotonicity (see below) at a few percent relative Jacobian
+asymmetry, and at those levels the rollout dynamics are indistinguishable from the potential case --
+measured: ``projection`` beats ``optimistic`` and ``extragradient`` at every step size, with and without
+preconditioning. ``kappa`` has no such cap: additive antisymmetric coupling is monotone unconditionally
+(``<B dc, dc> = 0`` exactly), and because ``B`` has a zero diagonal it also survives the ``supply_diagonal``
+preconditioner untouched. So ``kappa`` is the knob for a genuinely rotation-dominated field and ``eps`` is
+the one that stays physically interpretable as neighbour spillover.
+
+**``eps`` monotonicity is conditional, not guaranteed -- check it for the value you use.**
 ``build_asymmetric_interaction_matrix`` enforces ``sym(A) = (A + A^T)/2 > 0``, and PUME's
 ``AsymmetricBPRSupply`` docstring reads that as implying a monotone VI. It does not. Monotonicity needs
 ``sym(grad z) = sym(A diag(f'(c))) >= 0``, and a PD symmetric part of ``A`` does not survive scaling by an
@@ -34,16 +43,19 @@ Practically, monotonicity holds while the spread of ``f'`` over *coupled* links 
 - The training-time monotonicity prior (``--monotonicity --constraint_space raw``) is only well specified
   where the true operator really is monotone. At an ``eps`` that violates it, the penalty fights the field
   it is regressing.
-- ``optimistic``'s convergence guarantee is for monotone Lipschitz operators, so it is on firm ground only
-  in the same regime. It remains the right driver over ``projection`` either way (see ``algorithms.py``),
-  since projection has no guarantee even in the monotone case.
+- ``optimistic``'s and ``extragradient``'s convergence guarantees are for monotone Lipschitz operators, so
+  they are on firm ground only in the same regime. They are nevertheless *measured worse* than
+  ``projection`` here (see ``algorithms.py``); the guarantee is not the binding consideration.
+
+The additive coupling ``B`` has no such condition -- ``<B dc, dc> = 0`` for antisymmetric ``B`` makes its
+contribution to monotonicity exactly zero, at any ``kappa``.
 
 Separately, the *preconditioned* field ``M^{-1} E`` is not monotone at all -- ``M`` is state-dependent, and
 ``lambda_min sym(grad)`` is negative for the symmetric family too. That is pre-existing and is why
 ``--constraint_space raw`` is the default.
 
-``eps = 0`` gives ``A = I`` and reproduces ``pume_traffic`` exactly, which is the cheapest regression
-test of the whole path.
+``eps = 0, kappa = 0`` reproduces ``pume_traffic`` exactly, which is the cheapest regression test of the
+whole path.
 
 **Choosing eps** -- a *generation-time* decision, since it only enters through ``build_interaction_matrix``
 (there is no ``epsilon`` on this class, and none on the training scripts). The builder keeps ``A`` close to
@@ -62,52 +74,90 @@ network or the cost box changes. The builder's own upper limit (``eps < 1/(1 - l
 topology-dependent) is a *weaker* constraint than monotonicity of the operator -- it raises only well
 after the field has stopped being monotone, so it is not the guard to rely on.
 
-**``A`` is supplied, not rebuilt.** It is a *constant of the pipeline*: built once by
-``build_interaction_matrix(base_graph, epsilon)`` when a dataset is generated, persisted on that dataset's
-``base_graph``, and passed back in by everything downstream. Nothing else may construct it -- in particular
-the training script must not, because a rebuild is only *probably* the same matrix. Its sparsity pattern is
-the deterministic link-adjacency graph, but its values come from an RNG seeded by
-``build_asymmetric_interaction_matrix``'s default ``seed=42``, which we neither pass nor record; a dataset
-paired with a rebuilt ``A`` therefore depends on that default, and NumPy's stream for it, never changing.
+**Choosing kappa.** It scales a unit-spectral-norm ``S``, so ``kappa`` is directly the rotational magnitude
+and is comparable against ``max f' ~ 46`` on Sioux Falls: rotation only *dominates* the field once
+``kappa`` is of that order or larger. Large ``kappa`` can drive individual supply components negative
+(``f(c) >= 0``, so this is the rotation term overpowering BPR flow); PUME tolerates it and the root still has
+``z = x >= 0``, but the operator stops being interpretable as a traffic supply -- ``scripts/
+probe_rotational_supply.py`` reports where that starts.
+
+**Both matrices are supplied, not rebuilt.** They are *constants of the pipeline*: built once by
+``build_interaction_matrix(base_graph, epsilon)`` / ``build_rotation_matrix(base_graph, kappa)`` when a
+dataset is generated, persisted on that dataset's ``base_graph``, and passed back in by everything
+downstream. Nothing else may construct them -- in particular the training script must not.
+
+For ``A`` that is a correctness requirement: its sparsity pattern is the deterministic link-adjacency graph,
+but its values come from an RNG seeded by ``build_asymmetric_interaction_matrix``'s default ``seed=42``,
+which we neither pass nor record, so a rebuild is only *probably* the same matrix. ``B`` is fully
+deterministic from the topology and could safely be rebuilt -- it follows the same rule anyway, because one
+policy ("the dataset carries the operator, in full, or it is not usable") is easier to hold in your head than
+two, and because it makes swapping in a random ``S`` later a one-line change rather than a dataset migration.
 Getting it wrong is silent and severe: the residual at a cached equilibrium under a mismatched ``A`` is
 ~5.0 rather than ~1e-3.
 
-Two deliberate limits:
-
-- ``A`` is a **fixed property of the operator**, one matrix per dataset -- like ``edge_index``, not like the
-  noised BPR attrs. Sampling it per instance is not possible under the current conditioning seam: ``A`` is
-  pairwise ``[m, m]`` and the per-edge feature vector cannot express it, so the model would be asked to
-  predict a field it cannot see. The natural harder variant is to keep ``W`` fixed, sample ``eps`` per
-  instance, and expose it as an extra per-edge feature.
-- ``AsymmetricBPRSupply`` does not override ``jacobian_diagonal``, so the supply-diagonal preconditioner
-  reaches it through ``SupplyOperator``'s default ``jacobian(c).diag()``, materializing a dense
-  ``[m, m]`` per operator evaluation. Numerically correct (``diag(A diag(f')) = A_ii f'_i``) and
-  negligible against a 24-destination PUMCM solve at Sioux Falls' 76 links, but it is ``O(m^2)`` where
-  ``A.diagonal() * f'(c)`` would be ``O(m)`` -- revisit if the network grows.
+One deliberate limit: both couplings are a **fixed property of the operator**, one matrix per dataset -- like
+``edge_index``, not like the noised BPR attrs. Sampling per instance is not possible under the current
+conditioning seam, since a coupling is pairwise ``[m, m]`` and the per-edge feature vector cannot express it,
+so the model would be asked to predict a field it cannot see. The natural harder variant is to keep the
+pattern fixed, sample ``eps``/``kappa`` per instance, and expose the scalar as an extra per-edge feature.
 """
 
-from l2s_games.asymmetric_pume_solver import AsymmetricPUMESolver, build_interaction_matrix
+from l2s_games.asymmetric_pume_solver import (
+    AsymmetricPUMESolver,
+    build_interaction_matrix,
+    build_rotation_matrix,
+)
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
 
-__all__ = ["AsymmetricPUMEMarkovTrafficEquilibrium", "build_interaction_matrix"]
+__all__ = [
+    "AsymmetricPUMEMarkovTrafficEquilibrium",
+    "build_interaction_matrix",
+    "build_rotation_matrix",
+    "coupling_matrices",
+]
+
+COUPLING_MATRICES = ("interaction_matrix", "rotation_matrix")
+
+
+def coupling_matrices(base_graph):
+    """The couplings persisted on a base graph, as constructor kwargs for this family.
+
+    The read side of the "dataset carries its operator" rule: generation stores both matrices on
+    ``base_graph``, and every consumer passes them back rather than rebuilding (see the module docstring for
+    why, and why the rule covers the deterministic matrix too). A graph predating either has to be
+    regenerated, so the absence is an error rather than a default.
+    """
+    missing = [name for name in COUPLING_MATRICES if name not in base_graph]
+    assert not missing, (
+        f"this graph is missing the coupling matrices its equilibria were solved with: {', '.join(missing)}. "
+        "Regenerate the dataset:\n"
+        "  python scripts/generate_traffic_dataset.py <n> <root> --game asym_pume_traffic "
+        "--epsilon <eps> --kappa <kappa>"
+    )
+    return {name: base_graph[name] for name in COUPLING_MATRICES}
 
 
 class AsymmetricPUMEMarkovTrafficEquilibrium(PUMEMarkovTrafficEquilibrium):
-    """``PUMEMarkovTrafficEquilibrium`` with a non-potential supply ``z(c) = A f(c)``.
+    """``PUMEMarkovTrafficEquilibrium`` with a non-potential supply ``z(c) = A f(c) + B c``.
 
-    ``interaction_matrix`` is required: build it once with ``build_interaction_matrix`` when generating a
-    dataset, and pass the *stored* one thereafter (see the module docstring).
+    Both matrices are required: build them once with ``build_interaction_matrix`` /
+    ``build_rotation_matrix`` when generating a dataset, and pass the *stored* ones thereafter (see the
+    module docstring).
     """
 
-    def __init__(self, base_graph, interaction_matrix, **kwargs):
+    def __init__(self, base_graph, interaction_matrix, rotation_matrix, **kwargs):
         # Set before super().__init__, which is what calls _make_solver.
         self.interaction_matrix = interaction_matrix
+        self.rotation_matrix = rotation_matrix
         super().__init__(base_graph, **kwargs)
-        # Ride along on the graph so dataset generation persists A inside base_graph.pt, making the dataset
-        # carry the operator its equilibria were solved for. Stripped again in `model_input` (_DROPPED_ATTRS)
-        # so it never reaches a collated batch -- the model has no use for it, the solver holds the copy the
-        # operator actually reads.
+        # Ride along on the graph so dataset generation persists both couplings inside base_graph.pt, making
+        # the dataset carry the operator its equilibria were solved for. Stripped again in `model_input`
+        # (_DROPPED_ATTRS) so they never reach a collated batch -- the model has no use for them, the solver
+        # holds the copies the operator actually reads.
         self.base_graph.interaction_matrix = self.solver.interaction_matrix
+        self.base_graph.rotation_matrix = self.solver.rotation_matrix
 
     def _make_solver(self, solver_kwargs):
-        return AsymmetricPUMESolver(self.base_graph, self.interaction_matrix, **solver_kwargs)
+        return AsymmetricPUMESolver(
+            self.base_graph, self.interaction_matrix, self.rotation_matrix, **solver_kwargs
+        )

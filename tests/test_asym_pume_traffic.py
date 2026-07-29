@@ -21,12 +21,17 @@ import torch
 
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs import bind, make_game
-from l2s_games.envs.asym_pume_traffic import build_interaction_matrix
+from l2s_games.envs.asym_pume_traffic import (
+    build_interaction_matrix,
+    build_rotation_matrix,
+    coupling_matrices,
+)
 from l2s_games.envs.pume_traffic import load_sioux_falls_base_graph
 
 _DATA_ROOT = pathlib.Path(__file__).resolve().parents[1] / "raw_data" / "sioux_falls"
-_EPSILON = 0.05  # gentle coupling, monotone at every cost probed here
+_EPSILON = 0.05  # gentle multiplicative coupling, monotone at every cost probed here
 _VIOLATING_EPSILON = 0.5  # measurably non-monotone on this network (see docs/pume_issues.md)
+_KAPPA = 100.0  # additive coupling well past max f' ~ 46, i.e. rotation-dominated; monotone regardless
 
 
 @pytest.fixture(scope="module")
@@ -36,14 +41,20 @@ def base_graph():
     return load_sioux_falls_base_graph(str(_DATA_ROOT))
 
 
-def asym(base_graph, epsilon=_EPSILON, **kwargs):
-    """A family at ``epsilon``, built the way dataset generation builds one: matrix first, then the family.
+def asym(base_graph, epsilon=_EPSILON, kappa=0.0, **kwargs):
+    """A family at ``(epsilon, kappa)``, built the way dataset generation builds one: matrices, then family.
 
-    The matrix is always constructed explicitly here because the family requires it -- so every test below
-    exercises the same path ``scripts/generate_traffic_dataset.py`` uses.
+    Both matrices are always constructed explicitly because the family requires them -- so every test below
+    exercises the same path ``scripts/generate_traffic_dataset.py`` uses. ``kappa=0`` (no additive coupling)
+    is the default, so the multiplicative-coupling tests read unchanged.
     """
-    matrix = build_interaction_matrix(base_graph, epsilon)
-    return make_game("asym_pume_traffic", base_graph=base_graph, interaction_matrix=matrix, **kwargs)
+    return make_game(
+        "asym_pume_traffic",
+        base_graph=base_graph,
+        interaction_matrix=build_interaction_matrix(base_graph, epsilon),
+        rotation_matrix=build_rotation_matrix(base_graph, kappa),
+        **kwargs,
+    )
 
 
 @pytest.fixture(scope="module")
@@ -74,8 +85,8 @@ def jacobian_by_central_difference(family, params, cost, delta=1e-3):
     return torch.stack(columns, dim=1)
 
 
-def test_zero_epsilon_recovers_the_symmetric_family(base_graph):
-    """``epsilon = 0`` gives ``A = I``, so the operator must equal ``pume_traffic``'s exactly.
+def test_zero_coupling_recovers_the_symmetric_family(base_graph):
+    """``epsilon = 0, kappa = 0`` gives ``A = I, B = 0``, so the operator must equal ``pume_traffic``'s exactly.
 
     The cheapest end-to-end check of the whole seam: solver subclass, supply construction, link ordering
     of ``A``, and the family's ``_make_solver`` override. A permuted ``A`` would still be the identity
@@ -155,6 +166,69 @@ def test_monotonicity_holds_at_the_default_epsilon(base_graph):
         assert min(products) > 0.0, f"epsilon={epsilon} violated monotonicity (min {min(products):.4g})"
 
 
+def test_rotation_matrix_is_exactly_antisymmetric(base_graph):
+    """``B = -Bᵀ`` and ``⟨B v, v⟩ = 0`` to machine precision.
+
+    This is the whole basis of the additive coupling: an antisymmetric term contributes *exactly* nothing to
+    the monotonicity inner product, so it adds rotation at no cost to monotonicity, at any ``kappa``. If the
+    construction were only approximately antisymmetric, that guarantee would be approximate too.
+    """
+    rotation = build_rotation_matrix(base_graph, _KAPPA)
+    torch.manual_seed(0)
+    vectors = torch.randn(8, base_graph.num_edges, dtype=torch.float64)
+
+    assert torch.equal(rotation, -rotation.T)
+    assert torch.allclose(rotation.diagonal(), torch.zeros(base_graph.num_edges, dtype=torch.float64))
+    quadratic_forms = ((vectors @ rotation.T) * vectors).sum(dim=-1)
+    assert quadratic_forms.abs().max() < 1e-9 * _KAPPA
+
+
+def test_supply_jacobian_is_analytic_and_its_diagonal_is_separable(base_graph):
+    """``jacobian`` matches finite differences, and ``jacobian_diagonal`` is exactly ``A_ii f'_i``.
+
+    The diagonal claim is what makes rotation survive preconditioning: PUME's ``supply_diagonal`` metric is
+    built from ``jacobian_diagonal``, and since ``B`` has a zero diagonal the metric sees only the separable
+    part. It is also the ``O(m)`` path that avoids materializing a dense Jacobian per evaluation.
+    """
+    family = asym(base_graph, _EPSILON, _KAPPA)
+    graph = family.base_graph
+    supply = family.solver._make_supply(graph.free_flow_time, graph.capacity, graph.b, graph.power)
+    torch.manual_seed(0)
+    cost = family.sample_domain(graph, 1)[0].double()
+
+    delta = 1e-5
+    columns = []
+    for i in range(cost.numel()):
+        step = torch.zeros_like(cost)
+        step[i] = delta
+        columns.append((supply(cost + step) - supply(cost - step)) / (2 * delta))
+    assert torch.allclose(supply.jacobian(cost), torch.stack(columns, dim=1), atol=1e-4)
+
+    diagonal = supply.jacobian_diagonal(cost)
+    assert torch.allclose(diagonal, supply.jacobian(cost).diagonal())
+    expected = family.solver.interaction_matrix.diagonal() * supply.inner.jacobian_diagonal(cost)
+    assert torch.equal(diagonal, expected)
+
+
+def test_additive_coupling_stays_monotone_where_multiplicative_does_not(base_graph):
+    """A rotation-dominated additive coupling is monotone; the multiplicative form at 0.5 is not.
+
+    Both halves matter. The additive claim is exact maths (``⟨BΔc, Δc⟩ = 0``) so this is really an
+    implementation check; pairing it with the multiplicative failure at the same ``kappa``-free setting is
+    what shows the two couplings are genuinely different instruments rather than reparametrizations.
+    """
+    rotational = asym(base_graph, epsilon=0.0, kappa=_KAPPA, precondition=False)
+    graph = rotational.base_graph
+    torch.manual_seed(0)
+    products = []
+    for _ in range(8):
+        first, second = rotational.sample_domain(graph, 1)[0], rotational.sample_domain(graph, 1)[0]
+        difference = rotational.operator(graph, first) - rotational.operator(graph, second)
+        products.append((difference * (first - second)).sum().item())
+
+    assert min(products) > 0.0, f"kappa={_KAPPA} violated monotonicity (min {min(products):.4g})"
+
+
 def test_monotonicity_fails_at_large_epsilon(base_graph):
     """A large ``epsilon`` *is* non-monotone, even though ``A`` passes PUME's PD check.
 
@@ -170,7 +244,7 @@ def test_monotonicity_fails_at_large_epsilon(base_graph):
     cost = family.sample_domain(graph, 1)[0].double()
 
     symmetric_part = lambda matrix: torch.linalg.eigvalsh(0.5 * (matrix + matrix.T)).min().item()
-    supply_jacobian = interaction @ torch.diag(supply._inner.jacobian_diagonal(cost))
+    supply_jacobian = interaction @ torch.diag(supply.inner.jacobian_diagonal(cost))
 
     assert symmetric_part(interaction) > 0.0  # A passes PUME's validate_monotone check ...
     assert symmetric_part(supply_jacobian) < 0.0  # ... yet grad z is not positive semi-definite
@@ -196,27 +270,36 @@ def test_interaction_matrix_invariants(base_graph):
     assert not interaction[~adjacent].any(), "A couples links that share no node"
 
 
-def test_interaction_matrix_is_required(base_graph):
-    """The family refuses to be built without ``A`` rather than quietly constructing one.
+def test_both_coupling_matrices_are_required(base_graph):
+    """The family refuses to be built without either coupling rather than quietly constructing one.
 
-    A rebuilt matrix only *probably* matches the one a dataset's equilibria were solved with -- its values
-    come from an RNG seeded by a PUME default we neither pass nor record -- and a mismatch is silent. So
-    "no matrix" has to be an error, not a default.
+    A rebuilt ``A`` only *probably* matches the one a dataset's equilibria were solved with -- its values
+    come from an RNG seeded by a PUME default we neither pass nor record -- and a mismatch is silent. ``B``
+    is deterministic and could be rebuilt safely, but it follows the same rule so there is one policy rather
+    than a per-matrix exception.
     """
     with pytest.raises(TypeError):
         make_game("asym_pume_traffic", base_graph=base_graph)
+    with pytest.raises(TypeError):
+        make_game(
+            "asym_pume_traffic",
+            base_graph=base_graph,
+            interaction_matrix=build_interaction_matrix(base_graph, _EPSILON),
+        )
 
 
-def test_the_supplied_matrix_is_the_one_used(base_graph):
-    """Passing a different valid ``A`` changes the operator, so nothing is quietly rebuilt behind it."""
-    gentle, coupled = asym(base_graph, 0.05, precondition=False), asym(base_graph, 0.4, precondition=False)
+def test_the_supplied_matrices_are_the_ones_used(base_graph):
+    """Changing either coupling changes the operator, so nothing is quietly rebuilt behind them."""
     torch.manual_seed(0)
-    cost = gentle.sample_domain(gentle.base_graph, 1)[0]
+    base = asym(base_graph, 0.05, precondition=False)
+    cost = base.sample_domain(base.base_graph, 1)[0]
+    reference = base.operator(base.base_graph, cost)
 
-    assert not torch.equal(gentle.solver.interaction_matrix, coupled.solver.interaction_matrix)
-    assert not torch.allclose(
-        gentle.operator(gentle.base_graph, cost), coupled.operator(coupled.base_graph, cost), atol=1e-4
-    )
+    for label, family in [
+        ("multiplicative", asym(base_graph, 0.4, precondition=False)),
+        ("additive", asym(base_graph, 0.05, kappa=1.0, precondition=False)),
+    ]:
+        assert not torch.allclose(family.operator(family.base_graph, cost), reference, atol=1e-4), label
 
 
 def test_interaction_matrix_round_trips_through_a_dataset(base_graph, tmp_path):
@@ -226,8 +309,11 @@ def test_interaction_matrix_round_trips_through_a_dataset(base_graph, tmp_path):
     solved for and training reads it back instead of reconstructing it. Loose solver tolerances here: the
     equilibria's *accuracy* is not what is under test, their operator's identity is.
     """
-    matrix = build_interaction_matrix(base_graph, _EPSILON)
-    family = asym(base_graph, _EPSILON, solver_kwargs={"outer_tol": 1e-1, "outer_max_iter": 50})
+    expected = {
+        "interaction_matrix": build_interaction_matrix(base_graph, _EPSILON),
+        "rotation_matrix": build_rotation_matrix(base_graph, _KAPPA),
+    }
+    family = asym(base_graph, _EPSILON, _KAPPA, solver_kwargs={"outer_tol": 1e-1, "outer_max_iter": 50})
     SolvedInstanceDataset(
         str(tmp_path),
         base_graph=family.base_graph,
@@ -238,22 +324,25 @@ def test_interaction_matrix_round_trips_through_a_dataset(base_graph, tmp_path):
     )
 
     reloaded = SolvedInstanceDataset(str(tmp_path))
-    assert torch.equal(reloaded.base_graph.interaction_matrix, matrix)
+    assert coupling_matrices(reloaded.base_graph).keys() == expected.keys()
+    for name, matrix in expected.items():
+        assert torch.equal(reloaded.base_graph[name], matrix), name
 
 
-def test_interaction_matrix_never_reaches_the_collated_batch(base_graph):
-    """``A`` rides on the instance graph for persistence but is dropped before collation.
+def test_coupling_matrices_never_reach_the_collated_batch(base_graph):
+    """Both couplings ride on the instance graph for persistence but are dropped before collation.
 
-    Otherwise every batch would carry a redundant ``[B, E, E]`` tensor -- the operator reads ``A`` off the
-    solver, and the model never sees it at all.
+    Otherwise every batch would carry redundant ``[B, E, E]`` tensors -- the operator reads them off the
+    solver, and the model never sees them at all.
     """
-    family = asym(base_graph)
+    family = asym(base_graph, kappa=_KAPPA)
     torch.manual_seed(0)
     instance = family.sample_params()
-    assert "interaction_matrix" in instance  # cloned from base_graph, so it is there to begin with
+    batch = family.collate_fn([family.transform(family.model_input(instance, family.sample_domain(instance, 1)[0]))])
 
-    item = family.transform(family.model_input(instance, family.sample_domain(instance, 1)[0]))
-    assert "interaction_matrix" not in family.collate_fn([item])
+    for name in ("interaction_matrix", "rotation_matrix"):
+        assert name in instance, name  # cloned from base_graph, so they are there to begin with
+        assert name not in batch, name
 
 
 def test_operator_root_at_equilibrium(family, base_equilibrium):
