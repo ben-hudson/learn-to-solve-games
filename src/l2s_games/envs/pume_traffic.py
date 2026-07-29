@@ -6,8 +6,9 @@ but the operator is PUME's **excess-supply** field ``E(c) = z(c) - x(c)`` -- the
 This is a flow-space residual (contrast the cost-space ``costs - bpr(...)`` of the sibling family);
 it shares the same equilibrium root but is evaluated straight from the PUME package (``PUMEModel``),
 so the asymmetry of a non-potential supply plugs in at a single seam. That is the point of this
-family: ``AsymmetricMarkovTrafficEquilibrium`` will subclass it and swap ``InverseBPRSupply`` for
-``AsymmetricBPRSupply`` via ``PUMESolver._make_supply``, with everything else unchanged.
+family: ``asym_pume_traffic.AsymmetricPUMEMarkovTrafficEquilibrium`` subclasses it and swaps
+``InverseBPRSupply`` for ``AsymmetricBPRSupply`` via ``PUMESolver._make_supply`` (reached through this
+family's ``_make_solver`` hook), with everything else unchanged.
 
 This is a standalone ``VariationalInequalityFamily`` (not a subclass of ``MarkovTrafficEquilibrium``),
 so it is not tied to that family's cost-space formulation. The pure graph helpers and the conditioning
@@ -23,7 +24,7 @@ reuses PUME's public primitives (``supply_operator.jacobian_diagonal``, ``comput
 The zero is unchanged (``M > 0``), so equilibria, calibration, and projection are all preserved (box
 projection under a diagonal metric is plain coordinate clamping). ``precondition=False`` recovers the
 PUME-native excess supply. The supply diagonal comes straight from the supply operator, so it composes
-with the future asymmetric supply (``diag(A diag(f')) = A_ii f'_i``) with no extra code.
+with the asymmetric supply (``diag(A diag(f')) = A_ii f'_i``) with no extra code.
 """
 
 import torch
@@ -82,7 +83,12 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         # The PUME operator backend: builds the per-destination PUMCM demand models + a persistent
         # demand loader once from the (shared) topology; only the per-instance supply is rebuilt per
         # operator call in `build_model`, with this instance's OD threaded into the demand solve per call.
-        self.solver = PUMESolver(self.base_graph, **(solver_kwargs or {}))
+        self.solver = self._make_solver(solver_kwargs or {})
+
+    def _make_solver(self, solver_kwargs):
+        """The PUME operator backend for this family -- the seam a subclass overrides to swap the supply
+        operator (see ``asym_pume_traffic.AsymmetricPUMEMarkovTrafficEquilibrium``)."""
+        return PUMESolver(self.base_graph, **solver_kwargs)
 
     def sample_params(self):
         graph = self.base_graph.clone()

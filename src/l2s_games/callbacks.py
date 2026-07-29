@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from lightning.pytorch.loggers import WandbLogger
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.dynamics import simulate
+from l2s_games.dynamics import natural_map, simulate
 from l2s_games.viz import plot_trajectory_arrows
 
 
@@ -49,8 +49,7 @@ def _log_equilibrium_metrics(pl_module, family, inputs, z_end, name, equilibrium
     the raw flow-residual operator is not cost-scaled, so the *magnitude* is arbitrary (the zero is not).
     """
     params = family.params_from_batch(inputs)
-    natural_map = z_end - family.project(params, z_end - family.operator(params, z_end))
-    residual = natural_map.norm(dim=-1).mean()
+    residual = natural_map(family, params, z_end).norm(dim=-1).mean()
     eq_dist = (z_end - equilibrium).norm(dim=-1).mean()
     batch_size = z_end.shape[0]
     pl_module.log(f"val/{name}/residual", residual, on_epoch=True, batch_size=batch_size)

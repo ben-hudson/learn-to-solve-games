@@ -43,10 +43,18 @@ class PUMESolver:
         inner_tol=1e-7,
         outer_max_iter=500,
         outer_tol=1e-1,
+        initial_stepsize=2e-1,
     ):
         choice_model = choice_model if choice_model is not None else RecursiveLogit()
         self._outer_max_iter = outer_max_iter
         self._outer_tol = outer_tol
+        # aGRAAL's starting step size. 2e-1 rather than PUME's example value of 5e-2: the equilibrium
+        # iteration descends monotonically but *slowly* at 5e-2, so hard instances exhaust the iteration
+        # budget mid-descent instead of stalling (measured on Sioux Falls: 10/20 asymmetric instances hit
+        # the cap at eps=0.2). 2e-1 converges every instance tried, on both the potential and the
+        # asymmetric operator, in ~1/3 the wall clock. aGRAAL adapts the step from here, so this only
+        # sets where the adaptation starts.
+        self._initial_stepsize = initial_stepsize
 
         num_links = graph.num_edges
         source_nodes, target_nodes = graph.edge_index.numpy()
@@ -173,7 +181,7 @@ class PUMESolver:
                 "convergence_tolerance": self._outer_tol,
                 "oracle_type": "aa1",
                 "base_method": "agraal",
-                "base_options": {"metric_mode": "supply_diagonal", "initial_stepsize": 5e-2},
+                "base_options": {"metric_mode": "supply_diagonal", "initial_stepsize": self._initial_stepsize},
             },
         )
         return result["cost"].float(), result["demand"].float()

@@ -6,6 +6,7 @@ from l2s_games.envs.rps import RockPaperScissors2D, SymmetricZeroSumGame
 from l2s_games.envs.toy import RotationalFieldGame
 from l2s_games.envs.traffic import MarkovTrafficEquilibrium
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
+from l2s_games.envs.asym_pume_traffic import AsymmetricPUMEMarkovTrafficEquilibrium
 
 GAMES = {
     "toy": RotationalFieldGame,
@@ -13,6 +14,7 @@ GAMES = {
     "symmetric": SymmetricZeroSumGame,
     "traffic": MarkovTrafficEquilibrium,
     "pume_traffic": PUMEMarkovTrafficEquilibrium,
+    "asym_pume_traffic": AsymmetricPUMEMarkovTrafficEquilibrium,
 }
 
 
@@ -29,6 +31,7 @@ __all__ = [
     "SymmetricZeroSumGame",
     "MarkovTrafficEquilibrium",
     "PUMEMarkovTrafficEquilibrium",
+    "AsymmetricPUMEMarkovTrafficEquilibrium",
     "GAMES",
     "make_game",
 ]

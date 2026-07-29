@@ -58,15 +58,16 @@ class RecordedField:
 
     Recording at the **field** level rather than per step is what keeps this algorithm-agnostic:
     ``extragradient`` calls the field twice per step (at the iterate and at the lookahead) and both are
-    legitimate ``(state, operator value)`` pairs, while ``projection`` calls it once. The negation for
-    descent stays outside (``batched_rollout`` rolls out ``-field``), so the retained values are the
-    unnegated operator -- the target convention the whole pipeline regresses.
+    legitimate ``(state, operator value)`` pairs, while ``projection`` and ``optimistic`` call it once.
+    The negation for descent stays outside (``batched_rollout`` rolls out ``-field``), so the retained
+    values are the unnegated operator -- the target convention the whole pipeline regresses.
 
     ``groups`` slices the recording per instance, since the constraint and the conditioning are both
-    per-instance. One caveat, documented rather than filtered: the states are exactly the ones the
-    algorithm queried, and ``extragradient``'s lookahead is unprojected, so under that algorithm some
-    can lie outside the feasible set. Under ``projection`` (the default) the field only ever sees
-    projected iterates, so every recorded state is feasible.
+    per-instance. Every recorded state is feasible under every algorithm: the lookahead methods project
+    their intermediate points (their textbook constrained forms do -- see ``algorithms``), so the field
+    is only ever asked about projected points. Which points those are does vary: ``projection`` queries
+    the iterates, while ``optimistic`` queries its extrapolated points ``z_bar`` -- both feasible, both
+    on the distribution the rollout actually traverses.
     """
 
     def __init__(self, family, params):
