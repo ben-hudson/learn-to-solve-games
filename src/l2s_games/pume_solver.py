@@ -168,6 +168,12 @@ class PUMESolver:
         Offline (dataset generation) path: builds a fresh per-instance demand loader baking in this
         instance's OD, because the equilibrium iteration calls ``compute_demand(costs)`` with no
         per-call OD override. Run once offline, so its bounded cache growth is irrelevant.
+
+        Reports any solve that stopped on its iteration cap rather than its tolerance. The returned cost is
+        the last iterate either way, so without this a capped solve caches a point that is not an
+        equilibrium -- and every consumer treats the cached cost as exact (it calibrates the sampling range
+        and is the ``rel_dist`` reference). Reporting per solve rather than in aggregate is what lets a bad
+        generation run be abandoned in the first seconds instead of after it finishes.
         """
         loader = self._make_demand_loader(instance.demand)
         model = self._build_model(instance.free_flow_time, instance.capacity, instance.b, instance.power, loader)
@@ -184,4 +190,9 @@ class PUMESolver:
                 "base_options": {"metric_mode": "supply_diagonal", "initial_stepsize": self._initial_stepsize},
             },
         )
+        if not result["converged"]:
+            print(
+                f"  not converged: {result['iterations']} iters, residual {result['residual']:.3g} "
+                f"({result['message']})"
+            )
         return result["cost"].float(), result["demand"].float()

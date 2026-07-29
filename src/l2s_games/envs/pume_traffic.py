@@ -32,7 +32,7 @@ import torch
 from l2s_games.envs.base import VariationalInequalityFamily
 from l2s_games.envs.traffic import (
     _EDGE_ATTRS,
-    _DROPPED_NODE_ATTRS,
+    _DROPPED_ATTRS,
     _NOISED_ATTRS,
     _canonicalize,
     load_sioux_falls_base_graph,  # re-exported for callers/tests that build the base graph
@@ -230,10 +230,11 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         """Raw input item: the instance graph with the domain point attached as ``.cost``.
 
         Featurization is deferred to ``transform`` (lazy per access; see ``transforms.py``). Unused
-        float64 node-coordinate attrs are dropped so they never reach the collated batch.
+        attrs the model has no use for -- node coordinates, the asymmetric coupling matrix -- are dropped
+        so they never reach the collated batch (see ``_DROPPED_ATTRS``).
         """
         item = graph.clone()
-        for attr in _DROPPED_NODE_ATTRS:
+        for attr in _DROPPED_ATTRS:
             if attr in item:
                 del item[attr]
         item.cost = torch.as_tensor(cost, dtype=torch.float32)

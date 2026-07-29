@@ -75,7 +75,7 @@ from l2s_games.data import (
     split_instances,
 )
 from l2s_games.datasets import SolvedInstanceDataset
-from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
+from l2s_games.envs import GAMES, make_game
 from l2s_games.instance_sampling import FixedInstanceOperatorStream
 from l2s_games.models import (
     ConstrainedFieldModel,
@@ -105,6 +105,17 @@ def build_parser():
     # fit the normalizer + calibrate the sampling range (cal) and measure generalization (val/test).
     # Epoch length is --steps_per_epoch.
     p.add_argument("--dataset_root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load")
+    p.add_argument(
+        "--game",
+        type=str,
+        default="pume_traffic",
+        choices=["pume_traffic", "asym_pume_traffic"],
+        help="VI family: pume_traffic is the potential excess-supply field, asym_pume_traffic the "
+        "non-potential one (z(c) = A f(c), non-symmetric Jacobian). --dataset_root must hold equilibria "
+        "solved with the *same* family, since they set the sampling range and the rel_dist reference. "
+        "Under asym_pume_traffic the coupling matrix comes from the dataset (there is no --epsilon here; "
+        "it is set once at generation), so the dataset root fully identifies the operator",
+    )
     p.add_argument(
         "--n_cal_instances", type=int, default=128, help="calibration split size (normalizer + range calibration)"
     )
@@ -301,7 +312,13 @@ def build_parser():
         default="projection",
         help="converging algorithm rolled out to generate training points, on the learned field (the "
         "on-policy 'rollout' source) and on the *true* field (the 'expert'/solution source); it shapes "
-        "the sampling distribution (projection descends the preconditioned excess supply). Reuses --h / --n_steps",
+        "the sampling distribution (projection descends the preconditioned excess supply). Reuses --h / "
+        "--n_steps. projection is the measured best choice on *both* games: under --precondition (the "
+        "default) the supply-diagonal metric leaves a well-conditioned near-contraction, which is forward "
+        "Euler's best case, and rotation up to the monotonicity ceiling does not dent it -- optimistic and "
+        "extragradient carry the better theoretical guarantee for merely-monotone operators but are "
+        "empirically worse here, with lower stability ceilings. Re-tune with scripts/tune_pume_rollout.py "
+        "if the field's scaling changes",
     )
     p.add_argument("--refresh_every", type=int, default=5, help="regenerate the on-policy buffer every N epochs")
     p.add_argument("--n_rollout_instances", type=int, default=128, help="instances rolled out per buffer refresh")
@@ -331,9 +348,31 @@ def build_parser():
     # projection's stability ceiling is between h=0.2 and h=0.4, and h=0.1 gives a clean monotone
     # decay reaching the equilibrium (rel-dist <0.01 by ~step 200, residual still dropping at 500).
     # The old h=0.02/1000 was sized for the raw cost-space operator and badly under-steps here.
-    p.add_argument("--h", type=float, default=0.1, help="algorithm step size (damped fixed point)")
+    p.add_argument(
+        "--h",
+        type=float,
+        default=0.1,
+        help="algorithm step size (damped fixed point). Tuned for the preconditioned *potential* field "
+        "with --train_algo projection; re-tune per (game, algo) with scripts/tune_pume_rollout.py",
+    )
     p.add_argument("--n_steps", type=int, default=500, help="iterations for the rollout")
     return p
+
+
+def operator_kwargs(game, dataset):
+    """The asymmetric family's coupling matrix, read off the dataset that was solved with it.
+
+    Never rebuilt here: ``A``'s values come from an RNG seeded by a PUME default we neither pass nor record,
+    so a reconstruction only *probably* matches the one whose equilibria are cached -- and a mismatch is
+    silent (residual ~5.0 instead of ~1e-3 at a cached equilibrium). A dataset generated before ``A`` was
+    stored has to be regenerated rather than paired with a fresh matrix.
+    """
+    assert "interaction_matrix" in dataset.base_graph, (
+        f"{game} needs the interaction matrix its equilibria were solved with, but this dataset does not "
+        "carry one. Regenerate it:\n"
+        "  python scripts/generate_traffic_dataset.py <n> <root> --game asym_pume_traffic --epsilon <eps>"
+    )
+    return {"interaction_matrix": dataset.base_graph.interaction_matrix}
 
 
 def main(args):
@@ -349,35 +388,29 @@ def main(args):
     cal_inst, val_inst, test_inst = split_instances(
         instances, (args.n_cal_instances, args.n_val_instances, args.n_test_instances)
     )
-    reference_equilibrium, reference_spread = PUMEMarkovTrafficEquilibrium.calibrate_range(cal_inst)
+    reference_equilibrium, reference_spread = GAMES[args.game].calibrate_range(cal_inst)
+    # Family kwargs shared by both factories below. The asymmetric family additionally needs its coupling
+    # matrix, which is spliced in per game rather than branched at each construction site.
+    family_kwargs = {
+        "base_graph": dataset.base_graph,
+        "noise_scale": args.noise_scale,
+        "reference_equilibrium": reference_equilibrium,
+        "reference_spread": reference_spread,
+        "n_stds": args.sample_stds,
+        "precondition": args.precondition,
+        **(operator_kwargs(args.game, dataset) if args.game == "asym_pume_traffic" else {}),
+    }
     # A picklable factory (base graph + calibrated tensors) the streaming dataset ships to each worker,
     # which builds its own family + PUME solver lazily -- nothing solver-related is pickled. The
     # main process also needs one live family for collate_fn and the validation rollout callbacks.
-    family_factory = functools.partial(
-        PUMEMarkovTrafficEquilibrium,
-        dataset.base_graph,
-        noise_scale=args.noise_scale,
-        reference_equilibrium=reference_equilibrium,
-        reference_spread=reference_spread,
-        n_stds=args.sample_stds,
-        precondition=args.precondition,
-    )
+    family_factory = functools.partial(make_game, args.game, **family_kwargs)
     family = family_factory()
     # A process-safe counter of ground-truth operator point-evaluations (the training budget), shared
     # only by the families that generate training data: counting_factory bakes it in, so every
     # streaming worker + the on-policy/expert streams increment the same total, while the main `family`
     # (validation + collate) and the one-time cal/val/test build stay counter-free (family_factory).
     operator_counter = SharedCounter()
-    counting_factory = functools.partial(
-        PUMEMarkovTrafficEquilibrium,
-        dataset.base_graph,
-        noise_scale=args.noise_scale,
-        reference_equilibrium=reference_equilibrium,
-        reference_spread=reference_spread,
-        n_stds=args.sample_stds,
-        operator_counter=operator_counter,
-        precondition=args.precondition,
-    )
+    counting_factory = functools.partial(make_game, args.game, operator_counter=operator_counter, **family_kwargs)
     # 'full' amortization regresses z* directly: its fixed splits use the cached equilibria and its
     # only train source is the expert solution stream (built below). 'partial' regresses the operator
     # field, with the uniform stream as its always-on train source. train_ds is None under 'full'.
@@ -594,12 +627,12 @@ def main(args):
     if args.debug:
         logger = None
     elif args.logger == "wandb":
-        # Tag the run with game=pume_traffic so its config is comparable to train_field_mlp.py's runs
-        # (which log --game); this script is traffic-only, so it's a fixed constant.
+        # --game is in vars(args), so the run's config is comparable to train_field_mlp.py's (which
+        # also logs --game) with no extra tagging.
         run = wandb.init(
             project="learn-to-solve-games",
             group=args.exp,
-            config={**vars(args), "game": "pume_traffic"},
+            config=vars(args),
             dir=save_dir,
         )
         # Declare the operator budget so it can be *selected* as a custom x-axis in any panel (e.g.
