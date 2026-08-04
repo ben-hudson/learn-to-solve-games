@@ -21,9 +21,9 @@ Three properties worth knowing:
 - **The window fills lazily.** The first pass solves a group, yields its examples, and keeps it,
   resuming across epoch boundaries until the quota is spent -- so there is no startup stall and early
   training sees exactly the uncached stream's fresh-sample distribution.
-- **The cache holds ``SolvedGroup``s, not examples.** ``model_input`` clones the instance per point, so
+- **The cache holds ``OperatorEvaluations``s, not examples.** ``model_input`` clones the instance per point, so
   retaining examples would cost ``points_per_instance`` times as much memory (13 GB rather than 1.3 GB
-  for a million cached traffic points); ``group_examples`` rebuilds them at yield time.
+  for a million cached traffic points); ``operator_examples`` rebuilds them at yield time.
 - **One cache per worker.** PyTorch does not shard ``IterableDataset``s, so each of the ``n_workers``
   dataset replicas fills its own -- hence the ``n_workers`` factor above, matching how the expert and
   on-policy buffers are counted. The cache lives on the replica, so ``persistent_workers=True`` is
@@ -35,7 +35,7 @@ Three properties worth knowing:
 
 import torch
 
-from l2s_games.data import OperatorStream, group_examples, sample_group
+from l2s_games.data import OperatorStream, operator_examples, sample_and_eval_operator
 
 
 class CachedOperatorStream(OperatorStream):
@@ -72,12 +72,12 @@ class CachedOperatorStream(OperatorStream):
     def _solve(self, family, index):
         """Solve one instance's points -- the ``index``-th pinned instance, or a fresh draw."""
         params = self.instances[index] if self.instances is not None else family.sample_params()
-        return sample_group(family, params, self.points_per_instance)
+        return sample_and_eval_operator(family, params, self.points_per_instance)
 
     def _examples(self, family, index):
         """The cached group's examples, in a fresh point order."""
         group = self._groups[index]
-        return group_examples(family, group, index=index, order=torch.randperm(len(group.points)).tolist())
+        return operator_examples(family, group, index=index, order=torch.randperm(len(group.points)).tolist())
 
     def _raw_stream(self, family):
         # Refresh at epoch start (once per refresh_every epochs), mirroring ExpertOperatorStream's

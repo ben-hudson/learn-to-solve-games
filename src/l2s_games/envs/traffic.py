@@ -42,7 +42,11 @@ def _join(root, name):
 _NOISED_ATTRS = ("free_flow_time", "capacity")  # TODO: add demand back in once everything is working
 _EDGE_ATTRS = ("free_flow_time", "capacity", "b", "power")
 _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost/flow, when present
-# Instance-graph attrs stripped in ``model_input`` so they never reach a collated batch. Two kinds:
+# Fallback ``sampling_ceiling`` multiplier on the TNTP-shipped reference cost, for a family built without a
+# calibrated ceiling (the sandbox scripts). Prefer ``calibrate_ceiling`` on solved equilibria: this is a
+# guess, and the equilibrium moves with the operator (the asymmetric one at large kappa is far from here).
+_UNCALIBRATED_CEILING_MARGIN = 4.0
+# Instance-graph attrs stripped in ``model_input`` so they never reach a collated batch. Three kinds:
 #   - node coordinates that ``from_networkx`` carries off the TNTP graph (positions + PyG's x/y aliases).
 #     Nothing reads them, but they are float64 and stacking them breaks the device transfer (MPS rejects
 #     float64).
@@ -50,9 +54,23 @@ _REFERENCE_ATTRS = ("Cost", "Volume")  # TNTP-shipped reference equilibrium cost
 #     the graph so dataset generation persists them (see ``asym_pume_traffic``), but the *operator* reads them
 #     off the solver, so the model never needs them -- and stacking one would add an ``[B, E, E]`` tensor per
 #     batch.
+#   - ``points`` / ``targets`` / ``preconditioner_diagonal``, one instance's whole block of evaluated points
+#     as stored by ``operator_datasets``. ``get`` reads them off the graph to rebuild a single example, so by
+#     the time ``model_input`` runs they are spent -- and stacking them would put every *other* point of the
+#     instance into the batch alongside the one being trained on.
 # The general rule: anything carried on the graph for persistence or provenance rather than for the model
 # belongs here.
-_DROPPED_ATTRS = ("x", "y", "X", "Y", "interaction_matrix", "rotation_matrix")
+_DROPPED_ATTRS = (
+    "x",
+    "y",
+    "X",
+    "Y",
+    "interaction_matrix",
+    "rotation_matrix",
+    "points",
+    "targets",
+    "preconditioner_diagonal",
+)
 
 
 def load_sioux_falls_base_graph(root, scaling=1000.0):

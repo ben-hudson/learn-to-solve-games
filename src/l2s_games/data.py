@@ -151,7 +151,7 @@ def normalize_input(raw, transform, normalizer):
     """Featurize a raw input item and standardize its ``feats`` -- the one place that input shape lives.
 
     Clones the raw item (so a stored original stays pristine), applies the family ``transform`` (builds
-    ``feats`` fresh), then standardizes ``feats``. This is the input half of ``_normalize_example``,
+    ``feats`` fresh), then standardizes ``feats``. This is the input half of ``normalize_example``,
     factored out so every model-ready-input builder -- the datasets, ``FieldModel.conditioned_field``,
     and ``OnPolicyOperatorStream`` -- featurizes/standardizes identically. Representation-agnostic: it
     only touches the family ``transform`` seam and ``normalizer.input``, so it works for flat and graph
@@ -162,10 +162,11 @@ def normalize_input(raw, transform, normalizer):
     return item
 
 
-def _normalize_example(raw, target, transform, normalizer):
+def normalize_example(raw, target, transform, normalizer):
     """Featurize + standardize a raw ``(input item, target)`` pair -- input via ``normalize_input``,
-    target clip-then-standardized. Shared by the map-style ``OperatorDataset`` and the streaming
-    ``OperatorStream`` subclasses so both featurize/normalize identically.
+    target clip-then-standardized. Shared by the map-style ``OperatorDataset``, the streaming
+    ``OperatorStream`` subclasses, and the on-disk ``operator_datasets`` caches, so every source
+    featurizes/normalizes identically.
     """
     return normalize_input(raw, transform, normalizer), normalizer.transform_target(target)
 
@@ -187,7 +188,7 @@ class OperatorDataset(Dataset):
 
     def __getitem__(self, index):
         raw, target = self.examples[index]
-        return _normalize_example(raw, target, self.transform, self.normalizer)
+        return normalize_example(raw, target, self.transform, self.normalizer)
 
 
 def _collate_examples(family_collate_fn, pairs):
@@ -207,42 +208,45 @@ def collate_examples(family):
     return functools.partial(_collate_examples, family.collate_fn)
 
 
-class SolvedGroup(NamedTuple):
-    """One instance's solved points: ``params`` plus ``points`` / ``targets`` / ``metrics``, each ``[K, d]``.
+class OperatorEvaluations(NamedTuple):
+    """One instance's evaluated points: ``params`` plus ``points`` / ``targets`` /
+    ``preconditioner_diagonal``, each ``[points_per_instance, d]``.
 
-    The unit every *buffered* source retains (see ``caching.CachedOperatorStream`` and the expert stream
-    in ``rollout_sampling``). Deliberately **not** a list of ``(model_input, target)`` examples:
+    An *evaluation* is one operator call; contrast ``datasets.SolvedInstanceDataset``, where "solved"
+    means solved to equilibrium -- hundreds of these. The unit every *buffered* source retains (see
+    ``caching.CachedOperatorStream`` and the expert stream in ``rollout_sampling``) and the unit
+    ``operator_datasets`` persists. Deliberately **not** a list of ``(model_input, target)`` examples:
     ``model_input`` clones the instance per point -- ~13 KB for a traffic graph -- so a buffer of examples
-    costs ``K`` times what a group does, which for a million cached traffic points is 13 GB rather than
-    1.3 GB. ``group_examples`` rebuilds the examples one at a time, at yield time, so the clone is
-    transient and only the tensors are held.
+    costs ``points_per_instance`` times what this does, which for a million cached traffic points is
+    13 GB rather than 1.3 GB. ``operator_examples`` rebuilds the examples one at a time, at yield time,
+    so the clone is transient and only the tensors are held.
     """
 
     params: Any
     points: torch.Tensor
     targets: torch.Tensor
-    metrics: torch.Tensor
+    preconditioner_diagonal: torch.Tensor
 
 
-def solve_group(family, params, points):
-    """Solve the operator jointly for one instance's ``points`` -> a ``SolvedGroup``.
+def eval_operator(family, params, points):
+    """Evaluate the operator jointly for one instance's ``points`` -> an ``OperatorEvaluations``.
 
     The single place a domain point is paired with its operator target: the operator (an expensive
-    route-choice solve for traffic) runs **once for all points**, and the metric diagonal falls out of
-    the same call, so it is free (see ``VariationalInequalityFamily.operator_and_metric``).
+    route-choice solve for traffic) runs **once for all points**, and the preconditioner diagonal falls
+    out of the same call, so it is free (see ``VariationalInequalityFamily.operator_and_preconditioner``).
     """
     with torch.no_grad():
-        targets, metrics = family.operator_and_metric(params, points)
-    return SolvedGroup(params, points, targets, metrics)
+        targets, preconditioner_diagonal = family.operator_and_preconditioner(params, points)
+    return OperatorEvaluations(params, points, targets, preconditioner_diagonal)
 
 
-def sample_group(family, params, n):
-    """``solve_group`` at ``n`` freshly sampled domain points -- one instance's worth of training data."""
-    return solve_group(family, params, family.sample_domain(params, n))
+def sample_and_eval_operator(family, params, n):
+    """``eval_operator`` at ``n`` freshly sampled domain points -- one instance's worth of training data."""
+    return eval_operator(family, params, family.sample_domain(params, n))
 
 
-def group_examples(family, group, index=None, order=None):
-    """Iterate a ``SolvedGroup`` into raw ``(model_input, target)`` examples, one per point.
+def operator_examples(family, evaluations, index=None, order=None):
+    """Iterate an ``OperatorEvaluations`` into raw ``(model_input, target)`` examples, one per point.
 
     Each item is tagged with ``PRECONDITIONER_DIAGONAL``: the per-coordinate diagonal that maps the
     operator's value back to the family's **raw** (unpreconditioned) field, i.e.
@@ -252,34 +256,36 @@ def group_examples(family, group, index=None, order=None):
     this works for a PyG ``Data`` (traffic) and a plain dict (flat games) alike.
 
     ``order`` picks which point comes out when: the cached sources reshuffle it per pass so the
-    monotonicity pairs -- matched by halves within an instance -- vary without any new solves.
+    monotonicity pairs -- matched by halves within an instance -- vary without any new evaluations.
     """
-    order = range(len(group.points)) if order is None else order
+    order = range(len(evaluations.points)) if order is None else order
     for j in order:
         item = family.model_input(evaluations.params, evaluations.points[j])
         item[PRECONDITIONER_DIAGONAL] = evaluations.preconditioner_diagonal[j]
         if index is not None:
             item[INSTANCE_INDEX] = torch.tensor(index)
-        yield item, group.targets[j]
+        yield item, evaluations.targets[j]
 
 
 def examples_at_points(family, params, points, index=None):
     """A list of raw ``(model_input, target)`` examples for one instance at explicit ``points``.
 
-    ``solve_group`` + ``group_examples`` for the sources that build their examples eagerly (the fixed
-    splits, the fixed-instance stream and the on-policy collector, which must re-solve because it rolls
-    out the *learned* field). Buffered sources hold the group instead and skip this.
+    ``eval_operator`` + ``operator_examples`` for the sources that build their examples eagerly (the
+    fixed splits, the fixed-instance stream and the on-policy collector, which must re-evaluate because
+    it rolls out the *learned* field). Buffered sources hold the ``OperatorEvaluations`` instead and skip
+    this.
     """
-    return list(group_examples(family, solve_group(family, params, points), index=index))
+    return list(operator_examples(family, eval_operator(family, params, points), index=index))
 
 
 def _solve_instance(family, params, points_per_instance):
-    """The ``(raw input item, target)`` examples for one instance: sample points, solve the operator.
+    """The ``(raw input item, target)`` examples for one instance: sample points, evaluate the operator.
 
     Shared by the eager ``_examples_for_instances`` and the streaming ``UniformSampledOperatorStream``,
-    both of which pass the full ``points_per_instance`` so one solve amortizes over that many points.
+    both of which pass the full ``points_per_instance`` so one evaluation call amortizes over that many
+    points.
     """
-    return list(group_examples(family, sample_group(family, params, points_per_instance)))
+    return list(operator_examples(family, sample_and_eval_operator(family, params, points_per_instance)))
 
 
 def _examples_for_instances(family, instances, points_per_instance):
@@ -351,7 +357,7 @@ class OperatorStream(IterableDataset):
         family = self.family_factory()
         transform = family.transform
         for raw, target in self._raw_stream(family):
-            yield _normalize_example(raw, target, transform, self.normalizer)
+            yield normalize_example(raw, target, transform, self.normalizer)
 
 
 class UniformSampledOperatorStream(OperatorStream):

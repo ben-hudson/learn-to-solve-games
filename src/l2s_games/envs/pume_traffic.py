@@ -23,8 +23,14 @@ reuses PUME's public primitives (``supply_operator.jacobian_diagonal``, ``comput
 ``MetricPreconditioner`` container's ``apply_inverse``); only the element-wise floor is assembled here.
 The zero is unchanged (``M > 0``), so equilibria, calibration, and projection are all preserved (box
 projection under a diagonal metric is plain coordinate clamping). ``precondition=False`` recovers the
-PUME-native excess supply. The supply diagonal comes straight from the supply operator, so it composes
-with the asymmetric supply (``diag(A diag(f')) = A_ii f'_i``) with no extra code.
+PUME-native excess supply, which is what the raw-field diagnostics in
+``scripts/probe_rotational_supply.py`` measure. The supply diagonal comes straight from the supply
+operator, so it composes with the asymmetric supply (``diag(A diag(f')) = A_ii f'_i``) with no extra code.
+
+The **cached** operator datasets (see ``operator_datasets``) do not expose the choice: their targets bake
+in whichever field produced them, so a per-run switch could only disagree with them silently. They are
+generated with the default, so the flag exists for the analytic paths -- diagnostics, sandboxes, the
+streaming pipeline -- and not for anything reading a cache.
 """
 
 import torch
@@ -34,6 +40,7 @@ from l2s_games.envs.traffic import (
     _EDGE_ATTRS,
     _DROPPED_ATTRS,
     _NOISED_ATTRS,
+    _UNCALIBRATED_CEILING_MARGIN,
     _canonicalize,
     load_sioux_falls_base_graph,  # re-exported for callers/tests that build the base graph
 )
@@ -95,18 +102,15 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
             setattr(graph, attr, value * factor.clamp(min=1e-2))
         return graph
 
-    def _excess_supply(self, params, index, cost):
-        """``(residual, metric)`` at one cost vector: excess supply ``z(c) - x(c)``, and the diagonal
-        that maps it back to the raw field.
-
-        ``metric * residual`` is always the raw excess supply, so ``metric`` is ``M`` when preconditioning
-        and all ones when not. It comes out of the *same* demand solve as the residual -- the expensive
-        part -- so surfacing it is free; see ``operator_and_metric`` for why anything needs it.
+    def _model_and_od(self, params, index):
+        """One instance's ``PUMEModel`` and OD table, ready to evaluate at any cost vector.
 
         ``index`` selects the per-instance BPR attrs + demand from a batched ``params`` (rank-2), or is
-        ``None`` for a single-instance ``params`` (rank-1). ``build_model`` reuses the shared PUMCM
-        structure *and* the shared (persistent) demand loader, so only the light per-instance supply is
-        assembled here; this instance's OD is threaded into the demand solve per call via
+        ``None`` for a single-instance ``params`` (rank-1). Split out from ``_excess_supply`` so a
+        many-points-one-instance call builds this **once** rather than per point (see
+        ``operator_and_preconditioner``). ``build_model`` reuses the shared PUMCM structure *and* the
+        shared (persistent) demand loader, so only the light per-instance supply is assembled here; the OD
+        is returned alongside because it is threaded into the demand solve per call via
         ``compute_demand(initial_states_list=...)`` rather than baked into a fresh loader (which leaked).
         PUME solves on CPU float64 (it cannot run on MPS, which rejects float64), so every input is moved
         to CPU -- a no-op for the CPU tensors of data generation, and the move the on-device validation
@@ -115,8 +119,18 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         row = (lambda name: params[name][index]) if index is not None else (lambda name: params[name])
         pick = lambda name: row(name).cpu()
         free_flow_time, capacity, b, power = (pick(name) for name in _EDGE_ATTRS)
-        od = list(pick("demand").double().unbind(dim=0))
         model = self.solver.build_model(free_flow_time, capacity, b, power)
+        return model, list(pick("demand").double().unbind(dim=0))
+
+    def _excess_supply(self, model, od, cost):
+        """``(residual, preconditioner_diagonal)`` at one cost vector: excess supply ``z(c) - x(c)``, and
+        the diagonal that maps it back to the raw field.
+
+        ``preconditioner_diagonal * residual`` is always the raw excess supply, so the diagonal is ``M``
+        when preconditioning and all ones when not. It comes out of the *same* demand solve as the
+        residual -- the expensive part -- so surfacing it is free; see ``operator_and_preconditioner`` for
+        why anything needs it.
+        """
         c = cost.cpu().double()
         # One demand solve, reused for both the residual and (when preconditioning) the metric floor.
         # E = z(c) - x(c); the per-instance OD is passed here (the shared loader carries a placeholder).
@@ -179,9 +193,15 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         batch_size = costs.shape[0]
         self.operator_counter.add(batch_size)  # one point-evaluation per cost vector solved
         per_instance = params["free_flow_time"].dim() == 2
-        rows = [self._excess_supply(params, row if per_instance else None, costs[row]) for row in range(batch_size)]
-        residuals, metrics = (torch.stack(values).float().to(device) for values in zip(*rows))
-        return (residuals.squeeze(0), metrics.squeeze(0)) if single else (residuals, metrics)
+        # A rank-1 params is one instance shared by every cost row, so build its PUMEModel once and reuse
+        # it across the rows; rank-2 rows are distinct instances, so each genuinely needs its own.
+        shared = None if per_instance else self._model_and_od(params, None)
+        rows = [
+            self._excess_supply(*(self._model_and_od(params, row) if per_instance else shared), costs[row])
+            for row in range(batch_size)
+        ]
+        residuals, diagonals = (torch.stack(values).float().to(device) for values in zip(*rows))
+        return (residuals.squeeze(0), diagonals.squeeze(0)) if single else (residuals, diagonals)
 
     def project(self, params, costs):
         """Onto the feasible cost box ``[free_flow_time, COST_UPPER]``.
