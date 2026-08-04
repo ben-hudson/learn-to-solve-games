@@ -37,7 +37,7 @@ a tuning problem.
 import cooper
 import torch
 
-from l2s_games.data import INSTANCE_INDEX, METRIC_DIAGONAL
+from l2s_games.data import INSTANCE_INDEX, PRECONDITIONER_DIAGONAL
 
 
 def monotonicity_ratios(field, points, normalize=True):
@@ -128,7 +128,7 @@ class MonotonicityCMP(cooper.ConstrainedMinimizationProblem):
         single multiply, so this is nearly free and stays differentiable.
         """
         field = self.model.inverse_target(values)
-        return field * inputs[METRIC_DIAGONAL] if self.constrain_raw else field
+        return field * inputs[PRECONDITIONER_DIAGONAL] if self.constrain_raw else field
 
     def pair_violations(self, values, inputs):
         """Per-pair violations for every instance in the batch, concatenated.

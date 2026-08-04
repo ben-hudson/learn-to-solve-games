@@ -15,7 +15,7 @@ grows with the epoch count, so what is worth pinning is where the spend stops an
    ``n_workers`` factor in the budget formula comes from.
 
 Uses the flat ``rps`` family: its operator is a cheap matrix product, so the file runs without a
-route-choice solve. A counting wrapper around ``operator_and_metric`` stands in for the ``SharedCounter``
+route-choice solve. A counting wrapper around ``operator_and_preconditioner`` stands in for the ``SharedCounter``
 the traffic family carries, since counting is what every budget assertion here is about.
 """
 
@@ -84,7 +84,7 @@ def test_later_passes_reuse_the_same_points(stream):
 def test_targets_stay_paired_with_their_points(stream, family, normalizer):
     """Every re-emitted example's target is still the operator at its own point (in real units)."""
     for item, target in take(stream, 2 * CACHED_EXAMPLES):
-        expected, _metric = family.operator_and_metric(item["params"], item["point"].unsqueeze(0))
+        expected, _metric = family.operator_and_preconditioner(item["params"], item["point"].unsqueeze(0))
         assert torch.allclose(normalizer.inverse_target(target), expected[0], atol=1e-6)
 
 

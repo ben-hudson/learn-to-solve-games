@@ -19,7 +19,7 @@ import torch
 
 from l2s_games.data import (
     INSTANCE_INDEX,
-    METRIC_DIAGONAL,
+    PRECONDITIONER_DIAGONAL,
     build_streaming_operator_dataset,
     collate_examples,
     split_instances,
@@ -50,12 +50,10 @@ def solved_batch():
     torch.manual_seed(0)
     dataset = SolvedInstanceDataset(str(_DATASET_ROOT))
     cal, val, test = split_instances(list(dataset), (4, 2, 2))
-    reference_equilibrium, reference_spread = PUMEMarkovTrafficEquilibrium.calibrate_range(cal)
     factory = functools.partial(
         PUMEMarkovTrafficEquilibrium,
         dataset.base_graph,
-        reference_equilibrium=reference_equilibrium,
-        reference_spread=reference_spread,
+        sampling_ceiling=PUMEMarkovTrafficEquilibrium.calibrate_ceiling(cal),
     )
     _splits, normalizer = build_streaming_operator_dataset(factory, cal, val, test, _POINTS_PER_INSTANCE)
     family = factory()
@@ -68,23 +66,27 @@ def solved_batch():
 # --- the metric round-trip: the assumption the raw-field constraint rests on ----------------------
 
 
-def test_metric_maps_preconditioned_operator_back_to_raw(base_graph):
-    """``M * (M^-1 E) == E``, and the metric is all ones when the operator is already raw."""
+def test_preconditioner_diagonal_maps_operator_back_to_raw(base_graph):
+    """``M * (M^-1 E) == E``, and the diagonal is all ones when the operator is already raw.
+
+    Several points share one instance, so this also pins that the hoisted ``PUMEModel`` (built once per
+    rank-1 ``params``, see ``operator_and_preconditioner``) gives each row what a per-row build did.
+    """
     torch.manual_seed(0)
     preconditioned = make_game("pume_traffic", base_graph=base_graph, precondition=True)
     raw = make_game("pume_traffic", base_graph=base_graph, precondition=False)
     graph = preconditioned.sample_params()
     points = preconditioned.sample_domain(graph, 3)
 
-    values, metric = preconditioned.operator_and_metric(graph, points)
-    raw_values, raw_metric = raw.operator_and_metric(graph, points)
+    values, diagonal = preconditioned.operator_and_preconditioner(graph, points)
+    raw_values, raw_diagonal = raw.operator_and_preconditioner(graph, points)
 
-    assert torch.allclose(metric * values, raw_values, rtol=1e-4, atol=1e-4)
-    assert torch.equal(raw_metric, torch.ones_like(raw_metric))
-    assert (metric >= 1.0).all()  # PUME's supply diagonal is floored at 1
+    assert torch.allclose(diagonal * values, raw_values, rtol=1e-4, atol=1e-4)
+    assert torch.equal(raw_diagonal, torch.ones_like(raw_diagonal))
+    assert (diagonal >= 1.0).all()  # PUME's supply diagonal is floored at 1
 
 
-def test_operator_still_matches_operator_and_metric(base_graph):
+def test_operator_still_matches_operator_and_preconditioner(base_graph):
     """``operator`` delegates without changing its result, and costs one evaluation per row, not two."""
     torch.manual_seed(0)
     family = make_game("pume_traffic", base_graph=base_graph)
@@ -92,7 +94,7 @@ def test_operator_still_matches_operator_and_metric(base_graph):
     points = family.sample_domain(graph, 3)
 
     before = family.operator_counter.value
-    values, _metric = family.operator_and_metric(graph, points)
+    values, _metric = family.operator_and_preconditioner(graph, points)
     assert torch.equal(family.operator(graph, points), values)
     assert family.operator_counter.value - before == 2 * len(points)  # one call each, not doubled
 
@@ -167,10 +169,10 @@ def test_batch_carries_the_constraint_inputs(solved_batch):
     family, _normalizer, (inputs, targets) = solved_batch
     batch_size = targets.shape[0]
 
-    assert inputs[METRIC_DIAGONAL].shape == (batch_size, family.base_graph.num_edges)
-    assert inputs[METRIC_DIAGONAL].dtype == torch.float32
+    assert inputs[PRECONDITIONER_DIAGONAL].shape == (batch_size, family.base_graph.num_edges)
+    assert inputs[PRECONDITIONER_DIAGONAL].dtype == torch.float32
     assert inputs[INSTANCE_INDEX].dtype == torch.long  # IndexedMultiplier (stage 2) requires long
-    assert family.initial_point(inputs).shape == inputs[METRIC_DIAGONAL].shape
+    assert family.initial_point(inputs).shape == inputs[PRECONDITIONER_DIAGONAL].shape
     # The stream emits each instance's points contiguously, so a batch holds whole runs.
     _values, counts = inputs[INSTANCE_INDEX].unique(return_counts=True)
     assert (counts == _POINTS_PER_INSTANCE).all()
@@ -184,7 +186,7 @@ def test_analytic_raw_field_is_monotone_on_a_real_batch(solved_batch):
     would be enforcing monotonicity on a field that does not possess it.
     """
     family, normalizer, (inputs, targets) = solved_batch
-    raw_field = normalizer.inverse_target(targets) * inputs[METRIC_DIAGONAL]
+    raw_field = normalizer.inverse_target(targets) * inputs[PRECONDITIONER_DIAGONAL]
     points = family.initial_point(inputs)
     instance_index = inputs[INSTANCE_INDEX]
 
@@ -218,7 +220,7 @@ def test_metric_is_what_makes_the_field_monotone(base_graph):
     # One batched call for both legs. Stacking x then y makes the halves-matching pair each x with its
     # own y, so every pair keeps the intended separation.
     points = torch.cat([x, y])
-    preconditioned, metric = family.operator_and_metric(graph, points)
+    preconditioned, metric = family.operator_and_preconditioner(graph, points)
     raw = preconditioned * metric
 
     assert monotonicity_violations(raw, points).max() == 0.0

@@ -7,7 +7,7 @@ solves each with ``solve_fn`` (storing the equilibrium under ``equilibrium_cost`
 so it does not collide with the sampled domain point ``.cost`` set by ``model_input``), and caches the
 list in ``instances.pt``. A later read -- ``SolvedInstanceDataset(root)`` with no callables -- just
 reloads the cache. The training script splits the loaded instances into cal / val / test and
-calibrates the streaming sampling range from the calibration equilibria (see ``calibrate_range``).
+calibrates the streaming sampling range from the calibration equilibria (see ``calibrate_ceiling``).
 """
 
 import torch

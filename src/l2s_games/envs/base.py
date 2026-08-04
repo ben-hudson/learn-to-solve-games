@@ -55,19 +55,21 @@ class VariationalInequalityFamily(ABC):
     def operator(self, params, points):
         """Evaluate the VI operator at ``points`` (same shape out). Must be plain-torch."""
 
-    def operator_and_metric(self, params, points):
-        """``(values, metric)``: the operator, plus the diagonal that maps it back to the *raw* field.
+    def operator_and_preconditioner(self, params, points):
+        """``(values, preconditioner_diagonal)``: the operator, plus the diagonal that maps it back to
+        the *raw* field.
 
         Some families return a **preconditioned** operator -- a positive per-coordinate rescaling
         ``M^{-1}`` of an underlying field (see ``pume_traffic``) -- because the raw field is too stiff to
         roll out. That rescaling is not innocuous: a positive per-coordinate reweighting does not
         preserve the sign of ``sum_i dF_i dx_i``, so the preconditioned field can be non-monotone where
         the raw one is monotone. Anything reasoning about monotonicity therefore needs a way back, which
-        is what ``metric`` is: ``metric * values`` is the raw field, so ``metric`` is ``M`` itself.
+        is what the second return is: ``preconditioner_diagonal * values`` is the raw field, so it is
+        ``M`` itself.
 
-        The default is for families whose operator is already the raw field: ``metric`` is all ones.
-        Overriding families must return the metric from the **same** evaluation that produced
-        ``values`` -- recomputing it would double the operator cost, which is the expensive part.
+        The default is for families whose operator is already the raw field: the diagonal is all ones.
+        Overriding families must return it from the **same** evaluation that produced ``values`` --
+        recomputing it would double the operator cost, which is the expensive part.
         """
         values = self.operator(params, points)
         return values, torch.ones_like(values)

@@ -21,7 +21,7 @@ re-solve the true operator there (``trajectory_examples``) -- which is why only 
 second solve.
 
 Everything runs through the existing family seams -- ``model_input`` / ``transform`` / ``collate_fn``
-(conditioning), ``batched_field`` (the batched learned field, real units) or ``operator_and_metric``
+(conditioning), ``batched_field`` (the batched learned field, real units) or ``operator_and_preconditioner``
 (the batched analytic field), ``params_from_batch`` / ``project`` (off the collated batch), ``simulate``
 + ``ALGORITHMS`` (the rollout) -- so they are blind to the concrete representation and work for both the
 flat (RPS/matrix) and graph (traffic) families.
@@ -73,13 +73,13 @@ class RecordedField:
     def __init__(self, family, params):
         self.family = family
         self.params = params
-        self.states, self.values, self.metrics = [], [], []
+        self.states, self.values, self.preconditioner_diagonals = [], [], []
 
     def __call__(self, z):
-        values, metrics = self.family.operator_and_metric(self.params, z)
+        values, preconditioner_diagonal = self.family.operator_and_preconditioner(self.params, z)
         self.states.append(z.detach().clone())
         self.values.append(values)
-        self.metrics.append(metrics)
+        self.preconditioner_diagonals.append(preconditioner_diagonal)
         return values
 
     def groups(self, instances):

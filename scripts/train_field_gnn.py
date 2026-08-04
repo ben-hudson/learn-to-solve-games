@@ -163,24 +163,15 @@ def build_parser():
         "flow residual is well-scaled for the rollout algorithms; --no-precondition uses the raw field",
     )
     p.add_argument("--seed", type=int, default=None, help="global seed")
-    # domain coverage (see PUMEMarkovTrafficEquilibrium.sample_domain): the range is calibrated from the
-    # calibration split's equilibria -- per-edge mean (center) and std (spread) -- and sampled within
-    # --sample_stds sigma of that mean. --equilibrium_margin/--equilibrium_spread are the uncalibrated
-    # fallback only (used when a family is built without a calibrated range, e.g. the sandbox).
+    # domain coverage (see PUMEMarkovTrafficEquilibrium.sample_domain): the per-edge sampling ceiling is
+    # calibrated from the calibration split's equilibria -- --sample_stds sigma above their per-edge mean
+    # (see calibrate_ceiling).
     p.add_argument(
         "--sample_stds",
         type=float,
         default=3.0,
-        help="sigma reach of the per-edge uniform domain box ceiling (reference_equilibrium + "
-        "sample_stds * reference_spread) sample_domain draws uniformly up to",
+        help="sigma above the mean calibration equilibrium that sample_domain's per-edge cost box reaches",
     )
-    p.add_argument(
-        "--equilibrium_margin",
-        type=float,
-        default=2.5,
-        help="uncalibrated fallback: reference-equilibrium ceiling widen",
-    )
-    p.add_argument("--equilibrium_spread", type=float, default=0.2, help="uncalibrated fallback: multiplicative spread")
     # amortization target: 'partial' (default) learns the operator *field* -- a solver still rolls it
     # out (--algos) to reach the equilibrium; 'full' learns the equilibrium *solution* directly,
     # z* = g(params), with no rollout at inference. The same backbone serves both (both predict a
@@ -373,15 +364,12 @@ def main(args):
     cal_inst, val_inst, test_inst = split_instances(
         instances, (args.n_cal_instances, args.n_val_instances, args.n_test_instances)
     )
-    reference_equilibrium, reference_spread = GAMES[args.game].calibrate_range(cal_inst)
     # Family kwargs shared by both factories below. The asymmetric family additionally needs its coupling
     # matrix, which is spliced in per game rather than branched at each construction site.
     family_kwargs = {
         "base_graph": dataset.base_graph,
         "noise_scale": args.noise_scale,
-        "reference_equilibrium": reference_equilibrium,
-        "reference_spread": reference_spread,
-        "n_stds": args.sample_stds,
+        "sampling_ceiling": GAMES[args.game].calibrate_ceiling(cal_inst, args.sample_stds),
         "precondition": args.precondition,
         **(coupling_matrices(dataset.base_graph) if args.game == "asym_pume_traffic" else {}),
     }

@@ -12,9 +12,9 @@ class CountingFamily:
     """Wraps a family, counting the point-evaluations its operator is asked for.
 
     Both entry points are counted, and neither double-counts: whichever the caller enters, the delegate
-    call lands on the *wrapped* family, whose internal hop between ``operator`` and ``operator_and_metric``
+    call lands on the *wrapped* family, whose internal hop between ``operator`` and ``operator_and_preconditioner``
     never re-enters this wrapper. (Families differ in which way that hop goes -- ``pume_traffic``'s
-    ``operator`` delegates to ``operator_and_metric``, the flat families' default does the reverse -- so
+    ``operator`` delegates to ``operator_and_preconditioner``, the flat families' default does the reverse -- so
     counting only one of them would silently miss whole code paths.)
     """
 
@@ -29,9 +29,9 @@ class CountingFamily:
         self.n_evaluations += len(points)
         return self._family.operator(params, points)
 
-    def operator_and_metric(self, params, points):
+    def operator_and_preconditioner(self, params, points):
         self.n_evaluations += len(points)
-        return self._family.operator_and_metric(params, points)
+        return self._family.operator_and_preconditioner(params, points)
 
 
 def take(stream, n):

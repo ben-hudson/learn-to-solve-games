@@ -28,7 +28,7 @@ import pathlib
 import pytest
 import torch
 
-from l2s_games.data import METRIC_DIAGONAL, build_dataset, build_streaming_operator_dataset, split_instances
+from l2s_games.data import PRECONDITIONER_DIAGONAL, build_dataset, build_streaming_operator_dataset, split_instances
 from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
@@ -70,12 +70,10 @@ def traffic():
     torch.manual_seed(0)
     dataset = SolvedInstanceDataset(str(_DATASET_ROOT))
     cal, val, test = split_instances(list(dataset), (2, 1, 1))
-    reference_equilibrium, reference_spread = PUMEMarkovTrafficEquilibrium.calibrate_range(cal)
     factory = functools.partial(
         PUMEMarkovTrafficEquilibrium,
         dataset.base_graph,
-        reference_equilibrium=reference_equilibrium,
-        reference_spread=reference_spread,
+        sampling_ceiling=PUMEMarkovTrafficEquilibrium.calibrate_ceiling(cal),
     )
     _splits, normalizer = build_streaming_operator_dataset(factory, cal, val, test, 1)
     return CountingFamily(factory()), normalizer
@@ -108,7 +106,7 @@ def test_recorded_values_are_the_operator_at_their_own_state(family, normalizer)
     """Every example's target, in real units, is the operator at that example's point and params."""
     stream = expert_stream(family, normalizer)
     for item, target in take(stream, 2 * WINDOW):
-        expected, _metric = family.operator_and_metric(item["params"], item["point"].unsqueeze(0))
+        expected, _metric = family.operator_and_preconditioner(item["params"], item["point"].unsqueeze(0))
         assert torch.allclose(normalizer.inverse_target(target), expected[0], atol=1e-5)
 
 
@@ -116,7 +114,7 @@ def test_metric_maps_the_recorded_target_back_to_the_raw_field(family, normalize
     """``metric_diagonal * target`` is the raw field -- for rps the operator is already raw, so ones."""
     stream = expert_stream(family, normalizer)
     for item, _target in take(stream, WINDOW):
-        assert torch.equal(item[METRIC_DIAGONAL], torch.ones_like(item[METRIC_DIAGONAL]))
+        assert torch.equal(item[PRECONDITIONER_DIAGONAL], torch.ones_like(item[PRECONDITIONER_DIAGONAL]))
 
 
 def test_recorded_states_are_the_trajectory_without_its_endpoint(family, normalizer):

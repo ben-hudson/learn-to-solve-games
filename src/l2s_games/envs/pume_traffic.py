@@ -53,11 +53,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         base_graph,
         noise_scale=0.2,
         noise_type="normal",
-        equilibrium_margin=2.5,
-        equilibrium_spread=0.2,
-        reference_equilibrium=None,
-        reference_spread=None,
-        n_stds=3.0,
+        sampling_ceiling=None,
         operator_counter=None,
         solver_kwargs=None,
         precondition=True,
@@ -71,15 +67,13 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         # Cumulative point-evaluation counter; the no-op LocalCounter default keeps `operator`
         # branch-free (see traffic.MarkovTrafficEquilibrium for the shared-counter streaming setup).
         self.operator_counter = operator_counter or LocalCounter()
-        # Domain-sampling range: reference_equilibrium/spread (calibrated from the calibration equilibria)
-        # center and scale the cost box, else fall back to the shipped reference cost. See sample_domain.
-        if reference_equilibrium is not None and reference_spread is not None:
-            self.reference_equilibrium = torch.as_tensor(reference_equilibrium, dtype=torch.float32)
-            self.reference_spread = torch.as_tensor(reference_spread, dtype=torch.float32)
-        else:
-            self.reference_equilibrium = self.base_graph.Cost * equilibrium_margin
-            self.reference_spread = equilibrium_spread * self.reference_equilibrium
-        self.n_stds = n_stds
+        # Top of the per-edge cost box sample_domain draws over; calibrate it from solved equilibria with
+        # `calibrate_ceiling`, else fall back to the shipped reference cost. See sample_domain.
+        self.sampling_ceiling = (
+            torch.as_tensor(sampling_ceiling, dtype=torch.float32)
+            if sampling_ceiling is not None
+            else self.base_graph.Cost * _UNCALIBRATED_CEILING_MARGIN
+        )
         # The PUME operator backend: builds the per-destination PUMCM demand models + a persistent
         # demand loader once from the (shared) topology; only the per-instance supply is rebuilt per
         # operator call in `build_model`, with this instance's OD threaded into the demand solve per call.
@@ -127,13 +121,12 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         # One demand solve, reused for both the residual and (when preconditioning) the metric floor.
         # E = z(c) - x(c); the per-instance OD is passed here (the shared loader carries a placeholder).
         demand = model.compute_demand(c, initial_states_list=od)
-        supply = model.compute_supply(c)
-        excess = supply - demand
+        excess = model.compute_supply(c) - demand
         if not self.precondition:
             return excess, torch.ones_like(excess)
         # Apply PUME's supply-diagonal metric M^{-1} to the excess supply E, and hand back M itself.
-        metric = self._supply_diagonal_metric(model.supply_operator, c, demand)
-        return metric.apply_inverse(excess), metric.diag
+        preconditioner = self._supply_diagonal_metric(model.supply_operator, c, demand)
+        return preconditioner.apply_inverse(excess), preconditioner.diag
 
     @staticmethod
     def _supply_diagonal_metric(supply_operator, cost, demand):
@@ -158,24 +151,26 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
     def operator(self, params, costs):
         """PUME excess-supply residual ``z(c) - x(c)`` (zero at equilibrium), one row per cost vector.
 
-        Delegates to ``operator_and_metric`` and drops the metric, so the row loop and the evaluation
-        count live in exactly one place -- calling this costs the same as it always did.
+        Delegates to ``operator_and_preconditioner`` and drops the diagonal, so the row loop and the
+        evaluation count live in exactly one place -- calling this costs the same as it always did.
         """
-        return self.operator_and_metric(params, costs)[0]
+        return self.operator_and_preconditioner(params, costs)[0]
 
-    def operator_and_metric(self, params, costs):
-        """``(residuals, metrics)``: the operator plus the diagonal mapping it back to the raw field.
+    def operator_and_preconditioner(self, params, costs):
+        """``(residuals, preconditioner_diagonals)``: the operator plus the diagonal mapping it back to
+        the raw field.
 
         ``costs`` is ``[B, E]`` (one cost vector per instance) or a bare ``[E]`` vector (a batch of
         one). When ``params``' per-edge attrs are rank-2 (``[B, E]``), each cost row is a distinct
         instance (the expert-rollout path); when rank-1 they share one instance (the many-points-per-
-        instance dataset path), so one ``PUMEModel`` is reused across the rows. PUME evaluates one cost
-        vector at a time, so the batch is a Python loop -- the heavy PUMCM structure is built once in
-        ``__init__``; only the supply/demand wrapper is per row.
+        instance dataset path), so one ``PUMEModel`` is built and reused across the rows. PUME evaluates
+        one cost vector at a time, so the batch is a Python loop -- the heavy PUMCM structure is built
+        once in ``__init__``; only the supply/demand wrapper is per instance.
 
-        ``metrics`` matches ``residuals``' shape and satisfies ``metrics * residuals == raw excess
-        supply``; it falls out of the demand solve the residual already needs, so it is free (see
-        ``VariationalInequalityFamily.operator_and_metric`` for what consumes it).
+        ``preconditioner_diagonals`` matches ``residuals``' shape and satisfies
+        ``preconditioner_diagonals * residuals == raw excess supply``; it falls out of the demand solve
+        the residual already needs, so it is free (see
+        ``VariationalInequalityFamily.operator_and_preconditioner`` for what consumes it).
         """
         costs = torch.as_tensor(costs, dtype=torch.float32)
         device = costs.device  # PUME solves on CPU; hand the result back on the caller's device
@@ -219,24 +214,22 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         return batch["cost"]
 
     @staticmethod
-    def calibrate_range(instances):
-        """Per-edge ``(reference_equilibrium, reference_spread)`` from a set of solved instances -- the
-        per-edge mean and std of their cached ``equilibrium_cost``. Feed the pair into ``__init__`` so
-        ``sample_domain`` draws around where the equilibria actually are."""
+    def calibrate_ceiling(instances, n_stds=3.0):
+        """The per-edge ``sampling_ceiling`` from a set of solved instances: ``n_stds`` sigma above the
+        per-edge mean of their cached ``equilibrium_cost``. Feed it into ``__init__`` so ``sample_domain``
+        draws over the segment a rollout actually traverses rather than a guessed box."""
         eq = torch.stack([instance.equilibrium_cost.float() for instance in instances])  # [N, E]
-        return eq.mean(dim=0), eq.std(dim=0)
+        return eq.mean(dim=0) + n_stds * eq.std(dim=0)
 
     def sample_domain(self, graph, n):
-        """Feasible cost points drawn uniformly per edge over the calibrated box.
+        """Feasible cost points drawn uniformly per edge over ``[free_flow_time, sampling_ceiling]``.
 
-        Each edge's cost is drawn uniformly in ``[free_flow_time, ceiling]`` with per-edge
-        ``ceiling = reference_equilibrium + n_stds * reference_spread``, spanning the segment the
-        rollout traverses from the free-flow-time start up to (a few sigma above) the equilibrium.
-        ``hi`` is floored at ``free_flow_time`` so every sample is feasible (``>= free_flow_time``).
+        The ceiling spans the segment the rollout traverses -- from the free-flow-time start up to (a few
+        sigma above) the equilibrium -- and is floored at ``free_flow_time`` so every sample is feasible
+        (``>= free_flow_time``).
         """
         fft = graph.free_flow_time
-        ceiling = self.reference_equilibrium + self.n_stds * self.reference_spread
-        hi = torch.maximum(ceiling, fft)
+        hi = torch.maximum(self.sampling_ceiling, fft)
         return fft + torch.rand(n, graph.num_edges) * (hi - fft)
 
     def model_input(self, graph, cost):

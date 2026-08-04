@@ -26,12 +26,12 @@ from torch.utils.data import Dataset, IterableDataset, default_collate, random_s
 # Item key for the per-coordinate diagonal mapping the operator target back to the raw field; see
 # examples_at_points. Lives here (not in monotonicity.py, its consumer) so the data layer owns its own
 # schema and nothing in the pipeline imports the constraint code.
-METRIC_DIAGONAL = "metric_diagonal"
+PRECONDITIONER_DIAGONAL = "preconditioner_diagonal"
 # Item key for the index of the example's instance within its source's instance set -- stable across
 # epochs, and what the monotonicity constraint groups same-instance points by. Diagnostics-only for the
 # model (the backbones read only feats + structure); it rides along on the collated batch. Lives here
-# with METRIC_DIAGONAL for the same reason -- and because group_examples sets it, so a home in a module
-# that imports this one would be a cycle.
+# with PRECONDITIONER_DIAGONAL for the same reason -- and because operator_examples sets it, so a home in
+# a module that imports this one would be a cycle.
 INSTANCE_INDEX = "instance_index"
 
 
@@ -244,20 +244,20 @@ def sample_group(family, params, n):
 def group_examples(family, group, index=None, order=None):
     """Iterate a ``SolvedGroup`` into raw ``(model_input, target)`` examples, one per point.
 
-    Each item is tagged with ``METRIC_DIAGONAL``: the per-coordinate diagonal that maps the operator's
-    value back to the family's **raw** (unpreconditioned) field, i.e. ``metric_diagonal * target`` (all
-    ones for families that are already raw). It rides along for the monotonicity constraint, which must
-    be stated about the raw field -- the preconditioned one is not monotone. ``index``, when given, adds
-    the ``INSTANCE_INDEX`` tag. Both are set by key access, so this works for a PyG ``Data`` (traffic)
-    and a plain dict (flat games) alike.
+    Each item is tagged with ``PRECONDITIONER_DIAGONAL``: the per-coordinate diagonal that maps the
+    operator's value back to the family's **raw** (unpreconditioned) field, i.e.
+    ``preconditioner_diagonal * target`` (all ones for families that are already raw). It rides along for
+    the monotonicity constraint, which must be stated about the raw field -- the preconditioned one is
+    not monotone. ``index``, when given, adds the ``INSTANCE_INDEX`` tag. Both are set by key access, so
+    this works for a PyG ``Data`` (traffic) and a plain dict (flat games) alike.
 
     ``order`` picks which point comes out when: the cached sources reshuffle it per pass so the
     monotonicity pairs -- matched by halves within an instance -- vary without any new solves.
     """
     order = range(len(group.points)) if order is None else order
     for j in order:
-        item = family.model_input(group.params, group.points[j])
-        item[METRIC_DIAGONAL] = group.metrics[j]
+        item = family.model_input(evaluations.params, evaluations.points[j])
+        item[PRECONDITIONER_DIAGONAL] = evaluations.preconditioner_diagonal[j]
         if index is not None:
             item[INSTANCE_INDEX] = torch.tensor(index)
         yield item, group.targets[j]

@@ -360,7 +360,7 @@ def test_operator_root_at_equilibrium(family, base_equilibrium):
 def test_equilibrium_differs_from_the_symmetric_one(base_graph, family, base_equilibrium):
     """The asymmetric equilibrium is a different point, which is why it needs its own solved dataset.
 
-    The cached ``equilibrium_cost`` sets the sampling range (``calibrate_range``) and the ``rel_dist``
+    The cached ``equilibrium_cost`` sets the sampling range (``calibrate_ceiling``) and the ``rel_dist``
     metrics, so reusing a symmetric cache would calibrate around the wrong solution.
     """
     symmetric = make_game(

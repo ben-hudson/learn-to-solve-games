@@ -108,11 +108,7 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         base_graph,
         noise_scale=0.2,
         noise_type="normal",
-        equilibrium_margin=2.5,
-        equilibrium_spread=0.2,
-        reference_equilibrium=None,
-        reference_spread=None,
-        n_stds=3.0,
+        sampling_ceiling=None,
         operator_counter=None,
     ):
         self.base_graph = _canonicalize(base_graph)
@@ -122,20 +118,17 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         # LocalCounter default keeps `operator` branch-free; a SharedCounter injected via the streaming
         # family_factory scopes the total to training-data generation (see operator_count.py).
         self.operator_counter = operator_counter or LocalCounter()
-        # Domain sampling must span the whole path the rollout traverses -- from the free-flow-time
-        # start up to the equilibrium. ``reference_equilibrium`` (per-edge mean of the calibration
-        # equilibria) and ``reference_spread`` (their per-edge std) center and scale that range; they
-        # are calibrated once in the main process (see ``calibrate_range``) and passed in so every
-        # streaming worker shares the same range. See sample_domain. When they are not supplied (the
-        # sandbox / uncalibrated path), fall back to anchoring the top of the range at the base
-        # network's shipped reference equilibrium cost (``Cost``), widened by ``equilibrium_margin``.
-        if reference_equilibrium is not None and reference_spread is not None:
-            self.reference_equilibrium = torch.as_tensor(reference_equilibrium, dtype=torch.float32)
-            self.reference_spread = torch.as_tensor(reference_spread, dtype=torch.float32)
-        else:
-            self.reference_equilibrium = self.base_graph.Cost * equilibrium_margin
-            self.reference_spread = equilibrium_spread * self.reference_equilibrium
-        self.n_stds = n_stds
+        # Domain sampling must span the whole path the rollout traverses -- from the free-flow-time start
+        # up to (a few sigma above) the equilibrium -- so ``sampling_ceiling`` is the top of that per-edge
+        # box. Calibrate it once from solved equilibria (see ``calibrate_ceiling``) and pass it in, so
+        # every streaming worker shares the same range. When it is not supplied (the sandbox /
+        # uncalibrated path), fall back to the base network's shipped reference cost (``Cost``) widened by
+        # ``_UNCALIBRATED_CEILING_MARGIN``. See sample_domain.
+        self.sampling_ceiling = (
+            torch.as_tensor(sampling_ceiling, dtype=torch.float32)
+            if sampling_ceiling is not None
+            else self.base_graph.Cost * _UNCALIBRATED_CEILING_MARGIN
+        )
         self.dest_dim = -2
         # ift=True gives exact implicit-function-theorem gradients through the value/flow linear
         # solves. (The analytic operator's full Jacobian is blocked by a NaN in route_choice's
@@ -223,31 +216,27 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return batch["cost"]
 
     @staticmethod
-    def calibrate_range(instances):
-        """Per-edge ``(reference_equilibrium, reference_spread)`` from a set of solved instances.
+    def calibrate_ceiling(instances, n_stds=3.0):
+        """The per-edge ``sampling_ceiling`` from a set of solved instances.
 
         Treats the instances' equilibria (``instance.equilibrium_cost``, solved offline by
-        ``PUMESolver`` and cached in the dataset) as an empirical distribution: the center is the
-        per-edge mean and the spread is the per-edge std across instances. Feed the pair into
-        ``__init__`` so ``sample_domain`` draws around where the equilibria actually are.
+        ``PUMESolver`` and cached in the dataset) as an empirical distribution, and puts the ceiling
+        ``n_stds`` sigma above its per-edge mean. Feed the result into ``__init__`` so ``sample_domain``
+        draws around where the equilibria actually are.
         """
         eq = torch.stack([instance.equilibrium_cost.float() for instance in instances])  # [N, E]
-        return eq.mean(dim=0), eq.std(dim=0)
+        return eq.mean(dim=0) + n_stds * eq.std(dim=0)
 
     def sample_domain(self, graph, n):
-        """Feasible cost points drawn uniformly per edge over the calibrated domain box.
+        """Feasible cost points drawn uniformly per edge over ``[free_flow_time, sampling_ceiling]``.
 
-        Each edge's cost is drawn uniformly in ``[free_flow_time, ceiling]``, where the per-edge
-        ``ceiling = reference_equilibrium + n_stds * reference_spread`` is calibrated from the
-        calibration equilibria (per-edge mean ``reference_equilibrium`` and std ``reference_spread``;
-        see ``calibrate_range``). This spans the whole segment the rollout traverses -- from the
-        free-flow-time start up to (a few sigma above) the equilibrium -- as a flat box rather than
-        the earlier equilibrium-ball-plus-reach sampler. ``hi`` is floored at ``free_flow_time`` so
-        the range is never negative; every sample is feasible by construction (``>= free_flow_time``).
+        A flat box (rather than the earlier equilibrium-ball-plus-reach sampler) spanning the whole
+        segment the rollout traverses -- from the free-flow-time start up to (a few sigma above) the
+        equilibrium, see ``calibrate_ceiling``. ``hi`` is floored at ``free_flow_time`` so the range is
+        never negative; every sample is feasible by construction (``>= free_flow_time``).
         """
         fft = graph.free_flow_time
-        ceiling = self.reference_equilibrium + self.n_stds * self.reference_spread
-        hi = torch.maximum(ceiling, fft)
+        hi = torch.maximum(self.sampling_ceiling, fft)
         return fft + torch.rand(n, graph.num_edges) * (hi - fft)
 
     def model_input(self, graph, cost):
