@@ -1,22 +1,43 @@
 """
 generate_traffic_dataset.py
 
-Pre-compute and cache a dataset of noised SiouxFalls instances, in the two stages
-``datasets.EquilibriumDataset`` splits its work into -- because their costs differ by ~1800x:
+Pre-compute and cache a dataset of noised SiouxFalls instances, in the two stages the dataset classes split
+their work into -- because their costs differ by ~1800x:
 
-- **solving** every instance to user equilibrium (~2.5 s each), cached as the *raw* artifact, and
-- **evaluating the operator** at cost points per instance (~1.4 ms each), cached as the *processed* one.
+- **solving** every instance to user equilibrium (~2.5 s each), cached as the *raw* artifact by
+  ``datasets.EquilibriumDataset``, and
+- **evaluating the operator** at cost points per instance (~1.4 ms each), cached as the *processed* one by
+  whichever ``operator_datasets`` subclass ``--operator_dataset`` names.
 
     python scripts/generate_traffic_dataset.py 1024 data/sioux_falls/solved \
-        --operator-dataset uniform --points_per_instance 32
+        --operator_dataset uniform --points_per_instance 32
 
-The staging is why this is one command rather than two. Re-running with different ``process()``-stage
-arguments and ``--force-reload`` regenerates the operator examples over the **existing solves** -- seconds
-rather than the ~40 minutes a re-solve would cost. Only changing the solve stage (``n_instances``, the
-solver tolerances) requires deleting ``raw/``.
+The staging is why this is one command rather than two, and it buys two things. Adding a **different** point
+source to an existing root costs only the cheap stage and needs no flag at all -- it is a different processed
+file, so it is simply missing:
 
-``--operator-dataset none`` gives a solve-only root, for the fully-amortized model (which needs the
-equilibria and nothing else) or for the tuning and probe scripts.
+    python scripts/generate_traffic_dataset.py 1024 data/sioux_falls/solved \
+        --operator_dataset expert --n_steps 500        # same root, same solves, no --force_reload
+
+Both sources then sit in the same root over identical instances and an identical calibration box, which is
+what makes uniform-vs-expert a clean comparison. ``--force_reload`` is for regenerating *one* source after
+changing its own knobs (``--points_per_instance``, ``--n_steps``); it rewrites only that source's file.
+
+Changing the **solve** stage -- ``n_instances``, ``--n_cal_instances``, the solver tolerances -- requires
+deleting ``raw/`` instead.
+
+Every operator root also carries a *disjoint* set of ``--n_cal_instances`` solved instances
+(``raw/cal_instances.pt``) whose equilibria calibrate the cost box points are drawn over. They never enter the
+dataset, so no train/val/test split can contain one and the box is independent of any held-out instance by
+construction.
+
+``--operator_dataset none`` gives a solve-only root, for the fully-amortized model (which needs the
+equilibria and nothing else) or for the tuning and probe scripts. But note that any root serves that purpose
+-- constructing a plain ``EquilibriumDataset`` on a root with operator examples reads raw and ignores them --
+while the reverse costs the solves again: a solve-only root has no calibration set, so adding a point source
+to one re-runs the whole ``download()`` (reproducible under the same ``--seed``; see
+``operator_datasets.OperatorDataset`` for why there is deliberately no partial re-run). When in doubt,
+generate an operator root.
 
 ``--game`` picks which operator the equilibria are solved for, and the choice is **load-bearing**: the
 asymmetric family's equilibrium is a different point, and the cached ``equilibrium_cost`` is both the
@@ -25,7 +46,7 @@ sampling-ceiling calibration and the ``rel_dist`` reference during training. It 
 per (game, epsilon, kappa):
 
     python scripts/generate_traffic_dataset.py 1024 data/sioux_falls/solved_asym_eps0.05 \
-        --game asym_pume_traffic --epsilon 0.05 --operator-dataset expert --n_steps 500
+        --game asym_pume_traffic --epsilon 0.05 --operator_dataset expert --n_steps 500
 
 This script is also the **only** place the asymmetric interaction matrix ``A`` is built. It is stored on the
 dataset's ``base_graph``, so the dataset carries the operator its equilibria were solved for and training
@@ -36,7 +57,6 @@ Requires the ``pume`` / ``pumcm`` packages (imported lazily by ``l2s_games.pume_
 """
 
 import argparse
-import functools
 
 import lightning as L
 
@@ -44,21 +64,30 @@ from l2s_games.datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.asym_pume_traffic import build_interaction_matrix, build_rotation_matrix
 from l2s_games.envs.traffic import load_sioux_falls_base_graph
-from l2s_games.operator_datasets import POINT_SOURCES
+from l2s_games.operator_datasets import OPERATOR_DATASETS, ExpertOperatorDataset, UniformOperatorDataset
 
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     p.add_argument("n_instances", type=int, help="number of noised instances to generate and solve")
     p.add_argument("root", type=str, help="dataset root (holds raw/ and processed/)")
+    p.add_argument(
+        "--n_cal_instances",
+        type=int,
+        default=128,
+        help="extra instances solved into a *disjoint* calibration set whose equilibria set the sampling "
+        "ceiling. Disjoint, so no train/val/test split can contain one and the box never depends on a "
+        "held-out equilibrium. A download()-stage argument: changing it means deleting raw/. Unused under "
+        "--operator_dataset none, which is why such a root cannot gain a point source without a re-solve",
+    )
     # --- process() stage: the operator examples, cheap and regenerable over the existing solves ------
     p.add_argument(
-        "--operator-dataset",
-        choices=["none", *POINT_SOURCES],
+        "--operator_dataset",
+        choices=["none", *OPERATOR_DATASETS],
         default="uniform",
         help="where each instance's cost points come from: 'uniform' over the calibrated cost box, "
         "'expert' along a converging rollout of the true operator (plus the equilibrium it reaches), or "
-        "'none' for a solve-only root",
+        "'none' for a solve-only root. Each writes its own processed file, so a root can hold both",
     )
     p.add_argument(
         "--points_per_instance",
@@ -66,13 +95,6 @@ def build_parser():
         default=32,
         help="cost points per instance ('uniform' only -- the expert's count follows from --n_steps and "
         "the algorithm's field evaluations per step)",
-    )
-    p.add_argument(
-        "--n_cal_instances",
-        type=int,
-        default=128,
-        help="leading instances whose equilibria calibrate the sampling ceiling. Leading, so that a "
-        "consumer splitting train/val/test with train first never calibrates on a held-out equilibrium",
     )
     p.add_argument(
         "--sample_stds",
@@ -87,13 +109,14 @@ def build_parser():
     p.add_argument("--h", type=float, default=0.1, help="expert rollout step size")
     p.add_argument("--n_steps", type=int, default=500, help="expert rollout iterations")
     p.add_argument(
-        "--force-reload",
+        "--force_reload",
         action="store_true",
-        help="regenerate the operator examples, reusing the cached solves (PyG skips download() whenever "
-        "raw/ exists, so this only re-runs the cheap stage)",
+        help="regenerate *this* source's operator examples, reusing the cached solves (PyG skips download() "
+        "whenever raw/ exists, so this only re-runs the cheap stage, and only for this source's file). Not "
+        "needed to *add* a source -- its file is simply missing",
     )
     p.add_argument(
-        "--data-root",
+        "--data_root",
         type=str,
         default="data/sioux_falls",
         help="root location of the SiouxFalls_*.tntp files (local directory or URL)",
@@ -121,18 +144,18 @@ def build_parser():
         "so this is the knob for a rotation-dominated field; compare against max f' ~ 46. See "
         "envs/asym_pume_traffic.py. Both matrices are built here only and stored with the dataset",
     )
-    p.add_argument("--noise-scale", type=float, default=0.2, help="multiplicative attribute noise")
-    p.add_argument("--noise-type", choices=["normal", "uniform"], default="normal", help="attribute noise type")
+    p.add_argument("--noise_scale", type=float, default=0.2, help="multiplicative attribute noise")
+    p.add_argument("--noise_type", choices=["normal", "uniform"], default="normal", help="attribute noise type")
     p.add_argument("--seed", type=int, default=0, help="global seed")
     # PUMESolver tolerances (see l2s_games/pume_solver.py)
-    p.add_argument("--inner-max-iter", type=int, default=3000, help="inner modified-policy-iteration max iters")
-    p.add_argument("--inner-tol", type=float, default=1e-7, help="inner solver tolerance")
+    p.add_argument("--inner_max_iter", type=int, default=3000, help="inner modified-policy-iteration max iters")
+    p.add_argument("--inner_tol", type=float, default=1e-7, help="inner solver tolerance")
     # 8000 rather than PUMESolver's 500: the outer iteration descends monotonically but slowly, so a hard
     # instance runs out of budget mid-descent (converged=False, "Maximum iterations reached") and caches a
     # cost that is not an equilibrium. Easy instances stop early, so a generous cap costs nothing.
-    p.add_argument("--outer-max-iter", type=int, default=8000, help="outer equilibrium-iteration max iters")
+    p.add_argument("--outer_max_iter", type=int, default=8000, help="outer equilibrium-iteration max iters")
     p.add_argument(
-        "--initial-stepsize",
+        "--initial_stepsize",
         type=float,
         default=2e-1,
         help="aGRAAL initial step size; 2e-1 converges ~3x faster than 5e-2 on both operators (see "
@@ -145,7 +168,7 @@ def build_parser():
     # 1e-1 -> 0.22 / 1.1e-2,  1e-2 -> 2.1e-2 / 1.0e-3,  1e-3 -> 9.2e-4 / 3.5e-5,  1e-4 -> 1.4e-4 / 5.3e-6.
     # 1e-3 costs ~2.5 s/instance against ~1.2 s at 1e-1 -- worth it for a one-time offline job. The
     # asymmetric operator converges to the same residuals in the same time, so this is not game-specific.
-    p.add_argument("--outer-tol", type=float, default=1e-3, help="outer equilibrium tolerance")
+    p.add_argument("--outer_tol", type=float, default=1e-3, help="outer equilibrium tolerance")
     return p
 
 
@@ -183,38 +206,29 @@ def main(args):
     # (a mismatched --game would condition the model on the wrong operator silently). Rides on base_graph
     # like the coupling matrices, and is stripped by model_input -- see traffic._DROPPED_ATTRS.
     family.base_graph.game = args.game
-    # The process() stage: attach each instance's operator examples. Everything the point source needs is
-    # bound here except the instances themselves, which it receives *solved* so it can calibrate its own
-    # sampling ceiling from their equilibria (see operator_datasets.POINT_SOURCES).
-    evaluate_fn = None
-    if args.operator_dataset != "none":
-        point_args = (
-            {"algo": args.algo, "h": args.h, "n_steps": args.n_steps}
-            if args.operator_dataset == "expert"
-            else {"points_per_instance": args.points_per_instance}
-        )
-        evaluate_fn = functools.partial(
-            POINT_SOURCES[args.operator_dataset],
-            game=args.game,
-            base_graph=family.base_graph,
-            n_cal=args.n_cal_instances,
-            n_stds=args.sample_stds,
-            **point_args,
-            **couplings,
-        )
-    dataset = EquilibriumDataset(
-        args.root,
+    # The download() stage, identical whichever point source is layered on top: every root gets the same
+    # solved instances. The point-source classes derive their own (calibrated) family from base_graph, so
+    # neither --game nor the couplings are threaded into them.
+    solve_kwargs = dict(
         base_graph=family.base_graph,
         sample_fn=family.sample_params,
         solve_fn=family.solver.solve,
         n_instances=args.n_instances,
-        evaluate_fn=evaluate_fn,
         force_reload=args.force_reload,
     )
-    summary = f"{len(dataset)} solved instances at {args.root}"
+    operator_kwargs = dict(n_cal_instances=args.n_cal_instances, n_stds=args.sample_stds, **solve_kwargs)
+    # The process() stage: which class we construct decides which processed file gets written, and each one
+    # states only its own knobs.
+    if args.operator_dataset == "none":
+        dataset = EquilibriumDataset(args.root, **solve_kwargs)
+    elif args.operator_dataset == "uniform":
+        dataset = UniformOperatorDataset(args.root, points_per_instance=args.points_per_instance, **operator_kwargs)
+    else:
+        dataset = ExpertOperatorDataset(args.root, algo=args.algo, h=args.h, n_steps=args.n_steps, **operator_kwargs)
+    summary = f"{dataset.len()} solved instances at {args.root}"
     if args.operator_dataset != "none":
-        points = dataset[0].points.shape[0]
-        summary += f", each with {points} {args.operator_dataset} operator examples ({len(dataset) * points} total)"
+        points = dataset.points_per_instance
+        summary += f", each with {points} {args.operator_dataset} operator examples ({len(dataset)} total)"
     print(f"generated {summary}")
 
 

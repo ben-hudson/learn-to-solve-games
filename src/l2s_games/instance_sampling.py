@@ -2,7 +2,7 @@
 
 Sits between the two extremes the pipeline already has: ``UniformSampledOperatorStream`` (see
 ``data.py``) draws a **fresh** instance every step, so the model never sees a parametrization twice,
-while the fixed ``OperatorDataset`` splits freeze both the instance *and* the point.
+while the fixed ``LazyOperatorDataset`` splits freeze both the instance *and* the point.
 ``FixedInstanceOperatorStream`` pins the *instances* to a set of ``n`` drawn once, but keeps the point
 distribution identical to the uniform stream's (a fresh ``sample_domain`` draw per visit) -- the knob
 for asking how many distinct parametrizations amortization actually needs, with the point sampling

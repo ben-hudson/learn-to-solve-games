@@ -29,8 +29,9 @@ def solved_traffic_root(root, n_instances=4, game="pume_traffic"):
     """A small ``EquilibriumDataset`` solved fresh into ``root``, or a skip if the TNTP files are absent.
 
     Mirrors what ``scripts/generate_traffic_dataset.py`` does, including recording ``game`` on the base
-    graph so a reader derives its family from the data. No ``evaluate_fn``, so the instances carry only
-    their equilibria -- callers that want operator examples pass a point source themselves.
+    graph so a reader derives its family from the data. The base class attaches no operator examples (and
+    solves no calibration set), so the instances carry only their equilibria -- callers that want examples
+    construct one of the ``operator_datasets`` classes instead.
     """
     if not _DATA_ROOT.exists():
         pytest.skip(f"Sioux Falls TNTP data not found at {_DATA_ROOT}")

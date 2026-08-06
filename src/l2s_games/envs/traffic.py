@@ -55,9 +55,9 @@ _UNCALIBRATED_CEILING_MARGIN = 4.0
 #     off the solver, so the model never needs them -- and stacking one would add an ``[B, E, E]`` tensor per
 #     batch.
 #   - ``points`` / ``targets`` / ``preconditioner_diagonal``, one instance's whole block of evaluated points
-#     as stored by ``datasets.EquilibriumDataset``. ``OperatorExamples`` reads them off the graph to rebuild a
-#     single example, so by the time ``model_input`` runs they are spent -- and stacking them would put every
-#     *other* point of the instance into the batch alongside the one being trained on.
+#     as stored by ``operator_datasets.OperatorDataset``, whose ``__getitem__`` reads them off the graph to
+#     rebuild a single example, so by the time ``model_input`` runs they are spent -- and stacking them would
+#     put every *other* point of the instance into the batch alongside the one being trained on.
 #   - ``game``, the VI family's registry name, so a dataset root identifies the operator it was built with
 #     rather than relying on a matching command-line flag (see ``datasets.EquilibriumDataset``).
 # The general rule: anything carried on the graph for persistence or provenance rather than for the model
@@ -235,6 +235,15 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         trains on. Feasible by construction (``>= free_flow_time``); ``project`` still clamps.
         """
         return batch["cost"]
+
+    def reference_equilibrium(self, batch):
+        """Each instance's own solved ``equilibrium_cost``, ``[B, E]``.
+
+        Survives ``model_input`` and ``collate_fn`` (it is not in ``_DROPPED_ATTRS``, and every tensor
+        attribute is stacked), so the batch already carries it -- no threading required. ``.float()``
+        because ``PUMESolver`` returns float64.
+        """
+        return batch["equilibrium_cost"].float()
 
     @staticmethod
     def calibrate_ceiling(instances, n_stds=3.0):

@@ -66,18 +66,19 @@ class FieldRolloutCallback(L.Callback):
     callback runs one algorithm; compose a list to sweep several, each logging
     ``val/{algo}/{residual,eq_dist}``.
 
-    ``equilibrium`` is the reference ``z*`` for ``eq_dist``. It defaults to the origin (the
-    Nash-centered chart's equilibrium for the matrix-game scope); the traffic setting will pass its
-    pre-computed per-instance equilibria as a tensor.
+    The reference ``z*`` for ``eq_dist`` comes from the family's ``reference_equilibrium`` seam rather than
+    from a constructor argument: for traffic it is each instance's own cached ``equilibrium_cost``, which the
+    collated batch already carries, and for the Nash-centered matrix-game charts it is the origin. It used to
+    be a constructor default of ``0.0`` that no caller ever overrode, so ``eq_dist`` was silently reporting
+    ``||z_end||`` on the traffic families.
     """
 
-    def __init__(self, family, algo, n_steps, h, equilibrium=0.0):
+    def __init__(self, family, algo, n_steps, h):
         super().__init__()
         self.family = family
         self.algo = algo
         self.n_steps = n_steps
         self.h = h
-        self.equilibrium = equilibrium
 
     def on_validation_batch_end(self, trainer, pl_module, outputs, batch, batch_idx, dataloader_idx=0):
         inputs, _ = batch
@@ -87,7 +88,8 @@ class FieldRolloutCallback(L.Callback):
         # consensus' torch.func.grad manages its own grad tracking, so the ambient no-grad is fine;
         # params stay out of autograd (avoids the flash-attention grad-mask kernel error).
         endpoint = simulate(lambda z: -field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project)[-1]
-        _log_equilibrium_metrics(pl_module, self.family, inputs, endpoint, self.algo, self.equilibrium)
+        equilibrium = self.family.reference_equilibrium(inputs)
+        _log_equilibrium_metrics(pl_module, self.family, inputs, endpoint, self.algo, equilibrium)
 
 
 class SolutionPredictionCallback(L.Callback):

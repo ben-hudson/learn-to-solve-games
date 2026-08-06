@@ -1,28 +1,24 @@
-"""On-disk cache of traffic instances solved to equilibrium, optionally with operator examples attached.
+"""On-disk cache of traffic instances solved to equilibrium -- the expensive stage, and nothing else.
 
-Two stages, mapped onto PyG's raw/processed split because their costs differ by ~1800x:
+``download()`` draws instances and **solves** each to user equilibrium (``solve_fn``, ~2.5 s per instance),
+storing the result under ``equilibrium_cost`` / ``equilibrium_flow`` -- names chosen so they do not collide
+with the sampled domain point ``.cost`` that ``model_input`` sets. It writes two raw files:
 
-- ``download()`` draws ``n_instances`` noised instances and **solves** each to user equilibrium
-  (``solve_fn``, ~2.5 s per instance), storing the result under ``equilibrium_cost`` /
-  ``equilibrium_flow`` -- names chosen so they do not collide with the sampled domain point ``.cost`` that
-  ``model_input`` sets. This is the expensive artifact, and it is genuinely *raw*: everything downstream is
-  derived from it.
-- ``process()`` optionally attaches **operator examples** to each instance -- the cost points a field model
-  trains on plus the operator's value there (~1.4 ms per point). Injected as ``evaluate_fn``; omit it and
-  the instances pass through untouched.
+- ``base_graph.pt`` -- the canonical graph, unsolved, carrying ``game`` and the coupling matrices.
+- ``instances.pt`` -- the dataset's solved instances. **The only ones a consumer ever splits.**
 
-That staging is the point rather than an accident of the API. ``_download`` skips whenever the raw files
-exist and *ignores* ``force_reload``, while ``_process`` honours it -- so changing how many points to draw,
-or switching from uniformly-sampled points to expert-rollout ones, regenerates the examples and **reuses the
-solves**. Had both lived in ``process()``, every such change would re-pay the solving.
+This class deliberately defines **no** ``process()``. PyG's ``has_process`` is
+``overrides_method(cls, 'process')``, so it is ``False`` here and ``_process()`` never runs -- no ``processed/``
+directory, no ``pre_transform.pt``, nothing written. That is the point: ``instances.pt`` already *is* the solved
+instances with no operator examples attached, so a processed pass-through file would be a byte-identical second
+copy of it. ``operator_datasets.OperatorDataset`` extends ``download()`` with a disjoint calibration set and
+its subclasses add a ``process()`` (hence a processed file) each, one per point source, over the same
+``instances.pt`` -- so both sources can be built from one set of solves and describe identical instances,
+equilibria and calibration box.
 
-It also splits the arguments by stage, which is how to read the constructor: ``sample_fn`` / ``solve_fn`` /
-``n_instances`` build the raw artifact; ``evaluate_fn`` derives the processed one. A later read --
-``EquilibriumDataset(root)`` with no callables -- just reloads.
-
-Consumers pick the stage they need. The field model wants examples, so it wraps the processed instances in
-``operator_datasets.OperatorExamples``. The solution model wants only equilibria, so it reads
-``raw/instances.pt`` and never loads the (much larger) example tensors at all.
+Consumers pick the stage they need. The field model wants examples, so it constructs one of those subclasses.
+Anything that wants only equilibria -- the solution model, the tuning scripts -- constructs *this* class, which
+reads raw and writes nothing.
 
 Two invariants worth stating, because both were once violated:
 
@@ -41,19 +37,15 @@ import tqdm
 
 
 class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
-    """Noised traffic instances solved to equilibrium, optionally carrying operator examples.
+    """Noised traffic instances solved to equilibrium. Raw only -- see the module docstring.
 
     Args:
-        root: directory for the raw (``base_graph.pt``, ``instances.pt``) and processed
-            (``operator_examples.pt``) caches.
+        root: directory for the raw caches (``base_graph.pt``, ``instances.pt``).
         base_graph: canonical graph to noise instances from. Cached as-is: unsolved, but carrying the
-            asymmetric coupling matrices and ``game`` (see the module docstring).
+            asymmetric coupling matrices and ``game``.
         sample_fn: zero-arg callable returning a fresh noised instance (e.g. ``family.sample_params``).
         solve_fn: callable ``instance -> (cost, flow)`` equilibrium solver (e.g. ``PUMESolver.solve``).
-        n_instances: how many instances to draw and solve.
-        evaluate_fn: optional ``instances -> [OperatorEvaluations]``, one per instance, called with the
-            **solved** instances -- so it can calibrate its own sampling range from their equilibria (see
-            ``operator_datasets.POINT_SOURCES``). Omit for a solve-only dataset.
+        n_instances: how many instances to draw and solve into the dataset.
         quiet: suppress the progress bars.
         **kwargs: forwarded to ``InMemoryDataset.__init__``.
     """
@@ -65,7 +57,6 @@ class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
         sample_fn=None,
         solve_fn=None,
         n_instances=None,
-        evaluate_fn=None,
         quiet=False,
         **kwargs,
     ):
@@ -73,14 +64,13 @@ class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
         self.sample_fn = sample_fn
         self.solve_fn = solve_fn
         self.n_instances = n_instances
-        self.evaluate_fn = evaluate_fn
         self.quiet = quiet
 
-        # super().__init__ runs download()/process() if the respective caches are missing; after it
-        # returns both are guaranteed to exist, so we can load them.
+        # super().__init__ runs download() (and, in a subclass, process()) if their caches are missing;
+        # after it returns the raw files are guaranteed to exist.
         super().__init__(root, **kwargs)
-        self.load(self.processed_paths[0])
-        self.base_graph = torch.load(self.raw_paths[0], weights_only=False)
+        self.base_graph = self.raw_base_graph()
+        self.load_instances()
 
     @property
     def raw_file_names(self):
@@ -88,7 +78,9 @@ class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return ["operator_examples.pt"]
+        # No processed artifact: this class defines no process(), so PyG never creates one. Declared as an
+        # empty list purely so processed_paths is [] rather than the inherited NotImplementedError.
+        return []
 
     def download(self):
         """Draw and solve the instances -- the expensive stage, cached so nothing below re-pays it."""
@@ -97,24 +89,36 @@ class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
         )
         assert self.n_instances is not None, "n_instances is required to solve a fresh dataset"
         torch.save(self.base_graph, self.raw_paths[0])
-        progress = range(self.n_instances) if self.quiet else tqdm.trange(self.n_instances, desc="solving")
+        torch.save(self._solve(self.n_instances, "solving"), self.raw_paths[1])
+
+    def _solve(self, n, desc):
+        """``n`` freshly drawn instances, each solved to equilibrium in place."""
+        progress = range(n) if self.quiet else tqdm.trange(n, desc=desc)
         instances = []
         for _ in progress:
             instance = self.sample_fn()
             instance.equilibrium_cost, instance.equilibrium_flow = self.solve_fn(instance)
             instances.append(instance)
-        torch.save(instances, self.raw_paths[1])
+        return instances
 
-    def process(self):
-        """Attach each instance's operator examples.
+    def raw_base_graph(self):
+        """The cached canonical graph. Read from raw rather than taken from the constructor argument because
+        ``process()`` runs *inside* ``super().__init__()``, where that argument is still ``None`` on a read."""
+        return torch.load(self.raw_paths[0], weights_only=False)
 
-        ``evaluate_fn`` receives every solved instance at once rather than one at a time, because it needs
-        the equilibria as a population: the sampling range it draws points over is calibrated from them.
+    def solved_instances(self):
+        """The dataset's solved instances, straight from raw."""
+        return torch.load(self.raw_paths[1], weights_only=False)
+
+    def load_instances(self):
+        """Populate the in-memory store from raw: this class attaches nothing, so there is no processed
+        artifact to read (and no ``process()``, so PyG never creates one). Subclasses override this with
+        ``self.load(self.processed_paths[0])``.
+
+        Not optional. With ``has_process`` false, ``InMemoryDataset.__init__`` leaves ``slices`` as ``None``,
+        and in that state ``len()`` returns **1** and ``get(0)`` returns ``copy.copy(None)`` -- silently
+        broken rather than an error.
         """
-        instances = torch.load(self.raw_paths[1], weights_only=False)
-        if self.evaluate_fn is not None:
-            for instance, evaluations in zip(instances, self.evaluate_fn(instances)):
-                instance.points = evaluations.points
-                instance.targets = evaluations.targets
-                instance.preconditioner_diagonal = evaluations.preconditioner_diagonal
-        self.save(instances, self.processed_paths[0])
+        # collate + assigning data/slices is exactly what InMemoryDataset.load does, minus the file read;
+        # both are public API (collate is a staticmethod, and load itself goes through the data setter).
+        self.data, self.slices = self.collate(self.solved_instances())

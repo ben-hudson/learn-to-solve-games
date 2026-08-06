@@ -233,6 +233,18 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         (feasible by construction; ``project`` still clamps)."""
         return batch["cost"]
 
+    def reference_equilibrium(self, batch):
+        """Each instance's own solved ``equilibrium_cost``, ``[B, E]`` -- the ``z*`` a validation endpoint's
+        distance is measured against.
+
+        Survives ``model_input`` and ``collate_fn`` (it is not in ``_DROPPED_ATTRS``, and every tensor
+        attribute is stacked), so the batch already carries it -- no threading required. ``.float()``
+        because ``PUMESolver`` returns float64. Defined here as well as on ``MarkovTrafficEquilibrium``
+        because this family is a standalone sibling, not a subclass: without it, it would inherit the base's
+        constant ``0.0`` and ``eq_dist`` would silently measure ``||z_end||``.
+        """
+        return batch["equilibrium_cost"].float()
+
     @staticmethod
     def calibrate_ceiling(instances, n_stds=3.0):
         """The per-edge ``sampling_ceiling`` from a set of solved instances: ``n_stds`` sigma above the

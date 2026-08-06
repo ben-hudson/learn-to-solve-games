@@ -164,21 +164,21 @@ def normalize_input(raw, transform, normalizer):
 
 def normalize_example(raw, target, transform, normalizer):
     """Featurize + standardize a raw ``(input item, target)`` pair -- input via ``normalize_input``,
-    target clip-then-standardized. Shared by the in-memory ``OperatorDataset``, the streaming
-    ``OperatorStream`` subclasses, and ``operator_datasets.CachedOperatorDataset``, so every source
+    target clip-then-standardized. Shared by the in-memory ``LazyOperatorDataset``, the streaming
+    ``OperatorStream`` subclasses, and ``operator_datasets.OperatorDataset``, so every source
     featurizes/normalizes identically however its examples are stored.
     """
     return normalize_input(raw, transform, normalizer), normalizer.transform_target(target)
 
 
-class OperatorDataset(Dataset):
+class LazyOperatorDataset(Dataset):
     """Lazily featurize + normalize raw ``(input item, target)`` examples held in memory as a list.
 
     ``__getitem__`` clones the raw item, applies the family's ``transform`` (builds ``feats`` fresh),
     then standardizes ``feats`` and the target -- so no featurized tensor is ever cached.
 
     Serves the same ``(instance, point)`` examples as
-    ``operator_datasets.CachedOperatorDataset``, and the two coexist deliberately. That one persists them
+    ``operator_datasets.OperatorDataset``, and the two coexist deliberately. That one persists them
     to disk, which needs the sampling ceiling fixed *before* generation; the fixed cal/val/test splits
     cannot satisfy that, because the ceiling is calibrated from the very equilibria those splits are split
     from. So they are built eagerly here at startup instead, and this class wraps the resulting list.
@@ -212,6 +212,24 @@ def collate_examples(family):
     and free of the route-choice solver.
     """
     return functools.partial(_collate_examples, family.collate_fn)
+
+
+def _collate_normalized_examples(family_collate_fn, transform, normalizer, pairs):
+    normalized = [normalize_example(raw, target, transform, normalizer) for raw, target in pairs]
+    return _collate_examples(family_collate_fn, normalized)
+
+
+def collate_normalized_examples(family, normalizer):
+    """``collate_examples`` for sources that serve **raw** examples: featurize + standardize first.
+
+    The streams must normalize at yield time -- their examples are transient -- but a cached source
+    (``operator_datasets.OperatorDataset``) serves real-unit examples and stays free of experiment state,
+    so its normalizer enters here, at the DataLoader boundary, where the fit-on-train invariant is visible
+    at the call site. Goes through ``normalize_example``, so every source still featurizes/normalizes
+    identically. Picklable like ``collate_examples``: ``family.transform`` and ``family.collate_fn`` are
+    solver-free, and the normalizer is plain tensors.
+    """
+    return functools.partial(_collate_normalized_examples, family.collate_fn, family.transform, normalizer)
 
 
 class OperatorEvaluations(NamedTuple):
@@ -331,7 +349,7 @@ def build_dataset(family, n_train, n_val, n_test, points_per_instance):
         for n in (n_train, n_val, n_test)
     ]
     normalizer = _fit_normalizer(family, splits[0])
-    datasets = tuple(OperatorDataset(split, family.transform, normalizer) for split in splits)
+    datasets = tuple(LazyOperatorDataset(split, family.transform, normalizer) for split in splits)
     return datasets, normalizer
 
 
@@ -456,9 +474,9 @@ def build_streaming_operator_dataset(
         )
     else:
         train_ds = UniformSampledOperatorStream(stream_factory, normalizer, points_per_instance)
-    val_ds, test_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test))
+    val_ds, test_ds = (LazyOperatorDataset(split, family.transform, normalizer) for split in (val, test))
     # The calibration set (a fixed FieldDataset) doubles as the model-sizing sample source.
-    cal_ds = OperatorDataset(cal, family.transform, normalizer)
+    cal_ds = LazyOperatorDataset(cal, family.transform, normalizer)
     return (train_ds, val_ds, test_ds, cal_ds), normalizer
 
 
@@ -470,9 +488,7 @@ def solution_examples(family, instances):
     cached ``equilibrium_cost`` ``z*`` (solved offline, see ``EquilibriumDataset``). Mirrors the
     ``solution_target=True`` path of ``rollout_sampling.ExpertOperatorStream`` for the fixed splits.
     """
-    return [
-        (family.model_input(inst, inst.free_flow_time), inst.equilibrium_cost.float()) for inst in instances
-    ]
+    return [(family.model_input(inst, inst.free_flow_time), inst.equilibrium_cost.float()) for inst in instances]
 
 
 def build_streaming_solution_dataset(family_factory, cal_instances, val_instances, test_instances):
@@ -491,5 +507,5 @@ def build_streaming_solution_dataset(family_factory, cal_instances, val_instance
         solution_examples(family, instances) for instances in (cal_instances, val_instances, test_instances)
     )
     normalizer = _fit_normalizer(family, cal, target_scaler=Standardizer.fit, warp="none")
-    val_ds, test_ds, cal_ds = (OperatorDataset(split, family.transform, normalizer) for split in (val, test, cal))
+    val_ds, test_ds, cal_ds = (LazyOperatorDataset(split, family.transform, normalizer) for split in (val, test, cal))
     return (val_ds, test_ds, cal_ds), normalizer

@@ -115,6 +115,16 @@ class VariationalInequalityFamily(ABC):
         distribution the on-policy collector trains on, fixed across epochs.
         """
 
+    def reference_equilibrium(self, batch):
+        """The ``z*`` a validation endpoint's distance is measured against (see ``callbacks.py``).
+
+        Concrete by default rather than abstract, because for the flat families it is a constant: the
+        matrix-game charts are centered on the Nash, so their equilibrium is the origin. A family whose
+        instances each have their own ``z*`` overrides this to read it off the batch -- the same
+        "extract what the rollout needs from a dense batch" seam as the three above.
+        """
+        return 0.0
+
 
 @dataclass(frozen=True)
 class VariationalInequality:
