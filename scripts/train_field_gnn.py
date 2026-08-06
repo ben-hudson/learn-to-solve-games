@@ -74,7 +74,7 @@ from l2s_games.data import (
     collate_examples,
     split_instances,
 )
-from l2s_games.datasets import SolvedInstanceDataset
+from l2s_games.datasets import EquilibriumDataset
 from l2s_games.envs import GAMES, make_game
 from l2s_games.envs.asym_pume_traffic import coupling_matrices
 from l2s_games.instance_sampling import FixedInstanceOperatorStream
@@ -100,12 +100,12 @@ def _single_thread_worker(_worker_id):
 
 def build_parser():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # dataset: a cached SolvedInstanceDataset (see scripts/generate_traffic_dataset.py) is loaded and
+    # dataset: a cached EquilibriumDataset (see scripts/generate_traffic_dataset.py) is loaded and
     # split into cal/val/test instances. Training still streams fresh instances on the fly
     # (--points_per_instance points each, one joint solve) unless --sources fixed pins them; the splits
     # fit the normalizer + calibrate the sampling range (cal) and measure generalization (val/test).
     # Epoch length is --steps_per_epoch.
-    p.add_argument("--dataset_root", type=str, required=True, help="root of the cached SolvedInstanceDataset to load")
+    p.add_argument("--dataset_root", type=str, required=True, help="root of the cached EquilibriumDataset to load")
     p.add_argument(
         "--game",
         type=str,
@@ -359,7 +359,7 @@ def main(args):
     # Load the cached solved instances and split them into cal/val/test. The calibration split's
     # equilibria calibrate the streaming sampling range (per-edge mean + std); the calibrated tensors
     # are baked into the picklable factory so every worker shares the same range.
-    dataset = SolvedInstanceDataset(args.dataset_root)
+    dataset = EquilibriumDataset(args.dataset_root)
     instances = list(dataset)
     cal_inst, val_inst, test_inst = split_instances(
         instances, (args.n_cal_instances, args.n_val_instances, args.n_test_instances)

@@ -1,35 +1,23 @@
-"""On-disk caches of ``(instance, point) -> operator value`` training examples.
+"""Operator examples: where an instance's cost points come from, and how they are served to the model.
 
-Evaluating the operator is the expensive part (a route-choice demand solve per point for traffic), so
-these pay it once, offline, and persist the result as PyG ``InMemoryDataset``s -- the same move
-``datasets.SolvedInstanceDataset`` makes for equilibria. That replaces the streaming sources (see
-``data.OperatorStream`` and its subclasses), whose budget was
-``n_workers * n_instances * points_per_instance * ceil(epochs / refresh_every)``: a formula tied to the
-optimization budget and to ``persistent_workers``. Here the budget is ``n_instances *
-points_per_instance``, fixed when the cache is generated and independent of how long you train on it.
+Two halves, matching the two stages of ``datasets.EquilibriumDataset``:
 
-Two sources, differing *only* in where an instance's points come from -- the axis
-``OperatorStream._raw_stream`` factors on -- so they share a base class and one hook:
+- **Generation** (``POINT_SOURCES``, the ``process()`` stage). A point source is a plain function
+  ``instances -> [OperatorEvaluations]`` that picks each instance's cost points and evaluates the operator
+  there. Two exist, and they differ *only* in where the points come from: ``uniform_points`` spreads them
+  over the calibrated cost box, ``expert_points`` puts them on the path a converging algorithm actually
+  walks on the true operator. Each is handed the **solved** instances, so it calibrates its own sampling
+  ceiling from their equilibria -- which is why the ceiling never has to be threaded in from outside.
+- **Reading** (``OperatorExamples``). The stored dataset serves *instances*; a field model wants
+  *(instance, point)* examples. That is a view over the same file, not a second one.
 
-- ``UniformOperatorDataset`` draws them uniformly over the calibrated cost box (``sample_domain``).
-- ``ExpertTrajectoryOperatorDataset`` records the states a converging algorithm actually visits while
-  rolling out the **true** operator, plus the equilibrium it lands on.
-
-Both live in the **same root** as the ``SolvedInstanceDataset`` whose equilibria calibrated their
-sampling box, sharing its ``raw/base_graph.pt`` -- so the asymmetric family's coupling matrices exist in
-exactly one place per root and cannot disagree between the train and val/test data (see
-``envs/asym_pume_traffic`` for why a second copy would be unsafe). ``processed_file_names`` is what keeps
-them apart inside it.
-
-Why not in ``datasets.py``: the expert dataset rolls out an algorithm, so it needs ``algorithms`` +
-``dynamics``, while ``datasets.py`` depends only on torch/PyG/tqdm. Keeping that module a leaf is worth
-a second file.
+Why the operator examples ride on the instances rather than living in their own dataset: they describe the
+same instances, so two files would have to be kept describing the same thing -- which is what previously
+forced a pinned-instance argument, a coverage cap, a config sidecar recording it, and cross-file matching at
+load time. All of that was bookkeeping created by the split.
 """
 
-from abc import ABC, abstractmethod
-
 import torch
-import torch_geometric.data
 import tqdm
 
 from l2s_games.algorithms import ALGORITHMS
@@ -40,248 +28,146 @@ from l2s_games.data import (
     sample_and_eval_operator,
 )
 from l2s_games.dynamics import simulate
+from l2s_games.envs import GAMES, make_game
 from l2s_games.rollout_sampling import RecordedField, with_endpoint
 
-# Attrs the stored `Data` carries beyond the instance graph itself: one instance's evaluated points and
-# their operator values. `traffic._DROPPED_ATTRS` lists them too, so `model_input` strips them from the
-# example it builds and they never reach a collated batch (the model reads only `feats`).
-_EVALUATION_ATTRS = ("points", "targets", "preconditioner_diagonal")
+# The three per-instance tensors a point source produces, in `OperatorEvaluations` field order. Listed in
+# `traffic._DROPPED_ATTRS` too, so `model_input` strips them from the example it builds: they ride on the
+# instance graph, so without that a batch would carry every *other* point of each instance beside the one
+# being trained on.
+EVALUATION_ATTRS = ("points", "targets", "preconditioner_diagonal")
 
 
-class OperatorDataset(torch_geometric.data.InMemoryDataset, ABC):
-    """Base for an on-disk cache of operator examples: stores per *instance*, indexes per *point*.
+def _calibrated_family(instances, game, base_graph, n_cal, n_stds, **family_kwargs):
+    """A family whose ``sample_domain`` box is calibrated from the solved ``instances``.
 
-    The stored unit is one instance's ``OperatorEvaluations`` -- its graph plus ``points`` / ``targets`` /
-    ``preconditioner_diagonal``, each ``[points_per_instance, E]``. Storing whole instances rather than
-    expanded examples is deliberate: ``model_input`` clones the graph per point (~13 KB for traffic), so a
-    file of examples would cost ``points_per_instance`` times as much. ``operator_examples`` rebuilds one
-    example at a time in ``get``, so the clone is transient.
+    The calibration prefix is deliberately the *first* ``n_cal`` instances: consumers split train/val/test
+    with train first, so the instances that set the sampling box are always inside train and the box never
+    sees a held-out equilibrium.
+    """
+    ceiling = GAMES[game].calibrate_ceiling(instances[:n_cal], n_stds)
+    return make_game(game, base_graph=base_graph, sampling_ceiling=ceiling, **family_kwargs)
 
-    ``len`` and ``get`` therefore disagree with the underlying store: this dataset has
-    ``n_instances * points_per_instance`` items, and ``get`` decodes a flat index into
-    ``(which instance, which point)``. Subclasses implement one hook, ``evaluate_instance``.
+
+def uniform_points(instances, points_per_instance=32, n_cal=128, n_stds=3.0, quiet=False, **family_kwargs):
+    """Points drawn **uniformly** over the calibrated cost box, one block per instance.
+
+    Coverage of the whole segment a rollout traverses -- from the free-flow-time start up to a few sigma
+    past the equilibria -- rather than of the path any one algorithm takes. One
+    ``operator_and_preconditioner`` call covers an instance's whole block, and since those points share a
+    rank-1 ``params`` that call builds a single ``PUMEModel`` for the lot.
+    """
+    family = _calibrated_family(instances, n_cal=n_cal, n_stds=n_stds, **family_kwargs)
+    progress = instances if quiet else tqdm.tqdm(instances, desc="uniform points")
+    return [sample_and_eval_operator(family, instance, points_per_instance) for instance in progress]
+
+
+def expert_points(instances, algo="projection", h=0.1, n_steps=500, n_cal=128, n_stds=3.0, quiet=False, **family_kwargs):
+    """Points visited by rolling out the **true** operator, plus the equilibrium the rollout reaches.
+
+    The expert demonstration source: it covers the distribution a learned field is actually rolled out on
+    rather than the whole domain. ``RecordedField`` keeps every ``(state, value, diagonal)`` triple the
+    rollout asks for, so the evaluations the algorithm already paid for *are* the training targets -- one
+    example per evaluation, nothing re-solved. Recording at the field level keeps it algorithm-agnostic:
+    ``extragradient`` queries twice per step and ``projection`` once, and both are legitimate pairs.
+
+    The converged endpoint is appended as one extra example. It is the one state the algorithm never
+    queried (``simulate`` returns it without evaluating there) and the only near-zero target in the set, so
+    it is what teaches the field where its root is. Hence ``n_steps * evals_per_step + 1`` points per
+    instance, uniform across instances since every rollout runs the full ``n_steps``.
+
+    ``algo`` must be chosen per operator: ``projection`` for the potential and multiplicatively-coupled
+    families, ``optimistic`` once additive coupling makes the field rotation-dominated (see
+    ``envs/asym_pume_traffic``).
+    """
+    family = _calibrated_family(instances, n_cal=n_cal, n_stds=n_stds, **family_kwargs)
+    progress = instances if quiet else tqdm.tqdm(instances, desc=f"{algo} rollouts")
+    return [_rollout_evaluations(family, instance, algo, h, n_steps) for instance in progress]
+
+
+def _rollout_evaluations(family, params, algo, h, n_steps):
+    """One instance's rollout on the true operator from a uniform start, keeping every evaluation.
+
+    Single-instance (rank-1 ``params``), so ``simulate`` is driven directly rather than through
+    ``rollout_sampling.batched_rollout``, which is shaped for a collated batch. The field is negated for
+    descent -- toward the operator's zero -- so the *recorded* values stay the unnegated operator, which is
+    the target convention the whole pipeline regresses.
+    """
+    start = family.sample_domain(params, 1)[0]
+    recorder = RecordedField(family, params)
+    trajectory = simulate(
+        lambda z: -recorder(z),
+        ALGORITHMS[algo](h),
+        start,
+        n_steps,
+        project=lambda z: family.project(params, z),
+    )
+    endpoint = trajectory[-1]
+    target, diagonal = family.operator_and_preconditioner(params, endpoint)
+    return with_endpoint(recorder.evaluations(params), endpoint, target, diagonal)
+
+
+POINT_SOURCES = {"uniform": uniform_points, "expert": expert_points}
+
+
+class OperatorExamples(torch.utils.data.Dataset):
+    """``(model input, operator value)`` examples over an ``EquilibriumDataset``'s attached evaluations.
+
+    Stores per *instance*, serves per *point*: instance ``i`` owns the contiguous example range
+    ``[i*ppi, (i+1)*ppi)``, so ``__getitem__`` decodes a flat index with ``divmod``. That layout is
+    load-bearing twice over -- a file of expanded examples would clone the instance graph per point (~13 KB
+    for traffic), and a **contiguous slice is therefore an instance-disjoint split**, which is how
+    train/val/test are taken.
+
+    A plain ``Dataset`` rather than an ``InMemoryDataset`` subclass, deliberately: nothing here owns files,
+    so there is no ``len``/``get`` re-entrancy to work around when reading ``points_per_instance``, no
+    collision with PyG's own ``transform`` (which would be applied to the ``(item, target)`` tuple this
+    returns), and no second set of ``processed_file_names`` to keep distinct.
 
     Args:
-        root: shared with the root's ``SolvedInstanceDataset`` -- ``raw/base_graph.pt`` must already
-            exist there, since the sampling ceiling is calibrated from that dataset's equilibria.
-        family: the VI family. Required to *generate*; also used on every read, for ``model_input`` and
-            ``transform``.
-        n_instances: how many instances to draw and evaluate (generation only).
-        points_per_instance: points to evaluate per instance. A *generation* input -- the subclass that
-            needs it reads it in ``evaluate_instance`` -- and on a read it is overwritten by the stored
-            value, which is authoritative (see ``_read_config``). ``None`` on a read adopts the file's.
-        normalizer: fitted on the train split and applied lazily per ``get``; settable afterwards, since
-            it is fit *from* this dataset.
-        quiet: suppress the generation progress bar.
-        **kwargs: forwarded to ``InMemoryDataset``. Leave ``transform`` unset -- PyG would apply it to
-            the ``(item, target)`` tuple ``get`` returns; the family's own ``transform`` is applied inside.
+        instances: the processed instances of an ``EquilibriumDataset`` (or a slice of them). Each must
+            carry the ``EVALUATION_ATTRS``, i.e. the root was generated with an ``evaluate_fn``.
+        family_factory: zero-arg callable returning the VI family -- **not** a live family. A family holds
+            the PUME solver, which holds a thread lock and so cannot be pickled to a ``DataLoader`` worker;
+            construction costs ~0.02 s, so building one per worker is free. Only ``model_input`` and
+            ``transform`` are ever used from it: the points and targets are already stored, so nothing here
+            touches the operator, the solver, or ``sample_domain``.
+        normalizer: applied per ``__getitem__``; settable afterwards, since it is fit *from* this data.
     """
 
-    def __init__(
-        self,
-        root,
-        family=None,
-        n_instances=None,
-        points_per_instance=None,
-        normalizer=None,
-        quiet=False,
-        **kwargs,
-    ):
-        self.family = family
-        self.n_instances = n_instances
+    def __init__(self, instances, family_factory, normalizer=None):
+        assert all(attr in instances[0] for attr in EVALUATION_ATTRS), (
+            "these instances carry no operator examples -- regenerate the dataset with an evaluate_fn "
+            "(scripts/generate_traffic_dataset.py --operator-dataset uniform|expert)"
+        )
+        self.instances = instances
+        self.family_factory = family_factory
         self.normalizer = normalizer
-        self.quiet = quiet
-        # Assigned before super().__init__, which may run process() (which reads it) -- and before
-        # anything can call len(), which multiplies by it. _read_config then makes the file authoritative.
-        self.points_per_instance = points_per_instance
-        super().__init__(root, **kwargs)
-        self.load(self.processed_paths[0])
-        self._read_config()
+        self.points_per_instance = instances[0].points.shape[0]
+        self._family = None
 
     @property
-    def raw_file_names(self):
-        """Shared with ``SolvedInstanceDataset``, so one root holds one ``base_graph`` (hence one copy of
-        the asymmetric coupling matrices) for its instances *and* its operator examples."""
-        return ["base_graph.pt"]
-
-    @property
-    @abstractmethod
-    def processed_file_names(self):
-        """``[evaluations, config]`` -- distinct per subclass so both can share one root's processed dir."""
-
-    @abstractmethod
-    def evaluate_instance(self, params):
-        """One instance's ``OperatorEvaluations``: pick its points and evaluate the operator there.
-
-        The single axis the subclasses differ on. Per-instance rather than batched, because for PUME a
-        batch dimension is a Python loop over independent ``PUMEModel`` builds anyway (see
-        ``pume_traffic.operator_and_preconditioner``) -- so batching buys nothing and would force the base
-        class into a batch-shaped hook for no gain.
-        """
-
-    def download(self):
-        raise AssertionError(
-            f"no base graph at {self.raw_paths[0]}. Generate this root's SolvedInstanceDataset first "
-            "(scripts/generate_traffic_dataset.py): its equilibria calibrate the sampling ceiling these "
-            "examples are drawn under."
-        )
-
-    def process(self):
-        """Draw ``n_instances`` fresh instances, evaluate each, and cache them with a config sidecar.
-
-        Instances are drawn fresh from the family rather than reused from ``instances.pt`` -- matching the
-        streaming ``uniform`` source's semantics, and leaving the noise free to differ from the solved
-        instances' (which is the out-of-distribution axis; see ``_config``).
-        """
-        assert self.family is not None and self.n_instances is not None, (
-            f"no cache at {self.processed_paths[0]}. Pass family and n_instances to build the dataset."
-        )
-        progress = range(self.n_instances) if self.quiet else tqdm.trange(self.n_instances)
-        records = [self.evaluate_instance(self.family.sample_params()) for _ in progress]
-        self.save([self._to_data(record) for record in records], self.processed_paths[0])
-        torch.save(self._config(records[0]), self.processed_paths[1])
-
-    def _config(self, record):
-        """The sidecar written beside the evaluations.
-
-        ``points_per_instance`` is **load-bearing**: a reader needs it to decode a flat index, and it is
-        measured off the generated data rather than predicted, so the expert dataset does not have to know
-        its rollout's width in advance. The noise settings are **provenance**: nothing reads them back and
-        nothing asserts on them, which is the point -- generating the train examples under different noise
-        from the solved instances is how out-of-distribution generalization gets measured, so the record
-        has to distinguish the two without constraining them.
-        """
-        return {
-            "points_per_instance": len(record.points),
-            "noise_scale": self.family.noise_scale,
-            "noise_type": self.family.noise_type,
-        }
-
-    def _read_config(self):
-        """Adopt the stored ``points_per_instance``, and reject a constructor arg that disagrees.
-
-        The file is authoritative. A mismatch has to raise rather than resolve silently: ``process()`` is
-        skipped whenever the cache exists, so passing a new value *looks* like it should regenerate and
-        cannot -- and quietly keeping either value would decode every index into the wrong
-        ``(instance, point)`` pair.
-        """
-        stored = torch.load(self.processed_paths[1], weights_only=False)["points_per_instance"]
-        assert self.points_per_instance in (None, stored), (
-            f"{self.processed_paths[0]} holds {stored} points per instance, but "
-            f"{self.points_per_instance} was requested. The cache is not regenerated when it already "
-            "exists -- delete it, or pass the value it was built with."
-        )
-        self.points_per_instance = stored
-
-    @staticmethod
-    def _to_data(record):
-        """One ``OperatorEvaluations`` as a storable ``Data``: the instance graph plus the three stacks.
-
-        PyG's default ``__cat_dim__`` is 0 for non-``index`` keys and ``__inc__`` is 0, so ``collate``
-        concatenates the stacks along their point axis and ``separate`` slices them back out per instance.
-        """
-        data = record.params.clone()
-        for attr, value in zip(_EVALUATION_ATTRS, (record.points, record.targets, record.preconditioner_diagonal)):
-            data[attr] = value
-        return data
-
-    @property
-    def n_stored_instances(self):
-        """How many instances the file holds -- ``len(self)`` counts *examples*, one per point."""
-        return super().len()
+    def family(self):
+        """Built lazily, so each ``DataLoader`` worker constructs its own rather than unpickling one."""
+        if self._family is None:
+            self._family = self.family_factory()
+        return self._family
 
     def evaluations(self, index):
         """The ``index``-th instance's stored ``OperatorEvaluations``, unexpanded.
 
-        The cheap way in: no ``model_input`` clone and no ``transform``, so a caller wanting the raw
-        tensors in bulk -- fitting a normalizer over every target, say -- does not pay a graph clone and a
-        line-graph shortest-path solve per *point*, which indexing through ``get`` would cost.
+        The cheap read: no ``model_input`` clone and no ``transform``, so a caller wanting the raw tensors
+        in bulk -- fitting a normalizer over every target, say -- does not pay a graph clone and a
+        line-graph shortest-path solve per *point*, which indexing through ``__getitem__`` would cost.
         """
-        data = super().get(index)
-        return OperatorEvaluations(data, *(data[attr] for attr in _EVALUATION_ATTRS))
+        instance = self.instances[index]
+        return OperatorEvaluations(instance, *(instance[attr] for attr in EVALUATION_ATTRS))
 
-    def len(self):
-        return self.n_stored_instances * self.points_per_instance
+    def __len__(self):
+        return len(self.instances) * self.points_per_instance
 
-    def get(self, index):
-        """The ``index``-th ``(model input, target)`` example, featurized and normalized on access.
-
-        Nothing featurized is cached: ``operator_examples`` -> ``model_input`` clones the instance and
-        ``normalize_example`` applies the family ``transform`` fresh, exactly as every other source does.
-        """
+    def __getitem__(self, index):
+        """Featurize + normalize one example on access -- nothing featurized is ever cached."""
         instance, point = divmod(index, self.points_per_instance)
         raw, target = next(operator_examples(self.family, self.evaluations(instance), order=[point]))
         return normalize_example(raw, target, self.family.transform, self.normalizer)
-
-
-class UniformOperatorDataset(OperatorDataset):
-    """Operator examples at points drawn **uniformly** over the calibrated cost box.
-
-    The on-disk equivalent of ``data.UniformSampledOperatorStream``: every example is a fresh instance's
-    ``sample_domain`` draw, so coverage is spread over the whole segment a rollout traverses rather than
-    concentrated on the path one takes. One ``operator_and_preconditioner`` call per instance covers all
-    its points, and because those points share a rank-1 ``params`` that call builds a single ``PUMEModel``
-    for the lot.
-
-    ``points_per_instance`` (on the base) is required to generate and is what the stored value is checked
-    against on a read.
-    """
-
-    @property
-    def processed_file_names(self):
-        return ["operators.pt", "operators_config.pt"]
-
-    def evaluate_instance(self, params):
-        return sample_and_eval_operator(self.family, params, self.points_per_instance)
-
-
-class ExpertTrajectoryOperatorDataset(OperatorDataset):
-    """Operator examples at the states a converging algorithm visits on the **true** operator.
-
-    The expert demonstration source: instead of covering the domain, it covers the path a good solver
-    takes, which is the distribution a learned field is actually rolled out on. ``RecordedField`` keeps
-    every ``(state, value, diagonal)`` triple the rollout asks for, so the evaluations the algorithm
-    already paid for *are* the training targets -- one example per evaluation, no re-solving. Recording at
-    the field level keeps it algorithm-agnostic: ``extragradient`` queries twice per step and
-    ``projection`` once, and both are legitimate ``(state, operator value)`` pairs.
-
-    The converged endpoint is appended as one extra example. It is the one state the algorithm never
-    queried (``simulate`` returns it without evaluating there), and the only near-zero target the model
-    ever sees -- so it is what teaches the field where its root is.
-
-    ``points_per_instance`` is therefore ``n_steps * evals_per_step + 1``, uniform across instances since
-    every rollout runs the full ``n_steps``. ``algo`` must be chosen per operator: ``projection`` for the
-    potential and multiplicatively-coupled families, ``optimistic`` once the additive coupling makes the
-    field rotation-dominated (see ``envs/asym_pume_traffic``).
-    """
-
-    def __init__(self, root, algo="projection", h=0.1, n_steps=500, **kwargs):
-        self.algo = algo
-        self.h = h
-        self.n_steps = n_steps
-        super().__init__(root, **kwargs)
-
-    @property
-    def processed_file_names(self):
-        return ["trajectories.pt", "trajectories_config.pt"]
-
-    def evaluate_instance(self, params):
-        """Roll this instance out on the true operator from a uniform start, keeping every evaluation.
-
-        Single-instance (rank-1 ``params``), so ``simulate`` is driven directly rather than through
-        ``rollout_sampling.batched_rollout``, which is shaped for a collated batch. The field is negated
-        for descent -- toward the operator's zero -- so the *recorded* values stay the unnegated operator,
-        which is the target convention the whole pipeline regresses.
-        """
-        start = self.family.sample_domain(params, 1)[0]
-        recorder = RecordedField(self.family, params)
-        trajectory = simulate(
-            lambda z: -recorder(z),
-            ALGORITHMS[self.algo](self.h),
-            start,
-            self.n_steps,
-            project=lambda z: self.family.project(params, z),
-        )
-        endpoint = trajectory[-1]
-        target, diagonal = self.family.operator_and_preconditioner(params, endpoint)
-        return with_endpoint(recorder.evaluations(params), endpoint, target, diagonal)

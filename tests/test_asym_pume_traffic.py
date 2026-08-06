@@ -19,7 +19,7 @@ import pathlib
 import pytest
 import torch
 
-from l2s_games.datasets import SolvedInstanceDataset
+from l2s_games.datasets import EquilibriumDataset
 from l2s_games.envs import bind, make_game
 from l2s_games.envs.asym_pume_traffic import (
     build_interaction_matrix,
@@ -314,7 +314,7 @@ def test_interaction_matrix_round_trips_through_a_dataset(base_graph, tmp_path):
         "rotation_matrix": build_rotation_matrix(base_graph, _KAPPA),
     }
     family = asym(base_graph, _EPSILON, _KAPPA, solver_kwargs={"outer_tol": 1e-1, "outer_max_iter": 50})
-    SolvedInstanceDataset(
+    EquilibriumDataset(
         str(tmp_path),
         base_graph=family.base_graph,
         sample_fn=family.sample_params,
@@ -323,7 +323,7 @@ def test_interaction_matrix_round_trips_through_a_dataset(base_graph, tmp_path):
         quiet=True,
     )
 
-    reloaded = SolvedInstanceDataset(str(tmp_path))
+    reloaded = EquilibriumDataset(str(tmp_path))
     assert coupling_matrices(reloaded.base_graph).keys() == expected.keys()
     for name, matrix in expected.items():
         assert torch.equal(reloaded.base_graph[name], matrix), name

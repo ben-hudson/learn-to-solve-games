@@ -55,9 +55,11 @@ _UNCALIBRATED_CEILING_MARGIN = 4.0
 #     off the solver, so the model never needs them -- and stacking one would add an ``[B, E, E]`` tensor per
 #     batch.
 #   - ``points`` / ``targets`` / ``preconditioner_diagonal``, one instance's whole block of evaluated points
-#     as stored by ``operator_datasets``. ``get`` reads them off the graph to rebuild a single example, so by
-#     the time ``model_input`` runs they are spent -- and stacking them would put every *other* point of the
-#     instance into the batch alongside the one being trained on.
+#     as stored by ``datasets.EquilibriumDataset``. ``OperatorExamples`` reads them off the graph to rebuild a
+#     single example, so by the time ``model_input`` runs they are spent -- and stacking them would put every
+#     *other* point of the instance into the batch alongside the one being trained on.
+#   - ``game``, the VI family's registry name, so a dataset root identifies the operator it was built with
+#     rather than relying on a matching command-line flag (see ``datasets.EquilibriumDataset``).
 # The general rule: anything carried on the graph for persistence or provenance rather than for the model
 # belongs here.
 _DROPPED_ATTRS = (
@@ -70,6 +72,7 @@ _DROPPED_ATTRS = (
     "points",
     "targets",
     "preconditioner_diagonal",
+    "game",
 )
 
 

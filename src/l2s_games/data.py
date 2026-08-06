@@ -164,18 +164,24 @@ def normalize_input(raw, transform, normalizer):
 
 def normalize_example(raw, target, transform, normalizer):
     """Featurize + standardize a raw ``(input item, target)`` pair -- input via ``normalize_input``,
-    target clip-then-standardized. Shared by the map-style ``OperatorDataset``, the streaming
-    ``OperatorStream`` subclasses, and the on-disk ``operator_datasets`` caches, so every source
-    featurizes/normalizes identically.
+    target clip-then-standardized. Shared by the in-memory ``OperatorDataset``, the streaming
+    ``OperatorStream`` subclasses, and ``operator_datasets.CachedOperatorDataset``, so every source
+    featurizes/normalizes identically however its examples are stored.
     """
     return normalize_input(raw, transform, normalizer), normalizer.transform_target(target)
 
 
 class OperatorDataset(Dataset):
-    """Lazily featurize + normalize raw ``(input item, target)`` examples.
+    """Lazily featurize + normalize raw ``(input item, target)`` examples held in memory as a list.
 
     ``__getitem__`` clones the raw item, applies the family's ``transform`` (builds ``feats`` fresh),
     then standardizes ``feats`` and the target -- so no featurized tensor is ever cached.
+
+    Serves the same ``(instance, point)`` examples as
+    ``operator_datasets.CachedOperatorDataset``, and the two coexist deliberately. That one persists them
+    to disk, which needs the sampling ceiling fixed *before* generation; the fixed cal/val/test splits
+    cannot satisfy that, because the ceiling is calibrated from the very equilibria those splits are split
+    from. So they are built eagerly here at startup instead, and this class wraps the resulting list.
     """
 
     def __init__(self, examples, transform, normalizer):
@@ -212,7 +218,7 @@ class OperatorEvaluations(NamedTuple):
     """One instance's evaluated points: ``params`` plus ``points`` / ``targets`` /
     ``preconditioner_diagonal``, each ``[points_per_instance, d]``.
 
-    An *evaluation* is one operator call; contrast ``datasets.SolvedInstanceDataset``, where "solved"
+    An *evaluation* is one operator call; contrast ``datasets.EquilibriumDataset``, where "solved"
     means solved to equilibrium -- hundreds of these. The unit every *buffered* source retains (see
     ``caching.CachedOperatorStream`` and the expert stream in ``rollout_sampling``) and the unit
     ``operator_datasets`` persists. Deliberately **not** a list of ``(model_input, target)`` examples:
@@ -414,7 +420,7 @@ def build_streaming_operator_dataset(
     axis a global warp cannot; see ``--target_warp`` for that trade-off.
 
     The cal / val / test instances are pre-solved and passed in (split from a cached
-    ``SolvedInstanceDataset``); this builds their ``(input, target)`` examples with the family's
+    ``EquilibriumDataset``); this builds their ``(input, target)`` examples with the family's
     (calibrated) ``sample_domain`` + ``operator``. The normalizer is fit once on the **calibration**
     examples, then frozen and shared with the stream and the fixed val/test splits -- preserving the
     fit-on-a-fixed-sample invariant while training draws unbounded fresh instances. Val/test stay
@@ -461,7 +467,7 @@ def solution_examples(family, instances):
 
     The full-amortization target (``--amortization full``): each instance's free-flow-time start fills
     the query column (``model_input`` -- no point that would leak the answer), regressed onto the
-    cached ``equilibrium_cost`` ``z*`` (solved offline, see ``SolvedInstanceDataset``). Mirrors the
+    cached ``equilibrium_cost`` ``z*`` (solved offline, see ``EquilibriumDataset``). Mirrors the
     ``solution_target=True`` path of ``rollout_sampling.ExpertOperatorStream`` for the fixed splits.
     """
     return [

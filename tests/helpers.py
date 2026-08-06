@@ -1,11 +1,49 @@
-"""Shared test helpers: an operator-call counter and a stream-draining shorthand.
+"""Shared test helpers: an operator-call counter, a stream-draining shorthand, and a small solved root.
 
 ``CountingFamily`` is the in-process stand-in for ``operator_count.SharedCounter``, which only the traffic
 family accepts -- every budget assertion in ``test_caching`` / ``test_expert_recording`` is about how many
 point-evaluations a source spends, so it needs to count them for the flat families too.
+
+``solved_traffic_root`` gives a test its own freshly solved dataset. Tests used to read a checked-in
+``datasets/sioux_falls_512``, which coupled them to an artifact whose on-disk layout could drift out from
+under them -- and did, when solving moved from ``process()`` to ``download()``. Solving a handful of
+instances at loose tolerance costs a few seconds and keeps each test's data its own.
 """
 
 import itertools
+import pathlib
+
+import pytest
+
+from l2s_games.datasets import EquilibriumDataset
+from l2s_games.envs import make_game
+from l2s_games.envs.traffic import load_sioux_falls_base_graph
+
+_DATA_ROOT = pathlib.Path(__file__).resolve().parents[1] / "raw_data" / "sioux_falls"
+# Loose enough to solve in seconds. Tests that use this are about the data pipeline, not about how
+# precisely an equilibrium was reached; anything asserting on solution accuracy should tighten it.
+_LOOSE_SOLVER = {"outer_tol": 1e-1, "outer_max_iter": 500}
+
+
+def solved_traffic_root(root, n_instances=4, game="pume_traffic"):
+    """A small ``EquilibriumDataset`` solved fresh into ``root``, or a skip if the TNTP files are absent.
+
+    Mirrors what ``scripts/generate_traffic_dataset.py`` does, including recording ``game`` on the base
+    graph so a reader derives its family from the data. No ``evaluate_fn``, so the instances carry only
+    their equilibria -- callers that want operator examples pass a point source themselves.
+    """
+    if not _DATA_ROOT.exists():
+        pytest.skip(f"Sioux Falls TNTP data not found at {_DATA_ROOT}")
+    family = make_game(game, base_graph=load_sioux_falls_base_graph(str(_DATA_ROOT)), solver_kwargs=_LOOSE_SOLVER)
+    family.base_graph.game = game
+    return EquilibriumDataset(
+        str(root),
+        base_graph=family.base_graph,
+        sample_fn=family.sample_params,
+        solve_fn=family.solver.solve,
+        n_instances=n_instances,
+        quiet=True,
+    )
 
 
 class CountingFamily:

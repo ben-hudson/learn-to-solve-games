@@ -24,14 +24,14 @@ from l2s_games.data import (
     collate_examples,
     split_instances,
 )
-from l2s_games.datasets import SolvedInstanceDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium, load_sioux_falls_base_graph
 from l2s_games.instance_sampling import FixedInstanceOperatorStream
 from l2s_games.monotonicity import monotonicity_ratios, monotonicity_violations
 
+from helpers import solved_traffic_root
+
 _DATA_ROOT = pathlib.Path(__file__).resolve().parents[1] / "raw_data" / "sioux_falls"
-_DATASET_ROOT = pathlib.Path(__file__).resolve().parents[1] / "datasets" / "sioux_falls_512"
 _POINTS_PER_INSTANCE = 4
 
 
@@ -43,12 +43,10 @@ def base_graph():
 
 
 @pytest.fixture(scope="module")
-def solved_batch():
+def solved_batch(tmp_path_factory):
     """A real collated batch from the fixed-instance stream, plus the family that built it."""
-    if not _DATASET_ROOT.exists():
-        pytest.skip(f"Solved-instance cache not found at {_DATASET_ROOT}")
     torch.manual_seed(0)
-    dataset = SolvedInstanceDataset(str(_DATASET_ROOT))
+    dataset = solved_traffic_root(tmp_path_factory.mktemp("monotonicity") / "root", n_instances=8)
     cal, val, test = split_instances(list(dataset), (4, 2, 2))
     factory = functools.partial(
         PUMEMarkovTrafficEquilibrium,

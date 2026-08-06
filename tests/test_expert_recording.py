@@ -29,14 +29,13 @@ import pytest
 import torch
 
 from l2s_games.data import PRECONDITIONER_DIAGONAL, build_dataset, build_streaming_operator_dataset, split_instances
-from l2s_games.datasets import SolvedInstanceDataset
+from l2s_games.datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
 from l2s_games.rollout_sampling import ExpertOperatorStream
 
-from helpers import CountingFamily, take
+from helpers import CountingFamily, solved_traffic_root, take
 
-_DATASET_ROOT = pathlib.Path(__file__).resolve().parents[1] / "datasets" / "sioux_falls_512"
 
 N_INSTANCES = 3
 N_STEPS = 5
@@ -63,12 +62,10 @@ def normalizer(family):
 
 
 @pytest.fixture(scope="module")
-def traffic():
+def traffic(tmp_path_factory):
     """A counting traffic family + fitted normalizer, for the traffic-only ``z*``-target path."""
-    if not _DATASET_ROOT.exists():
-        pytest.skip(f"Solved-instance cache not found at {_DATASET_ROOT}")
     torch.manual_seed(0)
-    dataset = SolvedInstanceDataset(str(_DATASET_ROOT))
+    dataset = solved_traffic_root(tmp_path_factory.mktemp("expert") / "root", n_instances=4)
     cal, val, test = split_instances(list(dataset), (2, 1, 1))
     factory = functools.partial(
         PUMEMarkovTrafficEquilibrium,
