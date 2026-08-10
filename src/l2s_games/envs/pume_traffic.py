@@ -35,7 +35,7 @@ streaming pipeline -- and not for anything reading a cache.
 
 import torch
 
-from l2s_games.envs.base import VariationalInequalityFamily
+from l2s_games.envs.base import VariationalInequalityFamily, collate_dense_graphs
 from l2s_games.envs.traffic import (
     _EDGE_ATTRS,
     _DROPPED_ATTRS,
@@ -90,6 +90,15 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         """The PUME operator backend for this family -- the seam a subclass overrides to swap the supply
         operator (see ``asym_pume_traffic.AsymmetricPUMEMarkovTrafficEquilibrium``)."""
         return PUMESolver(self.base_graph, **solver_kwargs)
+
+    def solve_instance(self, instance):
+        """The equilibrium cost vector, as ``EquilibriumDataset``'s ``solve_fn`` stores it.
+
+        The solver's flow return is dropped: nothing reads it, and it is recoverable from the costs
+        via the demand model.
+        """
+        cost, _flow = self.solver.solve(instance)
+        return cost
 
     def sample_params(self):
         graph = self.base_graph.clone()
@@ -234,7 +243,7 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         return batch["cost"]
 
     def reference_equilibrium(self, batch):
-        """Each instance's own solved ``equilibrium_cost``, ``[B, E]`` -- the ``z*`` a validation endpoint's
+        """Each instance's own solved ``equilibrium``, ``[B, E]`` -- the ``z*`` a validation endpoint's
         distance is measured against.
 
         Survives ``model_input`` and ``collate_fn`` (it is not in ``_DROPPED_ATTRS``, and every tensor
@@ -243,15 +252,21 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
         because this family is a standalone sibling, not a subclass: without it, it would inherit the base's
         constant ``0.0`` and ``eq_dist`` would silently measure ``||z_end||``.
         """
-        return batch["equilibrium_cost"].float()
+        return batch["equilibrium"].float()
 
     @staticmethod
     def calibrate_ceiling(instances, n_stds=3.0):
         """The per-edge ``sampling_ceiling`` from a set of solved instances: ``n_stds`` sigma above the
-        per-edge mean of their cached ``equilibrium_cost``. Feed it into ``__init__`` so ``sample_domain``
+        per-edge mean of their cached ``equilibrium``. Feed it into ``__init__`` so ``sample_domain``
         draws over the segment a rollout actually traverses rather than a guessed box."""
-        eq = torch.stack([instance.equilibrium_cost.float() for instance in instances])  # [N, E]
+        eq = torch.stack([instance.equilibrium.float() for instance in instances])  # [N, E]
         return eq.mean(dim=0) + n_stds * eq.std(dim=0)
+
+    @classmethod
+    def calibration_kwargs(cls, cal_instances, n_stds):
+        """Constructor kwargs an operator dataset derives from its calibration solves (see
+        ``envs/base.py``): the calibrated ``sampling_ceiling``."""
+        return {"sampling_ceiling": cls.calibrate_ceiling(cal_instances, n_stds)}
 
     def sample_domain(self, graph, n):
         """Feasible cost points drawn uniformly per edge over ``[free_flow_time, sampling_ceiling]``.
@@ -297,17 +312,8 @@ class PUMEMarkovTrafficEquilibrium(VariationalInequalityFamily):
 
     @staticmethod
     def collate_fn(items):
-        """Dense-batch same-topology line graphs: stack every per-item tensor, share the topologies.
-
-        The Graphormer uses dense attention over one fixed topology, so a batch is stacked tensors plus
-        the shared (line-graph) ``edge_index`` and physical ``physical_edge_index`` -- both identical
-        across the batch, so stored once un-stacked. The real-unit BPR/demand params survive the stack,
-        which the operator's per-instance supply + per-call OD solve needs.
-        """
-        shared = ("edge_index", "physical_edge_index")  # one topology across the batch -- store once
-        batch = {key: items[0][key] for key in shared}
-        for key in items[0].keys():
-            value = items[0][key]
-            if key not in shared and isinstance(value, torch.Tensor):
-                batch[key] = torch.stack([item[key] for item in items])
-        return batch
+        """Dense-batch same-topology line graphs (see ``base.collate_dense_graphs``): both the line-graph
+        ``edge_index`` and the physical ``physical_edge_index`` are identical across the batch, and the
+        real-unit BPR/demand params survive the stack, which the operator's per-instance supply +
+        per-call OD solve needs."""
+        return collate_dense_graphs(items, shared=("edge_index", "physical_edge_index"))

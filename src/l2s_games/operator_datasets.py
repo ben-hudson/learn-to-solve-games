@@ -5,7 +5,7 @@ share, on both sides of the raw/processed split:
 
 - **Generation.** ``download()`` additionally solves a *disjoint* calibration set (``raw/cal_instances.pt``),
   drawn from the same ``sample_fn``, whose equilibria calibrate the sampling box points are drawn over
-  (``calibrate_ceiling``). Keeping them out of the dataset is what makes the box's independence from any
+  (the family's ``calibration_kwargs``). Keeping them out of the dataset is what makes the box's independence from any
   val/test split **structural** rather than a convention about prefixes. ``process()`` then picks every
   instance's cost points, evaluates the operator there, and attaches the result; the subclasses differ *only*
   in where the points come from (``_evaluate``): ``UniformOperatorDataset`` spreads them over the calibrated
@@ -51,8 +51,7 @@ from l2s_games.data import (
 )
 from l2s_games.datasets import EquilibriumDataset
 from l2s_games.dynamics import simulate
-from l2s_games.envs import GAMES, make_game
-from l2s_games.envs.asym_pume_traffic import coupling_matrices
+from l2s_games.envs import GAMES
 from l2s_games.rollout_sampling import RecordedField, with_endpoint
 
 # The three per-instance tensors a point source produces, in `OperatorEvaluations` field order. Listed in
@@ -63,14 +62,14 @@ EVALUATION_ATTRS = ("points", "targets", "preconditioner_diagonal")
 
 
 def _root_family(base_graph, **kwargs):
-    """The family a root's ``base_graph`` names, carrying the couplings its equilibria were solved with.
+    """The family a root's ``base_graph`` names.
 
-    Everything rides on the root: ``base_graph.game`` picks the family, and for the asymmetric one the
-    coupling matrices are on the graph too. Deriving them rather than being told removes the silent-mismatch
-    hazard ``base_graph.game`` exists for.
+    Everything rides on the root: ``base_graph.game`` picks the family, and anything else the family's
+    constructor needs (the asymmetric coupling matrices, say) persists on the graph too, where the family
+    reads it back itself. Deriving the family from the data rather than being told removes the
+    silent-mismatch hazard ``base_graph.game`` exists for.
     """
-    couplings = coupling_matrices(base_graph) if base_graph.game == "asym_pume_traffic" else {}
-    return make_game(base_graph.game, base_graph=base_graph, **couplings, **kwargs)
+    return GAMES[base_graph.game](base_graph=base_graph, **kwargs)
 
 
 def _attach(instance, evaluations):
@@ -89,7 +88,8 @@ class OperatorDataset(EquilibriumDataset):
         root: as ``EquilibriumDataset``, plus ``raw/cal_instances.pt`` and this source's processed file.
         n_cal_instances: how many *additional* instances to solve for the calibration set. No default, so a
             generating caller states it (tests want two, generation wants ~128).
-        n_stds: how many sigma above the calibration equilibria's mean the sampling ceiling sits.
+        n_stds: calibration spread, passed to the family's ``calibration_kwargs`` (for traffic: how many
+            sigma above the calibration equilibria's mean the sampling ceiling sits).
         **kwargs: forwarded to ``EquilibriumDataset``.
     """
 
@@ -116,14 +116,16 @@ class OperatorDataset(EquilibriumDataset):
         return torch.load(self.raw_paths[2], weights_only=False)
 
     def _calibrated_family(self):
-        """A family whose ``sample_domain`` box is calibrated from the dedicated calibration instances.
+        """A family whose point-sampling box is calibrated from the dedicated calibration instances.
 
-        Calibrates from *all* of ``cal_instances()`` -- they are already the dedicated disjoint set, so
-        there is no prefix to slice and no held-out equilibrium to avoid.
+        What "calibrated" means is the family's own business (``calibration_kwargs`` -- a ceiling for
+        traffic, nothing for a fixed-box chart). Calibrates from *all* of ``cal_instances()`` -- they are
+        already the dedicated disjoint set, so there is no prefix to slice and no held-out equilibrium to
+        avoid.
         """
         base_graph = self.raw_base_graph()
-        ceiling = GAMES[base_graph.game].calibrate_ceiling(self.cal_instances(), self.n_stds)
-        return _root_family(base_graph, sampling_ceiling=ceiling)
+        kwargs = GAMES[base_graph.game].calibration_kwargs(self.cal_instances(), self.n_stds)
+        return _root_family(base_graph, **kwargs)
 
     def process(self):
         """Attach each instance's operator examples -- the cheap stage, one processed file per source."""

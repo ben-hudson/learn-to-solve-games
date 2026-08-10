@@ -270,22 +270,27 @@ def test_interaction_matrix_invariants(base_graph):
     assert not interaction[~adjacent].any(), "A couples links that share no node"
 
 
-def test_both_coupling_matrices_are_required(base_graph):
-    """The family refuses to be built without either coupling rather than quietly constructing one.
+def test_omitted_couplings_come_from_the_graph_or_fail_loudly(base_graph):
+    """Omitting the coupling kwargs means "read the stored ones off ``base_graph``", never "build fresh".
 
     A rebuilt ``A`` only *probably* matches the one a dataset's equilibria were solved with -- its values
-    come from an RNG seeded by a PUME default we neither pass nor record -- and a mismatch is silent. ``B``
-    is deterministic and could be rebuilt safely, but it follows the same rule so there is one policy rather
-    than a per-matrix exception.
+    come from an RNG seeded by a PUME default we neither pass nor record -- and a mismatch is silent. So a
+    bare graph (no stored couplings) must refuse construction with the regenerate message, and a graph that
+    carries them must hand back exactly those.
     """
-    with pytest.raises(TypeError):
+    with pytest.raises(AssertionError, match="Regenerate the dataset"):
         make_game("asym_pume_traffic", base_graph=base_graph)
-    with pytest.raises(TypeError):
-        make_game(
-            "asym_pume_traffic",
-            base_graph=base_graph,
-            interaction_matrix=build_interaction_matrix(base_graph, _EPSILON),
-        )
+
+    stored = {
+        "interaction_matrix": build_interaction_matrix(base_graph, _EPSILON),
+        "rotation_matrix": build_rotation_matrix(base_graph, _KAPPA),
+    }
+    carrying = base_graph.clone()
+    for name, matrix in stored.items():
+        carrying[name] = matrix
+    family = make_game("asym_pume_traffic", base_graph=carrying)
+    for name, matrix in stored.items():
+        assert torch.equal(getattr(family, name), matrix), name
 
 
 def test_the_supplied_matrices_are_the_ones_used(base_graph):
@@ -318,7 +323,7 @@ def test_interaction_matrix_round_trips_through_a_dataset(base_graph, tmp_path):
         str(tmp_path),
         base_graph=family.base_graph,
         sample_fn=family.sample_params,
-        solve_fn=family.solver.solve,
+        solve_fn=family.solve_instance,
         n_instances=2,
         quiet=True,
     )
@@ -360,7 +365,7 @@ def test_operator_root_at_equilibrium(family, base_equilibrium):
 def test_equilibrium_differs_from_the_symmetric_one(base_graph, family, base_equilibrium):
     """The asymmetric equilibrium is a different point, which is why it needs its own solved dataset.
 
-    The cached ``equilibrium_cost`` sets the sampling range (``calibrate_ceiling``) and the ``rel_dist``
+    The cached ``equilibrium`` sets the sampling range (``calibrate_ceiling``) and the ``rel_dist``
     metrics, so reusing a symmetric cache would calibrate around the wrong solution.
     """
     symmetric = make_game(

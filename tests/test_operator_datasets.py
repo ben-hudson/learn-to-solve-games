@@ -83,7 +83,7 @@ def build_root(root, base_graph, cls=EquilibriumDataset, **point_kwargs):
         str(root),
         base_graph=family.base_graph,
         sample_fn=family.sample_params,
-        solve_fn=family.solver.solve,
+        solve_fn=family.solve_instance,
         n_instances=N_INSTANCES,
         quiet=True,
         **point_kwargs,
@@ -119,7 +119,7 @@ def test_both_sources_share_one_set_of_solves(tmp_path, base_graph):
     """
     root = tmp_path / "root"
     uniform = build_root(root, base_graph, UniformOperatorDataset, points_per_instance=POINTS_PER_INSTANCE)
-    equilibria = torch.stack([instance.equilibrium_cost for instance in uniform.instances()])
+    equilibria = torch.stack([instance.equilibrium for instance in uniform.instances()])
     raw_mtime = (root / "raw" / "instances.pt").stat().st_mtime
 
     expert = build_root(root, base_graph, ExpertOperatorDataset, n_steps=N_STEPS)
@@ -127,7 +127,7 @@ def test_both_sources_share_one_set_of_solves(tmp_path, base_graph):
     assert (root / "processed" / "uniform_operators.pt").exists(), "the first source's file was clobbered"
     assert (root / "processed" / "expert_operators.pt").exists()
     assert (root / "raw" / "instances.pt").stat().st_mtime == raw_mtime, "the solves were re-run"
-    assert torch.equal(torch.stack([instance.equilibrium_cost for instance in expert.instances()]), equilibria)
+    assert torch.equal(torch.stack([instance.equilibrium for instance in expert.instances()]), equilibria)
     assert uniform.points_per_instance == POINTS_PER_INSTANCE
     assert expert.points_per_instance == N_STEPS + 1
 
@@ -143,7 +143,7 @@ def test_a_solve_only_root_has_no_processed_directory_and_no_cal_set(tmp_path, b
     assert not (root / "processed").exists()
     assert not (root / "raw" / "cal_instances.pt").exists()
     assert len(dataset) == N_INSTANCES
-    assert "equilibrium_cost" in dataset[0]
+    assert "equilibrium" in dataset[0]
     assert "points" not in dataset[0]
 
 
@@ -171,8 +171,8 @@ def test_the_calibration_set_is_disjoint_from_the_dataset(uniform_root):
 
     assert len(cal) == N_CAL
     assert dataset.len() == N_INSTANCES, "the calibration instances leaked into the dataset"
-    dataset_equilibria = {tuple(instance.equilibrium_cost.tolist()) for instance in dataset.instances()}
-    assert not dataset_equilibria & {tuple(instance.equilibrium_cost.tolist()) for instance in cal}
+    dataset_equilibria = {tuple(instance.equilibrium.tolist()) for instance in dataset.instances()}
+    assert not dataset_equilibria & {tuple(instance.equilibrium.tolist()) for instance in cal}
 
 
 def test_the_box_is_calibrated_from_the_cal_set_not_the_dataset(uniform_root):
@@ -199,7 +199,7 @@ def test_process_builds_its_family_through_the_calibration(tmp_path, base_graph,
     real = OperatorDataset._calibrated_family
 
     def spy(self):
-        calls.append(torch.stack([instance.equilibrium_cost for instance in self.cal_instances()]))
+        calls.append(torch.stack([instance.equilibrium for instance in self.cal_instances()]))
         return real(self)
 
     monkeypatch.setattr(OperatorDataset, "_calibrated_family", spy)
@@ -208,7 +208,7 @@ def test_process_builds_its_family_through_the_calibration(tmp_path, base_graph,
 
     assert len(calls) == 1, "process() did not build its family through _calibrated_family"
     assert torch.equal(
-        calls[0], torch.stack([instance.equilibrium_cost for instance in dataset.cal_instances()])
+        calls[0], torch.stack([instance.equilibrium for instance in dataset.cal_instances()])
     )
 
 
@@ -221,8 +221,8 @@ def test_the_root_records_its_own_family_and_no_stale_equilibrium(uniform_root):
     """
     dataset, _root = uniform_root
     assert dataset.base_graph.game == GAME
-    assert "equilibrium_cost" not in dataset.base_graph
-    equilibria = {tuple(instance.equilibrium_cost.tolist()) for instance in dataset.instances()}
+    assert "equilibrium" not in dataset.base_graph
+    equilibria = {tuple(instance.equilibrium.tolist()) for instance in dataset.instances()}
     assert len(equilibria) == N_INSTANCES, "instances share an equilibrium -- one was inherited, not solved"
 
 
@@ -322,7 +322,7 @@ def test_reference_equilibrium_is_each_instances_own_solved_cost(uniform_root):
 
     assert equilibrium.dtype == torch.float32
     assert equilibrium.shape == (batch_size, dataset.get(0).num_edges)
-    assert torch.allclose(equilibrium[0], dataset.get(0).equilibrium_cost.float())
+    assert torch.allclose(equilibrium[0], dataset.get(0).equilibrium.float())
     assert not torch.allclose(equilibrium[0], equilibrium[-1]), "every row got the same instance's z*"
 
 

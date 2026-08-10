@@ -485,17 +485,17 @@ def solution_examples(family, instances):
 
     The full-amortization target (``--amortization full``): each instance's free-flow-time start fills
     the query column (``model_input`` -- no point that would leak the answer), regressed onto the
-    cached ``equilibrium_cost`` ``z*`` (solved offline, see ``EquilibriumDataset``). Mirrors the
+    cached ``equilibrium`` ``z*`` (solved offline, see ``EquilibriumDataset``). Mirrors the
     ``solution_target=True`` path of ``rollout_sampling.ExpertOperatorStream`` for the fixed splits.
     """
-    return [(family.model_input(inst, inst.free_flow_time), inst.equilibrium_cost.float()) for inst in instances]
+    return [(family.model_input(inst, inst.free_flow_time), inst.equilibrium.float()) for inst in instances]
 
 
 def build_streaming_solution_dataset(family_factory, cal_instances, val_instances, test_instances):
     """Fixed cal/val/test ``z*``-target ``FieldDataset``s plus the fitted ``Normalizer``.
 
     The solution-target sibling of ``build_streaming_operator_dataset``. The fixed splits use each
-    instance's cached ``equilibrium_cost`` (exact and free), and the normalizer's target scaler is a
+    instance's cached ``equilibrium`` (exact and free), and the normalizer's target scaler is a
     per-feature ``Standardizer`` fit on those equilibria -- ``z*`` is a generic regression target, not
     a field, so it uses neither the field's global scale nor a warp. There is no ``train_ds`` -- the
     streaming train part is the expert solution stream (``ExpertOperatorStream(solution_target=True)``),

@@ -44,6 +44,22 @@ def _identity(item):
     return item
 
 
+def collate_dense_graphs(items, shared=("edge_index",)):
+    """Dense-batch same-topology graphs: stack every per-item tensor, store the shared topologies once.
+
+    The graph path's ``collate_fn``: the Graphormer uses dense attention over one fixed topology, so a
+    batch is stacked tensors (``feats [B, N, k]``, ``spd [B, N, N]``, real-unit operator params, ...)
+    plus the topology tensors named in ``shared`` -- identical across the batch, so stored un-stacked
+    rather than copied ``B`` times -- not a PyG sparse ``Batch``. Non-tensor attributes are skipped.
+    """
+    batch = {key: items[0][key] for key in shared}
+    for key in items[0].keys():
+        value = items[0][key]
+        if key not in shared and isinstance(value, torch.Tensor):
+            batch[key] = torch.stack([item[key] for item in items])
+    return batch
+
+
 class VariationalInequalityFamily(ABC):
     """A parametric family of variational inequalities."""
 
@@ -92,6 +108,16 @@ class VariationalInequalityFamily(ABC):
     def project(self, params, points):
         """Project ``points`` onto the feasible set (default: unconstrained)."""
         return points
+
+    @classmethod
+    def calibration_kwargs(cls, cal_instances, n_stds):
+        """Constructor kwargs derived from a dataset root's disjoint calibration solves.
+
+        The seam ``operator_datasets.OperatorDataset`` calibrates its point-sampling family through: the
+        traffic families return a ``sampling_ceiling`` computed from the calibration equilibria; a family
+        whose ``sample_domain`` box is fixed (the matrix-game charts) derives nothing (the default).
+        """
+        return {}
 
     # --- batched validation-sweep seams ------------------------------------------------------------
     # ``params_from_batch`` / ``batched_field_input`` / ``initial_point`` build the per-family inputs

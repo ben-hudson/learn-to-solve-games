@@ -1,8 +1,8 @@
 """On-disk cache of traffic instances solved to equilibrium -- the expensive stage, and nothing else.
 
-``download()`` draws instances and **solves** each to user equilibrium (``solve_fn``, ~2.5 s per instance),
-storing the result under ``equilibrium_cost`` / ``equilibrium_flow`` -- names chosen so they do not collide
-with the sampled domain point ``.cost`` that ``model_input`` sets. It writes two raw files:
+``download()`` draws instances and **solves** each to equilibrium (``solve_fn``, e.g. ~2.5 s per traffic
+instance), storing the result under ``equilibrium`` -- a name that does not collide with the sampled
+domain point ``model_input`` sets. It writes two raw files:
 
 - ``base_graph.pt`` -- the canonical graph, unsolved, carrying ``game`` and the coupling matrices.
 - ``instances.pt`` -- the dataset's solved instances. **The only ones a consumer ever splits.**
@@ -22,10 +22,10 @@ reads raw and writes nothing.
 
 Two invariants worth stating, because both were once violated:
 
-- ``equilibrium_cost`` always means "this instance's own solved equilibrium". The base graph deliberately
+- ``equilibrium`` always means "this instance's own solved equilibrium". The base graph deliberately
   carries none: ``sample_params`` clones it, so a base-graph equilibrium would be inherited by every noised
   instance as though it were its own -- right shape, plausible magnitude, and silently wrong for the two
-  things that read it (``calibrate_ceiling`` and the ``rel_dist`` reference).
+  things that read it (``calibration_kwargs`` and the ``rel_dist`` reference).
 - ``base_graph.game`` records which VI family generated the root, so a reader derives its family from the
   data rather than being told. Being told is the same silent-mismatch hazard as the coupling matrices: a
   wrong ``--game`` would condition the model on the wrong family with nothing to complain.
@@ -44,7 +44,7 @@ class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
         base_graph: canonical graph to noise instances from. Cached as-is: unsolved, but carrying the
             asymmetric coupling matrices and ``game``.
         sample_fn: zero-arg callable returning a fresh noised instance (e.g. ``family.sample_params``).
-        solve_fn: callable ``instance -> (cost, flow)`` equilibrium solver (e.g. ``PUMESolver.solve``).
+        solve_fn: callable ``instance -> equilibrium`` tensor (e.g. ``family.solve_instance``).
         n_instances: how many instances to draw and solve into the dataset.
         quiet: suppress the progress bars.
         **kwargs: forwarded to ``InMemoryDataset.__init__``.
@@ -97,7 +97,7 @@ class EquilibriumDataset(torch_geometric.data.InMemoryDataset):
         instances = []
         for _ in progress:
             instance = self.sample_fn()
-            instance.equilibrium_cost, instance.equilibrium_flow = self.solve_fn(instance)
+            instance.equilibrium = self.solve_fn(instance)
             instances.append(instance)
         return instances
 

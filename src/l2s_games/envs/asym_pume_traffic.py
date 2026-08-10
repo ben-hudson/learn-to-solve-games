@@ -83,8 +83,9 @@ probe_rotational_supply.py`` reports where that starts.
 
 **Both matrices are supplied, not rebuilt.** They are *constants of the pipeline*: built once by
 ``build_interaction_matrix(base_graph, epsilon)`` / ``build_rotation_matrix(base_graph, kappa)`` when a
-dataset is generated, persisted on that dataset's ``base_graph``, and passed back in by everything
-downstream. Nothing else may construct them -- in particular the training script must not.
+dataset is generated, persisted on that dataset's ``base_graph``, and read back off the stored graph by
+everything downstream (``__init__`` does this itself when the kwargs are omitted). Nothing else may
+construct them -- in particular the training script must not.
 
 For ``A`` that is a correctness requirement: its sparsity pattern is the deterministic link-adjacency graph,
 but its values come from an RNG seeded by ``build_asymmetric_interaction_matrix``'s default ``seed=42``,
@@ -140,12 +141,16 @@ def coupling_matrices(base_graph):
 class AsymmetricPUMEMarkovTrafficEquilibrium(PUMEMarkovTrafficEquilibrium):
     """``PUMEMarkovTrafficEquilibrium`` with a non-potential supply ``z(c) = A f(c) + B c``.
 
-    Both matrices are required: build them once with ``build_interaction_matrix`` /
-    ``build_rotation_matrix`` when generating a dataset, and pass the *stored* ones thereafter (see the
-    module docstring).
+    Both matrices are built once, with ``build_interaction_matrix`` / ``build_rotation_matrix``, when a
+    dataset is generated -- that caller passes them in. Every other consumer omits them and gets the
+    *stored* ones back off ``base_graph``, where generation persisted them, so a dataset root is
+    self-describing and nothing downstream can rebuild a mismatched coupling (see the module docstring).
     """
 
-    def __init__(self, base_graph, interaction_matrix, rotation_matrix, **kwargs):
+    def __init__(self, base_graph, interaction_matrix=None, rotation_matrix=None, **kwargs):
+        if interaction_matrix is None:  # a reader: the root's graph carries the stored couplings
+            stored = coupling_matrices(base_graph)
+            interaction_matrix, rotation_matrix = (stored[name] for name in COUPLING_MATRICES)
         # Set before super().__init__, which is what calls _make_solver.
         self.interaction_matrix = interaction_matrix
         self.rotation_matrix = rotation_matrix

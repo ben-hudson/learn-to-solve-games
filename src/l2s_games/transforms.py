@@ -112,6 +112,25 @@ class BuildTrafficEdgeData(BaseTransform):
         return data
 
 
+class BuildGameNodeData(BaseTransform):
+    """Build per-player ``data.feats = [chart point | own payoff matrix]`` for a matrix game.
+
+    The player-graph analogue of ``BuildTrafficEdgeData``, without the ``LineGraph`` step: the domain
+    point lives per player *node* (each player's simplex-chart coordinates), so the physical graph is
+    already the Graphormer's topology. Node ``i``'s conditioning is the payoff matrix on its outgoing
+    edge, flattened -- which pins the current shape to one outgoing edge per player (2-player games);
+    a polymatrix extension has to aggregate a node's edge payoffs instead. ``feats`` is
+    ``[num_nodes, chart_dim + n_actions**2]``, recomputed on every call like the traffic transform.
+    """
+
+    def forward(self, data):
+        chart = torch.as_tensor(data.point, dtype=torch.float32).reshape(data.num_nodes, -1)
+        own_edge = data.edge_index[0].argsort()  # one outgoing edge per node: edge k conditions node src[k]
+        payoffs = data.payoff.reshape(data.payoff.shape[0], -1).float()[own_edge]
+        data.feats = torch.cat([chart, payoffs], dim=-1)
+        return data
+
+
 class SPDEmbedding(BaseTransform):
     """Computes all-pairs shortest-path distances and stores them as ``data.spd``.
 
@@ -121,7 +140,9 @@ class SPDEmbedding(BaseTransform):
     """
 
     def forward(self, data):
-        adj_sp = torch_geometric.utils.to_scipy_sparse_matrix(data.edge_index, num_nodes=data.num_nodes)
+        # .tocsr(): shortest_path's auto method picks Floyd-Warshall on dense graphs (e.g. the 2-node
+        # player graph), and that path rejects the COO matrix to_scipy_sparse_matrix returns.
+        adj_sp = torch_geometric.utils.to_scipy_sparse_matrix(data.edge_index, num_nodes=data.num_nodes).tocsr()
         spd_sp = scipy.sparse.csgraph.shortest_path(adj_sp, directed=True, unweighted=True)
         data.spd = torch.as_tensor(spd_sp).float()
         return data
@@ -146,3 +167,9 @@ def traffic_field_transform():
     ``k`` is edge ``k``, so ``feats`` stays aligned with the structure.
     """
     return Compose([BuildTrafficEdgeData(), LineGraph(force_directed=True), SPDEmbedding(), DegreeEmbedding()])
+
+
+def game_field_transform():
+    """The matrix-game ``feats`` + structure pipeline: like traffic's, minus ``LineGraph`` -- the domain
+    point lives per player node, so the player graph itself is the Graphormer's topology."""
+    return Compose([BuildGameNodeData(), SPDEmbedding(), DegreeEmbedding()])

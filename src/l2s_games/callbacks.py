@@ -67,7 +67,7 @@ class FieldRolloutCallback(L.Callback):
     ``val/{algo}/{residual,eq_dist}``.
 
     The reference ``z*`` for ``eq_dist`` comes from the family's ``reference_equilibrium`` seam rather than
-    from a constructor argument: for traffic it is each instance's own cached ``equilibrium_cost``, which the
+    from a constructor argument: for traffic it is each instance's own cached ``equilibrium``, which the
     collated batch already carries, and for the Nash-centered matrix-game charts it is the origin. It used to
     be a constructor default of ``0.0`` that no caller ever overrode, so ``eq_dist`` was silently reporting
     ``||z_end||`` on the traffic families.

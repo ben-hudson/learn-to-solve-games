@@ -27,7 +27,7 @@ import torch
 from route_choice import MarkovRouteChoice
 from torch_geometric.utils import coalesce, from_networkx
 
-from l2s_games.envs.base import VariationalInequalityFamily
+from l2s_games.envs.base import VariationalInequalityFamily, collate_dense_graphs
 from l2s_games.operator_count import LocalCounter
 from l2s_games.transforms import traffic_field_transform
 
@@ -237,25 +237,31 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
         return batch["cost"]
 
     def reference_equilibrium(self, batch):
-        """Each instance's own solved ``equilibrium_cost``, ``[B, E]``.
+        """Each instance's own solved ``equilibrium``, ``[B, E]``.
 
         Survives ``model_input`` and ``collate_fn`` (it is not in ``_DROPPED_ATTRS``, and every tensor
         attribute is stacked), so the batch already carries it -- no threading required. ``.float()``
         because ``PUMESolver`` returns float64.
         """
-        return batch["equilibrium_cost"].float()
+        return batch["equilibrium"].float()
 
     @staticmethod
     def calibrate_ceiling(instances, n_stds=3.0):
         """The per-edge ``sampling_ceiling`` from a set of solved instances.
 
-        Treats the instances' equilibria (``instance.equilibrium_cost``, solved offline by
+        Treats the instances' equilibria (``instance.equilibrium``, solved offline by
         ``PUMESolver`` and cached in the dataset) as an empirical distribution, and puts the ceiling
         ``n_stds`` sigma above its per-edge mean. Feed the result into ``__init__`` so ``sample_domain``
         draws around where the equilibria actually are.
         """
-        eq = torch.stack([instance.equilibrium_cost.float() for instance in instances])  # [N, E]
+        eq = torch.stack([instance.equilibrium.float() for instance in instances])  # [N, E]
         return eq.mean(dim=0) + n_stds * eq.std(dim=0)
+
+    @classmethod
+    def calibration_kwargs(cls, cal_instances, n_stds):
+        """Constructor kwargs an operator dataset derives from its calibration solves (see
+        ``envs/base.py``): the calibrated ``sampling_ceiling``."""
+        return {"sampling_ceiling": cls.calibrate_ceiling(cal_instances, n_stds)}
 
     def sample_domain(self, graph, n):
         """Feasible cost points drawn uniformly per edge over ``[free_flow_time, sampling_ceiling]``.
@@ -303,19 +309,8 @@ class MarkovTrafficEquilibrium(VariationalInequalityFamily):
 
     @staticmethod
     def collate_fn(items):
-        """Dense-batch same-topology line graphs: stack every per-item tensor, share the topologies.
-
-        The Graphormer uses dense attention over one fixed topology, so a batch is stacked tensors
-        ``{feats [B,E,k], in_degree [B,E], out_degree [B,E], spd [B,E,E], ...}`` plus the shared
-        (line-graph) ``edge_index`` -- not a PyG sparse ``Batch``. Every other tensor attribute is
-        stacked, so the real-unit BPR/demand params survive -- the batched analytic operator needs
-        them. Both topologies (``edge_index`` and the physical ``physical_edge_index``) are identical
-        across the batch, so they are shared un-stacked rather than copied ``B`` times.
-        """
-        shared = ("edge_index", "physical_edge_index")  # one topology across the batch -- store once
-        batch = {key: items[0][key] for key in shared}
-        for key in items[0].keys():
-            value = items[0][key]
-            if key not in shared and isinstance(value, torch.Tensor):
-                batch[key] = torch.stack([item[key] for item in items])
-        return batch
+        """Dense-batch same-topology line graphs (see ``base.collate_dense_graphs``): both the line-graph
+        ``edge_index`` and the physical ``physical_edge_index`` are identical across the batch, and every
+        other tensor attribute is stacked -- so the real-unit BPR/demand params survive, which the
+        batched analytic operator needs."""
+        return collate_dense_graphs(items, shared=("edge_index", "physical_edge_index"))

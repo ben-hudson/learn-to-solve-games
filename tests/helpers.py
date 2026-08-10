@@ -41,7 +41,7 @@ def solved_traffic_root(root, n_instances=4, game="pume_traffic"):
         str(root),
         base_graph=family.base_graph,
         sample_fn=family.sample_params,
-        solve_fn=family.solver.solve,
+        solve_fn=family.solve_instance,
         n_instances=n_instances,
         quiet=True,
     )

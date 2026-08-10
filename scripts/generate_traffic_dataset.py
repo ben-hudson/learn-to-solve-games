@@ -40,7 +40,7 @@ to one re-runs the whole ``download()`` (reproducible under the same ``--seed``;
 generate an operator root.
 
 ``--game`` picks which operator the equilibria are solved for, and the choice is **load-bearing**: the
-asymmetric family's equilibrium is a different point, and the cached ``equilibrium_cost`` is both the
+asymmetric family's equilibrium is a different point, and the cached ``equilibrium`` is both the
 sampling-ceiling calibration and the ``rel_dist`` reference during training. It is recorded on the root's
 ``base_graph``, so readers derive the family from the data instead of being told. Generate a separate root
 per (game, epsilon, kappa):
@@ -162,7 +162,7 @@ def build_parser():
         "l2s_games/pume_solver.py)",
     )
     # PUMESolver's own default (1e-1) is far too loose to *cache*: it stops early, leaving a natural-map
-    # residual of ~0.2-1.0 at the returned cost instead of ~1e-3, and equilibrium_cost is both the
+    # residual of ~0.2-1.0 at the returned cost instead of ~1e-3, and the cached equilibrium is both the
     # sampling-range calibration and the rel_dist reference for every training run that reads this cache.
     # Measured on Sioux Falls (per instance, tol -> residual / relative distance to a converged solve):
     # 1e-1 -> 0.22 / 1.1e-2,  1e-2 -> 2.1e-2 / 1.0e-3,  1e-3 -> 9.2e-4 / 3.5e-5,  1e-4 -> 1.4e-4 / 5.3e-6.
@@ -212,7 +212,7 @@ def main(args):
     solve_kwargs = dict(
         base_graph=family.base_graph,
         sample_fn=family.sample_params,
-        solve_fn=family.solver.solve,
+        solve_fn=family.solve_instance,
         n_instances=args.n_instances,
         force_reload=args.force_reload,
     )
