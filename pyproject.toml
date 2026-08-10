@@ -18,6 +18,10 @@ dependencies = [
     "torchvision",
     "wandb",
     "scipy",
+    # StandardScaler.partial_fit, for the streaming normalizer fit (see data.Standardizer.fit_iter).
+    # Already present transitively via route-choice; declared so a release of that dropping it cannot
+    # break this import silently.
+    "scikit-learn",
 ]
 
 [tool.setuptools.packages.find]

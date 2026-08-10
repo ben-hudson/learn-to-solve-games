@@ -17,13 +17,8 @@ import pathlib
 import pytest
 import torch
 
-from l2s_games.data import (
-    INSTANCE_INDEX,
-    PRECONDITIONER_DIAGONAL,
-    build_streaming_operator_dataset,
-    collate_examples,
-    split_instances,
-)
+from l2s_games.data import INSTANCE_INDEX, PRECONDITIONER_DIAGONAL, split_instances
+from l2s_games.streaming import build_streaming_operator_dataset, collate_examples
 from l2s_games.envs import make_game
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium, load_sioux_falls_base_graph
 from l2s_games.instance_sampling import FixedInstanceOperatorStream

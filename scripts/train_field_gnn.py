@@ -67,13 +67,8 @@ from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.caching import CachedOperatorStream
-from l2s_games.callbacks import FieldRolloutCallback, OperatorCountCallback, SolutionPredictionCallback
-from l2s_games.data import (
-    build_streaming_operator_dataset,
-    build_streaming_solution_dataset,
-    collate_examples,
-    split_instances,
-)
+from l2s_games.callbacks import FieldRolloutCallback, SolutionPredictionCallback
+from l2s_games.data import split_instances
 from l2s_games.datasets import EquilibriumDataset
 from l2s_games.envs import GAMES, make_game
 from l2s_games.envs.asym_pume_traffic import coupling_matrices
@@ -85,8 +80,14 @@ from l2s_games.models import (
     MLPBackbone,
     SolutionModel,
 )
-from l2s_games.operator_count import SharedCounter
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
+from l2s_games.streaming import (
+    OperatorCountCallback,
+    SharedCounter,
+    build_streaming_operator_dataset,
+    build_streaming_solution_dataset,
+    collate_examples,
+)
 
 torch.set_float32_matmul_precision("medium")
 

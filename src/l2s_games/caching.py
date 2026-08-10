@@ -35,7 +35,8 @@ Three properties worth knowing:
 
 import torch
 
-from l2s_games.data import OperatorStream, operator_examples, sample_and_eval_operator
+from l2s_games.data import operator_examples, sample_and_eval_operator
+from l2s_games.streaming import OperatorStream
 
 
 class CachedOperatorStream(OperatorStream):

@@ -10,19 +10,14 @@ they differ only in how ``z_end`` is produced, so each has its own thin callback
 - ``SolutionPredictionCallback`` -- the solution model predicts ``z*`` directly, so ``z_end`` is just
   its (projected) prediction; no rollout.
 
-``VizRolloutCallback`` logs the rollout + true/learned field visualizations through training for the
-on-policy training mode (see ``rollout_sampling``).
+The streaming path's own callbacks -- ``OperatorCountCallback`` (the streaming operator budget) and
+``VizRolloutCallback`` (on-policy rollout plots) -- live in ``streaming`` with the sources that need them.
 """
 
-import os
-
 import lightning as L
-import matplotlib.pyplot as plt
-from lightning.pytorch.loggers import WandbLogger
 
 from l2s_games.algorithms import ALGORITHMS
 from l2s_games.dynamics import natural_map, simulate
-from l2s_games.viz import plot_trajectory_arrows
 
 
 def _log_equilibrium_metrics(pl_module, family, inputs, z_end, name, equilibrium):
@@ -113,96 +108,3 @@ class SolutionPredictionCallback(L.Callback):
         _log_equilibrium_metrics(pl_module, self.family, inputs, z_end, "solution", equilibrium)
 
 
-class OperatorCountCallback(L.Callback):
-    """Log the cumulative ground-truth operator point-evaluation budget once per epoch.
-
-    The ``SharedCounter`` (see ``operator_count``) accumulates every training-data operator call
-    across the streaming workers and the main process; this logs its current (monotonic) value, so
-    the logged series *is* the cumulative-sum curve -- no in-dashboard cumsum needed. Logging goes
-    through ``pl_module.log`` (never ``experiment.log``) so wandb's step bookkeeping stays in sync;
-    register it as a ``wandb.define_metric`` step_metric at the call site to plot other metrics
-    against the budget.
-
-    Logged from **two** epoch-boundary hooks with ``on_epoch=True`` -- once in ``on_train_epoch_end``
-    (pairing with ``train/loss`` / ``train/mse``) and once in ``on_validation_epoch_end`` (pairing with
-    the ``val/*`` metrics). Both are needed because Lightning's ``WandbLogger.log_metrics`` does *not*
-    forward a ``step`` to ``wandb.log`` -- it lets wandb auto-increment ``_step`` once per
-    ``log_metrics`` call. The training-epoch flush and the validation-loop flush are separate
-    ``log_metrics`` calls, so they land on *different* ``_step`` s: logging the budget only at
-    ``on_train_epoch_end`` put it on the train flush's step, which no ``val/*`` metric ever shares, so
-    selecting it as the custom x-axis for a val metric returned "no data" (nothing to pair against).
-    Logging it in the validation flush too puts a copy on the val metrics' step (validation does not
-    touch the training family's counter, so the value matches the same epoch's train-flush value).
-    """
-
-    def __init__(self, counter, key="train/operator_evals"):
-        super().__init__()
-        self.counter = counter
-        self.key = key
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        pl_module.log(self.key, float(self.counter.value), on_step=False, on_epoch=True)
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        # Shares the validation flush's wandb _step so val/* metrics can be plotted against the budget.
-        pl_module.log(self.key, float(self.counter.value), on_step=False, on_epoch=True)
-
-
-class VizRolloutCallback(L.Callback):
-    """Log the rollout trajectory + true/learned operators along it, for fixed instances through training.
-
-    Each validation epoch, for each fixed held-out instance rolls out the learned field and draws one
-    plot over the full domain: the trajectory as a blue line, with the true (crimson) and learned
-    (blue) operators arrowed (magnitude-scaled, shared scale) at ``n_arrows`` points along it (see
-    ``viz.plot_trajectory_arrows``). Both fields are shown because a lookahead/momentum algorithm does
-    not step straight along the learned field, so the trajectory tangent isn't the learned direction.
-    Logged as ``viz/rollout`` via the Lightning logger when it is wandb (so wandb's step bookkeeping
-    stays consistent -- never ``experiment.log`` directly), else saved to
-    ``{save_dir}/rollout_viz/epoch_{n}.png``.
-    """
-
-    def __init__(self, family, instances, algo, h, n_steps, save_dir, n_arrows=20):
-        super().__init__()
-        self.family = family
-        self.instances = instances
-        self.algo = algo
-        self.h = h
-        self.n_steps = n_steps
-        self.save_dir = save_dir
-        self.n_arrows = n_arrows
-        # Fixed random starts, one per instance, so the trajectory across epochs is comparable.
-        self.starts = [family.sample_domain(params, 1)[0] for params in instances]
-
-    def on_validation_epoch_end(self, trainer, pl_module):
-        epoch = trainer.current_epoch
-        n = len(self.instances)
-        cols = min(n, 3)
-        rows = -(-n // cols)
-        fig, axes = plt.subplots(rows, cols, figsize=(4.6 * cols, 4.6 * rows), squeeze=False)
-        axes = axes.ravel()
-        for ax, params, z0 in zip(axes, self.instances, self.starts):
-            true_field = lambda z, p=params: self.family.operator(p, z)
-            learned_field = pl_module.conditioned_field(self.family, params)
-            project = lambda z, p=params: self.family.project(p, z)
-            traj = simulate(
-                lambda z: -learned_field(z), ALGORITHMS[self.algo](self.h), z0, self.n_steps, project=project
-            )
-            summary = ", ".join(f"p{i}={v:.2f}" for i, v in enumerate(params.tolist()))
-            plot_trajectory_arrows(
-                ax, traj, true_field, learned_field, lim=self.family.lim, n_arrows=self.n_arrows, title=summary
-            )
-            ax.legend(fontsize=8, loc="upper right")
-        for ax in axes[n:]:
-            ax.axis("off")
-        fig.suptitle(f"rollout ({self.algo}): trajectory + true/learned operator -- epoch {epoch}", fontsize=12)
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
-
-        if isinstance(trainer.logger, WandbLogger):
-            # Go through the Lightning logger (not experiment.log) so wandb's step counter stays in sync
-            # with the metric logging -- a direct experiment.log desyncs the step and drops points on sync.
-            trainer.logger.log_image(key="viz/rollout", images=[fig], step=trainer.global_step)
-        else:
-            out_dir = os.path.join(self.save_dir, "rollout_viz")
-            os.makedirs(out_dir, exist_ok=True)
-            fig.savefig(os.path.join(out_dir, f"epoch_{epoch:04d}.png"), dpi=110)
-        plt.close(fig)

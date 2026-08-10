@@ -26,7 +26,8 @@ import torch
 from torch.utils.data import DataLoader
 
 from l2s_games.caching import CachedOperatorStream
-from l2s_games.data import INSTANCE_INDEX, build_dataset
+from l2s_games.data import INSTANCE_INDEX
+from l2s_games.streaming import build_dataset
 from l2s_games.envs import make_game
 
 from helpers import CountingFamily, take

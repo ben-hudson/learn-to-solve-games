@@ -20,7 +20,7 @@ each visit -- see ``caching.CachedOperatorStream``.
 
 import torch
 
-from l2s_games.data import OperatorStream, examples_at_points
+from l2s_games.streaming import OperatorStream, examples_at_points
 
 
 class FixedInstanceOperatorStream(OperatorStream):

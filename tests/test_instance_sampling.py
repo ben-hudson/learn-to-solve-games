@@ -17,7 +17,8 @@ import pathlib
 import pytest
 import torch
 
-from l2s_games.data import INSTANCE_INDEX, build_dataset, collate_examples
+from l2s_games.data import INSTANCE_INDEX
+from l2s_games.streaming import build_dataset, collate_examples
 from l2s_games.envs import make_game
 from l2s_games.envs.pume_traffic import load_sioux_falls_base_graph
 from l2s_games.instance_sampling import FixedInstanceOperatorStream

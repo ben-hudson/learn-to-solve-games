@@ -52,7 +52,7 @@ from l2s_games.data import (
 from l2s_games.datasets import EquilibriumDataset
 from l2s_games.dynamics import simulate
 from l2s_games.envs import GAMES
-from l2s_games.rollout_sampling import RecordedField, with_endpoint
+from l2s_games.recording import RecordedField, with_endpoint
 
 # The three per-instance tensors a point source produces, in `OperatorEvaluations` field order. Listed in
 # `traffic._DROPPED_ATTRS` too, so `model_input` strips them from the example it builds: they ride on the
@@ -61,7 +61,7 @@ from l2s_games.rollout_sampling import RecordedField, with_endpoint
 EVALUATION_ATTRS = ("points", "targets", "preconditioner_diagonal")
 
 
-def _root_family(base_graph, **kwargs):
+def root_family(base_graph, **kwargs):
     """The family a root's ``base_graph`` names.
 
     Everything rides on the root: ``base_graph.game`` picks the family, and anything else the family's
@@ -125,7 +125,7 @@ class OperatorDataset(EquilibriumDataset):
         """
         base_graph = self.raw_base_graph()
         kwargs = GAMES[base_graph.game].calibration_kwargs(self.cal_instances(), self.n_stds)
-        return _root_family(base_graph, **kwargs)
+        return root_family(base_graph, **kwargs)
 
     def process(self):
         """Attach each instance's operator examples -- the cheap stage, one processed file per source."""
@@ -148,7 +148,7 @@ class OperatorDataset(EquilibriumDataset):
         the operator, the solver, or ``sample_domain``. Built lazily and dropped by ``__getstate__``, so
         each ``DataLoader`` worker constructs its own."""
         if self._family is None:
-            self._family = _root_family(self.base_graph)
+            self._family = root_family(self.base_graph)
         return self._family
 
     def __getstate__(self):
@@ -176,6 +176,16 @@ class OperatorDataset(EquilibriumDataset):
         """Per-instance access, now that indexing means examples: the solved instances with their
         examples attached."""
         return [self.get(i) for i in range(self.len())]
+
+    def raw_examples(self, instances, order=None):
+        """The raw ``(model input, target)`` examples of ``instances``, ``order`` picking which points of each.
+
+        The per-instance counterpart of ``__getitem__``'s flat index, for a caller that wants examples grouped
+        by instance rather than addressed by one integer -- fitting a normalizer over a train split, say (see
+        ``data.fit_normalizer``). A generator, so the caller decides what to materialize.
+        """
+        for index in instances:
+            yield from operator_examples(self.family, self.evaluations(index), order=order)
 
     def __len__(self):
         """Examples, not instances -- PyG's ``len()`` keeps counting instances underneath."""

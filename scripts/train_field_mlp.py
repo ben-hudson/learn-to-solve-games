@@ -26,13 +26,13 @@ from lightning.pytorch.loggers import CSVLogger
 from torch.utils.data import DataLoader
 
 from l2s_games.algorithms import ALGORITHMS
-from l2s_games.callbacks import FieldRolloutCallback, VizRolloutCallback
-from l2s_games.data import UniformSampledOperatorStream, build_dataset, collate_examples
+from l2s_games.callbacks import FieldRolloutCallback
 from l2s_games.dynamics import simulate
 from l2s_games.envs import make_game
 from l2s_games.models import FieldModel, MLPBackbone
 from l2s_games.rollout_sampling import ExpertOperatorStream, OnPolicyOperatorStream
 from l2s_games.viz import overlay_trajectory, plot_field_quiver
+from l2s_games.streaming import UniformSampledOperatorStream, VizRolloutCallback, build_dataset, collate_examples
 
 
 # --------------------------------------------------------------------------

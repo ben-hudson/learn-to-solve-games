@@ -41,6 +41,7 @@ from l2s_games.data import (
     Normalizer,
     Standardizer,
     collate_normalized_examples,
+    fit_normalizer,
 )
 from l2s_games.datasets import EquilibriumDataset
 from l2s_games.envs import make_game
@@ -324,6 +325,97 @@ def test_reference_equilibrium_is_each_instances_own_solved_cost(uniform_root):
     assert equilibrium.shape == (batch_size, dataset.get(0).num_edges)
     assert torch.allclose(equilibrium[0], dataset.get(0).equilibrium.float())
     assert not torch.allclose(equilibrium[0], equilibrium[-1]), "every row got the same instance's z*"
+
+
+# --- the normalizer fit ----------------------------------------------------------------------------
+
+
+def test_raw_examples_agrees_with_flat_indexing(uniform_root):
+    """The two handles onto the same data -- per-instance and flat -- must not drift.
+
+    ``raw_examples`` exists so a caller can group by instance without redoing ``__getitem__``'s ``divmod``;
+    if the two disagreed, a normalizer would be fit on different examples than training sees.
+    """
+    dataset, _root = uniform_root
+    grouped = list(dataset.raw_examples(range(dataset.len())))
+
+    assert len(grouped) == len(dataset)
+    for (grouped_item, grouped_target), (flat_item, flat_target) in zip(grouped, dataset):
+        assert torch.equal(grouped_item["cost"], flat_item["cost"])
+        assert torch.equal(grouped_target, flat_target)
+
+
+def test_raw_examples_order_selects_points_within_each_instance(uniform_root):
+    """``order`` is per *instance*, so every instance contributes whatever it selects.
+
+    The property that matters for a subsampled fit: a stride over the flat index would skip whole instances
+    once it exceeded ``ppi``, while ``order`` cannot.
+    """
+    dataset, _root = uniform_root
+    firsts = list(dataset.raw_examples(range(dataset.len()), order=[0]))
+
+    assert len(firsts) == dataset.len()
+    for index, (item, _target) in enumerate(firsts):
+        assert torch.equal(item["cost"], dataset.evaluations(index).points[0])
+
+
+def test_streamed_feats_fit_matches_a_stacked_one(uniform_root):
+    """``Standardizer.fit_iter`` is an implementation detail of *how* the population is read, not a
+    different statistic -- so it must agree with ``fit`` over the same stacked population.
+
+    A tolerance rather than equality: sklearn accumulates the population std (ddof=0) where torch's default
+    is unbiased, a ``sqrt(n/(n-1))`` factor. Also pins the zero-variance convention on traffic's constant
+    ``b`` / ``power`` columns, which is the one place the two implementations could silently diverge.
+    """
+    dataset, _root = uniform_root
+    feats = [dataset.family.transform(item)["feats"] for item, _ in dataset.raw_examples(range(dataset.len()))]
+
+    stacked = Standardizer.fit(torch.stack(feats))
+    streamed = Standardizer.fit_iter(iter(feats))
+
+    assert torch.allclose(stacked.mean, streamed.mean, atol=1e-4)
+    assert torch.allclose(stacked.std, streamed.std, rtol=1e-3)
+    assert (streamed.std > 0).all(), "a constant feature divided by zero instead of mapping to 1"
+
+
+def test_fit_normalizer_uses_only_the_instances_it_is_given(uniform_root):
+    """The fit-on-train invariant, and the reason the caller passes instance indices.
+
+    Fitting over the whole root must give a *different* normalizer than fitting over a strict subset --
+    otherwise held-out instances would be contributing statistics with nothing to reveal it.
+    """
+    dataset, _root = uniform_root
+    train = range(dataset.len() - 1)
+
+    def fit(instances):
+        return fit_normalizer(
+            (dataset.family.transform(item)["feats"] for item, _ in dataset.raw_examples(instances)),
+            torch.cat([dataset.evaluations(i).targets for i in instances]),
+        )
+
+    partial, whole = fit(train), fit(range(dataset.len()))
+
+    assert not torch.allclose(partial.input.mean, whole.input.mean)
+    assert not torch.allclose(partial.target.std, whole.target.std)
+
+
+def test_fit_normalizer_sees_every_point_not_just_the_first(tmp_path, base_graph):
+    """Fitting over every example must differ from fitting over one point per instance.
+
+    On an expert root the trajectory descends, so point 0 is the rollout *start* and the rest sit nearer the
+    equilibrium: a fit that quietly sampled only the starts would be calibrated to the wrong distribution.
+    This is the assertion that keeps the fit exhaustive.
+    """
+    dataset = build_root(tmp_path / "root", base_graph, ExpertOperatorDataset, n_steps=N_STEPS)
+    instances = range(dataset.len())
+
+    def feats(order):
+        return (dataset.family.transform(item)["feats"] for item, _ in dataset.raw_examples(instances, order))
+
+    every = Standardizer.fit_iter(feats(None))
+    starts_only = Standardizer.fit_iter(feats([0]))
+
+    assert not torch.allclose(every.mean, starts_only.mean)
 
 
 # --- targets ---------------------------------------------------------------------------------------
