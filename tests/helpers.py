@@ -15,7 +15,7 @@ import pathlib
 
 import pytest
 
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.traffic import load_sioux_falls_base_graph
 

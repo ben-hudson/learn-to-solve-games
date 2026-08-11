@@ -19,7 +19,7 @@ import pathlib
 import pytest
 import torch
 
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import bind, make_game
 from l2s_games.envs.asym_pume_traffic import (
     build_interaction_matrix,
@@ -374,7 +374,9 @@ def test_equilibrium_differs_from_the_symmetric_one(base_graph, family, base_equ
     symmetric_equilibrium, _flow = symmetric.solver.solve(symmetric.base_graph)
 
     relative_gap = (base_equilibrium - symmetric_equilibrium.float()).norm() / symmetric_equilibrium.float().norm()
-    assert relative_gap > 1e-3, f"asymmetric equilibrium is indistinguishable from the symmetric one ({relative_gap:.3g})"
+    assert (
+        relative_gap > 1e-3
+    ), f"asymmetric equilibrium is indistinguishable from the symmetric one ({relative_gap:.3g})"
 
 
 def test_batched_matches_per_instance(family):

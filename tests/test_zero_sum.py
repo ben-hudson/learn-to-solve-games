@@ -1,11 +1,8 @@
 import pytest
 import torch
-from l2s_games.envs.gamut import (
-    RandomZeroSum,
-    RandomZeroSumEquilibriumDataset,
-    RandomZeroSumOperatorDataset,
-    profile_to_tensor,
-)
+
+from l2s_games.envs.zero_sum import RandomZeroSum, profile_to_tensor
+from l2s_games.datasets.zero_sum import RandomZeroSumEquilibriumDataset, RandomZeroSumOperatorDataset
 
 
 @pytest.fixture

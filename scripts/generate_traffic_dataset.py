@@ -60,7 +60,7 @@ import argparse
 
 import lightning as L
 
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.asym_pume_traffic import build_interaction_matrix, build_rotation_matrix
 from l2s_games.envs.traffic import load_sioux_falls_base_graph

@@ -48,7 +48,7 @@ from l2s_games.data import (
     normalize_example,
     solution_examples,
 )
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.models import FieldModel, GraphormerBackbone, MLPBackbone, SolutionModel
 from l2s_games.operator_datasets import OPERATOR_DATASETS, root_family
 
@@ -211,9 +211,7 @@ def main(args):
     # Fit on the train split only, over every one of its examples. Feats are streamed rather than stacked:
     # they have to be built (one transform each), and the stacked population would be gigabytes on a wide
     # root. Passing both populations here is what keeps the fit-on-train choice visible.
-    normalizer = fit_normalizer(
-        (family.transform(item)["feats"] for item, _ in train), targets, target_scaler
-    )
+    normalizer = fit_normalizer((family.transform(item)["feats"] for item, _ in train), targets, target_scaler)
     print(f"train: {len(train)} examples   val: {len(val)}   game: {dataset.base_graph.game}")
 
     sample, _target = normalize_example(*train[0], family.transform, normalizer)

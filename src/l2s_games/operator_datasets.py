@@ -49,7 +49,7 @@ from l2s_games.data import (
     operator_examples,
     sample_and_eval_operator,
 )
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.dynamics import simulate
 from l2s_games.envs import GAMES
 from l2s_games.recording import RecordedField, with_endpoint

@@ -30,13 +30,12 @@ import torch
 
 from l2s_games.data import PRECONDITIONER_DIAGONAL, split_instances
 from l2s_games.streaming import build_dataset, build_streaming_operator_dataset
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.pume_traffic import PUMEMarkovTrafficEquilibrium
 from l2s_games.rollout_sampling import ExpertOperatorStream
 
 from helpers import CountingFamily, solved_traffic_root, take
-
 
 N_INSTANCES = 3
 N_STEPS = 5

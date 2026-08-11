@@ -26,7 +26,7 @@ import argparse
 import lightning as L
 import torch
 
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.dynamics import natural_map
 from l2s_games.envs import make_game
 from l2s_games.envs.gamut import build_gamut_base_graph
@@ -72,8 +72,13 @@ def build_parser():
     )
     # --- the solve stage (rollout on the true operator) ------------------------------------------------
     p.add_argument("--solve_algo", default="extragradient", help="rollout algorithm for solve_instance")
-    p.add_argument("--solve_h", type=float, default=0.2, help="solve rollout step size (measured: ~1e-7 "
-                   "residual at 2000 steps on RandomZeroSum; 0.05 stalls at ~1e-2)")
+    p.add_argument(
+        "--solve_h",
+        type=float,
+        default=0.2,
+        help="solve rollout step size (measured: ~1e-7 "
+        "residual at 2000 steps on RandomZeroSum; 0.05 stalls at ~1e-2)",
+    )
     p.add_argument("--solve_steps", type=int, default=2000, help="solve rollout length")
     p.add_argument(
         "--n_cal_instances",
@@ -143,7 +148,9 @@ def main(args):
     if args.operator_dataset != "none":
         summary += f", each with {dataset.points_per_instance} {args.operator_dataset} operator examples"
     print(f"generated {summary}")
-    print(f"worst natural-map residual at the cached equilibria: {worst_natural_map_residual(family, dataset.solved_instances()):.3g}")
+    print(
+        f"worst natural-map residual at the cached equilibria: {worst_natural_map_residual(family, dataset.solved_instances()):.3g}"
+    )
 
 
 if __name__ == "__main__":

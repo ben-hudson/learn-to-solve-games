@@ -69,7 +69,7 @@ from l2s_games.algorithms import ALGORITHMS
 from l2s_games.caching import CachedOperatorStream
 from l2s_games.callbacks import FieldRolloutCallback, SolutionPredictionCallback
 from l2s_games.data import split_instances
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import GAMES, make_game
 from l2s_games.envs.asym_pume_traffic import coupling_matrices
 from l2s_games.instance_sampling import FixedInstanceOperatorStream

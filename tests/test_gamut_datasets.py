@@ -27,7 +27,7 @@ from l2s_games.data import (
     Standardizer,
     collate_normalized_examples,
 )
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.gamut import build_gamut_base_graph
 from l2s_games.gamut import default_jar, generate_payoffs
@@ -56,7 +56,12 @@ def fake_generate_payoffs(gamut_class, n_actions, jar_path, min_payoff=-1.0, max
     raw = min_payoff + (max_payoff - min_payoff) * torch.rand(n_actions, n_actions)
     x, y = torch.distributions.Dirichlet(torch.full((2, n_actions), 5.0)).sample()
     ones = torch.ones(n_actions)
-    a = raw - torch.outer(raw @ y, ones) - torch.outer(ones, raw.T @ x) + (x @ raw @ y) * torch.ones(n_actions, n_actions)
+    a = (
+        raw
+        - torch.outer(raw @ y, ones)
+        - torch.outer(ones, raw.T @ x)
+        + (x @ raw @ y) * torch.ones(n_actions, n_actions)
+    )
     return a, -a
 
 

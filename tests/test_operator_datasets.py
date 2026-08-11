@@ -43,7 +43,7 @@ from l2s_games.data import (
     collate_normalized_examples,
     fit_normalizer,
 )
-from l2s_games.datasets import EquilibriumDataset
+from l2s_games.equilibrium_datasets import EquilibriumDataset
 from l2s_games.envs import make_game
 from l2s_games.envs.traffic import load_sioux_falls_base_graph
 from l2s_games.operator_datasets import ExpertOperatorDataset, OperatorDataset, UniformOperatorDataset
@@ -183,9 +183,7 @@ def test_the_box_is_calibrated_from_the_cal_set_not_the_dataset(uniform_root):
     family = dataset._calibrated_family()
 
     assert torch.equal(family.sampling_ceiling, type(family).calibrate_ceiling(dataset.cal_instances(), 3.0))
-    assert not torch.allclose(
-        family.sampling_ceiling, type(family).calibrate_ceiling(dataset.instances(), 3.0)
-    )
+    assert not torch.allclose(family.sampling_ceiling, type(family).calibrate_ceiling(dataset.instances(), 3.0))
 
 
 def test_process_builds_its_family_through_the_calibration(tmp_path, base_graph, monkeypatch):
@@ -208,9 +206,7 @@ def test_process_builds_its_family_through_the_calibration(tmp_path, base_graph,
     dataset = build_root(root, base_graph, UniformOperatorDataset, points_per_instance=POINTS_PER_INSTANCE)
 
     assert len(calls) == 1, "process() did not build its family through _calibrated_family"
-    assert torch.equal(
-        calls[0], torch.stack([instance.equilibrium for instance in dataset.cal_instances()])
-    )
+    assert torch.equal(calls[0], torch.stack([instance.equilibrium for instance in dataset.cal_instances()]))
 
 
 def test_the_root_records_its_own_family_and_no_stale_equilibrium(uniform_root):
