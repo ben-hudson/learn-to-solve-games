@@ -219,5 +219,6 @@ CLAUDE.md
 wandb/
 results/
 checkpoints/
-datasets/
+datasets/**
 raw_data/
+slop/
