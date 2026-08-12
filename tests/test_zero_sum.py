@@ -66,10 +66,10 @@ def test_smoke_equilibrium_dataset(tmp_path):
 
 
 def test_smoke_operator_dataset(tmp_path):
-    dataset = RandomZeroSumOperatorDataset(tmp_path, n_instances=5, n_points_per_instance=2, n_actions=3)
+    dataset = RandomZeroSumOperatorDataset(tmp_path, n_instances=10, n_points_per_instance=4, n_actions=3)
 
     assert len(dataset) == 10
     assert dataset[0].A.shape == (3, 3)
     assert dataset[0].B.shape == (3, 3)
-    assert dataset[0].point.shape == (2, 3)
-    assert dataset[0].operator.shape == (2, 3)
+    assert dataset[0].point.shape == (4, 2, 3)
+    assert dataset[0].operator.shape == (4, 2, 3)

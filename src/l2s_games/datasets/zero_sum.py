@@ -11,7 +11,7 @@ class RandomZeroSumEquilibriumDataset(InMemoryDataset):
         self,
         root,
         n_instances=None,
-        n_actions=3,
+        n_actions=None,
         gamut_jar="./gamut.jar",
         quiet=True,
         **kwargs,
@@ -30,10 +30,10 @@ class RandomZeroSumEquilibriumDataset(InMemoryDataset):
 
     @property
     def processed_file_names(self):
-        return ["equilibria.pt"]
+        return ["instances.pt"]
 
     def download(self):
-        required_attrs = ["n_instances", "n_actions", "gamut_jar"]
+        required_attrs = ["n_instances", "n_actions"]
         assert all(
             getattr(self, attr) for attr in required_attrs
         ), f"No cache at {self.raw_paths[0]}. Pass {required_attrs} to rebuild it."
@@ -43,8 +43,7 @@ class RandomZeroSumEquilibriumDataset(InMemoryDataset):
         data_list = []
         for i in progress:
             instance = RandomZeroSum(n_actions=self.n_actions, solve=True, gamut_jar=self.gamut_jar)
-            data = instance.to_data().apply(lambda tensor: tensor.to(torch.float32))
-            data_list.append(data)
+            data_list.append(instance.to_data())
 
         torch.save(data_list, self.raw_paths[0])
 
@@ -71,19 +70,21 @@ class RandomZeroSumOperatorDataset(RandomZeroSumEquilibriumDataset):
         return torch.stack([-y @ instance.A.T, -x @ instance.B], dim=-2)
 
     def process(self):
-        required_attrs = ["n_actions", "n_points_per_instance"]
+        required_attrs = ["n_points_per_instance"]
         assert all(
             getattr(self, attr) for attr in required_attrs
         ), f"No cache at {self.processed_paths[0]}. Pass {required_attrs} to rebuild it."
 
-        progress = iter(self.load_instances()) if self.quiet else tqdm.tqdm(self.load_instances())
-        player_simplex = torch.distributions.Dirichlet(torch.ones(self.n_actions))
+        instances = self.load_instances()
+        n_actions = instances[0].A.size(0)
+        player_simplex = torch.distributions.Dirichlet(torch.ones(n_actions))
+
+        progress = instances if self.quiet else tqdm.tqdm(instances)
 
         data_list = []
         for instance in progress:
-            points = player_simplex.sample((self.n_points_per_instance, 2))  # 2 players
-            operators = self.eval_operator(instance, points)
-            for point, operator in zip(points, operators):
-                data_list.append(Data(A=instance.A, B=instance.B, point=point, operator=operator))
+            instance.point = player_simplex.sample((self.n_points_per_instance, 2))  # 2 players
+            instance.operator = self.eval_operator(instance, instance.point)
+            data_list.append(instance)
 
         self.save(data_list, self.processed_paths[0])

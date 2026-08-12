@@ -30,15 +30,18 @@ class RandomZeroSum:
 
     def to_data(self):
         # player interaction graph is just a complete graph
-        adjacency = torch.ones(2, 2) - torch.eye(2)
+        n_players = 2
+        adjacency = torch.ones(n_players, n_players, dtype=torch.long) - torch.eye(n_players, dtype=torch.long)
         edge_index, _ = torch_geometric.utils.dense_to_sparse(adjacency)
 
         A, B = self.game.to_arrays(dtype=float)
         return Data(
             edge_index=edge_index,
-            A=torch.as_tensor(A.astype(float)),
-            B=torch.as_tensor(B.astype(float)),
-            eq=profile_to_tensor(self.eq),
+            num_nodes=n_players,
+            # messy because to_arrays returns object even though we ask for floats
+            A=torch.as_tensor(A.astype(float), dtype=torch.float32),
+            B=torch.as_tensor(B.astype(float), dtype=torch.float32),
+            eq=profile_to_tensor(self.eq).to(torch.float32),
         )
 
     @classmethod
