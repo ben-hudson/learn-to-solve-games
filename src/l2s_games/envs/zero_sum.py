@@ -1,8 +1,8 @@
 import pygambit as gambit
 import torch
-import torch_geometric
 
 from torch_geometric.data import Data
+from torch_geometric.utils import dense_to_sparse
 
 
 def project_onto_simplex(strategies):
@@ -70,7 +70,7 @@ class RandomZeroSum:
         # player interaction graph is just a complete graph
         n_players = 2
         adjacency = torch.ones(n_players, n_players, dtype=torch.long) - torch.eye(n_players, dtype=torch.long)
-        edge_index, _ = torch_geometric.utils.dense_to_sparse(adjacency)
+        edge_index, _ = dense_to_sparse(adjacency)
 
         A, B = self.game.to_arrays(dtype=float)
         return Data(
