@@ -1,9 +1,11 @@
 import pytest
 import torch
 
+from l2s_games.algorithms import Optimistic
 from l2s_games.envs.zero_sum import (
     dist_to_normal_cone,
     profile_to_tensor,
+    project_onto_simplex,
     RandomZeroSum,
     RandomZeroSumEquilibriumDataset,
     RandomZeroSumOperatorDataset,
@@ -39,6 +41,22 @@ def test_normal_cone_dist_nonzero(random_zero_sum: RandomZeroSum):
 
     dist = dist_to_normal_cone(-operator, point)
     assert (dist > 0.0).all()
+
+
+def test_optimistic_converges(random_zero_sum: RandomZeroSum):
+    instance = random_zero_sum.to_data()
+
+    # eval_operator returns the descent-convention VI field; the algorithm ascends its negation
+    def operator(point):
+        return -RandomZeroSumOperatorDataset.eval_operator(instance, point)
+
+    algorithm = Optimistic(2e-3, operator, project_onto_simplex)
+    strategies = torch.full_like(instance.eq, 1 / instance.eq.size(-1))  # uniform strategy
+    for _ in range(2000):
+        strategies = algorithm.step(strategies)
+
+    dist = dist_to_normal_cone(operator(strategies), strategies)
+    assert torch.allclose(dist, torch.tensor(0.0), atol=1e-3)
 
 
 def test_data_round_trip(random_zero_sum: RandomZeroSum):

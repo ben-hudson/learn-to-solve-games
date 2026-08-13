@@ -1,18 +1,17 @@
 """
 Game-optimization dynamics as a small class hierarchy.
 
-Each algorithm is an ``Algorithm`` subclass carrying its own state and step size ``h``, and exposing
-``step(z, v, project) -> z_next``, where ``z`` is the current iterate (any shape), ``v`` is the vector
-field, and ``project`` maps a point onto the feasible set. Every constructor takes ``h`` first
-(subclasses add their own extra hyperparameters), so the ``ALGORITHMS`` registry can build any of them
-uniformly as ``ALGORITHMS[name](h, **kwargs)``. To add your own, subclass ``Algorithm``, implement
-``step``, and register the class in ``ALGORITHMS``.
+Each algorithm is an ``Algorithm`` subclass carrying its own state, constructed from a step size, the
+vector field ``operator_fn``, and a projection ``project_fn`` onto the feasible set, and exposing
+``step(z) -> z_next``, where ``z`` is the current iterate (any shape). Every constructor takes
+``step_size`` first (subclasses add their own extra hyperparameters), so the ``ALGORITHMS`` registry
+can build any of them uniformly as ``ALGORITHMS[name](step_size, operator_fn, project_fn, **kwargs)``.
+To add your own, subclass ``Algorithm``, implement ``step``, and register the class in ``ALGORITHMS``.
 
-``project`` is a *step* argument rather than a constructor argument because it is a property of the VI
-being solved, not of the algorithm: ``simulate`` owns the feasible set and threads it in. Methods that
-evaluate the field at an **intermediate** point must project that point too -- the textbook constrained
-forms do (Korpelevich for extragradient, Popov for optimistic), and it is what keeps every state an
-algorithm queries feasible, which the expert data stream relies on (see ``rollout_sampling``).
+Methods that evaluate the field at an **intermediate** point must project that point too -- the
+textbook constrained forms do (Korpelevich for extragradient, Popov for optimistic), and it is what
+keeps every state an algorithm queries feasible, which the expert data stream relies on (see
+``rollout_sampling``).
 """
 
 from abc import ABC, abstractmethod
@@ -21,19 +20,23 @@ import torch
 
 
 class Algorithm(ABC):
-    """Base game-dynamics update: holds the step size ``h``, exposes ``step(z, v, project) -> z_next``.
+    """Base game-dynamics update: holds the step size, vector field ``operator_fn``, and projection
+    ``project_fn``, and exposes ``step(z) -> z_next``.
 
-    The shared contract behind the ``ALGORITHMS`` registry: ``h`` is always the first constructor
-    argument, so every algorithm builds uniformly as ``ALGORITHMS[name](h, **kwargs)``.
+    The shared contract behind the ``ALGORITHMS`` registry: ``step_size`` is always the first
+    constructor argument, so every algorithm builds uniformly as
+    ``ALGORITHMS[name](step_size, operator_fn, project_fn, **kwargs)``.
     """
 
-    def __init__(self, h):
-        self.h = h
+    def __init__(self, step_size, operator_fn, project_fn):
+        self.step_size = step_size
+        self.operator_fn = operator_fn
+        self.project_fn = project_fn
 
     @abstractmethod
-    def step(self, z, v, project):
-        """One update from iterate ``z`` under field ``v``, projected onto the feasible set by
-        ``project``, returning the next iterate."""
+    def step(self, z):
+        """One update from iterate ``z`` under the field ``operator_fn``, projected onto the
+        feasible set by ``project_fn``, returning the next iterate."""
 
 
 class SimpleProjection(Algorithm):
@@ -80,16 +83,16 @@ class Optimistic(Algorithm):
     one. The two are closely related and both converge on monotone fields, but they are distinct
     iterations, so unconstrained results are not numerically comparable across the two."""
 
-    def __init__(self, h):
-        super().__init__(h)
+    def __init__(self, step_size, operator_fn, project_fn):
+        super().__init__(step_size, operator_fn, project_fn)
         self.g_bar = None  # field value at the previous extrapolated point
 
-    def step(self, z, v, project):
+    def step(self, z):
         if self.g_bar is None:  # first step: no past extrapolation to lean on
-            self.g_bar = v(z)
-        z_bar = project(z + self.h * self.g_bar)  # free: g_bar was evaluated last step
-        self.g_bar = v(z_bar)  # the one field evaluation per step
-        return project(z + self.h * self.g_bar)
+            self.g_bar = self.operator_fn(z)
+        z_bar = self.project_fn(z + self.step_size * self.g_bar)  # free: g_bar was evaluated last step
+        self.g_bar = self.operator_fn(z_bar)  # the one field evaluation per step
+        return self.project_fn(z + self.step_size * self.g_bar)
 
 
 class Momentum(Algorithm):
@@ -123,9 +126,10 @@ class Consensus(Algorithm):
         return project(z + self.h * (g - self.gamma * consensus_term))
 
 
-# Names map straight to the classes: every constructor takes ``h`` first plus optional extra
-# hyperparameters, so ``ALGORITHMS[name](h)`` uses the class-level defaults (beta=0.9, gamma=1.0)
-# and ``ALGORITHMS[name](h, beta=0.5)`` overrides them.
+# Names map straight to the classes: every constructor takes ``step_size``, ``operator_fn``, and
+# ``project_fn`` first plus optional extra hyperparameters, so
+# ``ALGORITHMS[name](step_size, operator_fn, project_fn)`` uses the class-level defaults (beta=0.9,
+# gamma=1.0) and passing ``beta=0.5`` overrides them.
 ALGORITHMS = {
     "projection": SimpleProjection,
     "extragradient": ExtraGradient,

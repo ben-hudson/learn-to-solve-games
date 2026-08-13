@@ -56,7 +56,7 @@ class AmortizedModel(L.LightningModule):
 
 class FieldModel(AmortizedModel):
     def __init__(
-        self, backbone, dim, n_actions, feat_mean, feat_scale, target_scale, step_size=0.1, steps=100, **kwargs
+        self, backbone, dim, n_actions, feat_mean, feat_scale, target_scale, step_size=2e-3, steps=2000, **kwargs
     ):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
@@ -110,10 +110,10 @@ class FieldModel(AmortizedModel):
             feats = torch.cat([strategies, payoffs], dim=-1)
             return self.readout(self.backbone(feats, in_degree, out_degree, spd))
 
-        algorithm = Optimistic(h=self.step_size)
+        algorithm = Optimistic(self.step_size, operator, project_onto_simplex)
         strategies = torch.full_like(batch.eq, 1 / batch.eq.size(-1))
         for _ in range(self.steps):
-            strategies = algorithm.step(strategies, operator, project_onto_simplex)
+            strategies = algorithm.step(strategies)
         return strategies
 
     def validation_step(self, batch, batch_idx):
@@ -157,7 +157,8 @@ class SolutionModel(AmortizedModel):
         # one embedding per player node; softmax puts each player's readout on the simplex,
         # so the prediction is a valid mixed-strategy profile
         embedding = self.backbone(batch.payoffs, batch.in_degree, batch.out_degree, batch.spd)
-        return self.readout(embedding).softmax(dim=-1)
+        # return self.readout(embedding).softmax(dim=-1)
+        return project_onto_simplex(self.readout(embedding))
 
     def training_step(self, batch, batch_idx):
         loss = self.loss(self.predict_strategies(batch), batch.A, batch.B)
