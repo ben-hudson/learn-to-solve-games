@@ -1,10 +1,14 @@
 import pytest
 import torch
 
+from l2s_games.envs.zero_sum import (
+    dist_to_normal_cone,
+    profile_to_tensor,
+    RandomZeroSum,
+    RandomZeroSumEquilibriumDataset,
+    RandomZeroSumOperatorDataset,
+)
 from torch.utils.data import default_collate
-
-from l2s_games.envs.zero_sum import RandomZeroSum, profile_to_tensor, dist_to_normal_cone
-from l2s_games.datasets.zero_sum import RandomZeroSumEquilibriumDataset, RandomZeroSumOperatorDataset
 
 
 @pytest.fixture

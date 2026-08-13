@@ -1,8 +1,9 @@
 import torch
 import tqdm
 
-from l2s_games.envs.zero_sum import RandomZeroSum
 from torch_geometric.data import InMemoryDataset
+
+from .game import RandomZeroSum
 
 
 class RandomZeroSumEquilibriumDataset(InMemoryDataset):
