@@ -50,8 +50,8 @@ class SimpleProjection(Algorithm):
     rotational fields such as RPS. It queries the field only at the (feasible) current iterate, so it
     is the one method for which projecting the intermediate point is vacuous."""
 
-    def step(self, z, v, project):
-        return project(z + self.h * v(z))
+    def step(self, z):
+        return self.project_fn(z + self.step_size * self.operator_fn(z))
 
 
 class ExtraGradient(Algorithm):
@@ -64,9 +64,9 @@ class ExtraGradient(Algorithm):
     the rotational fields where plain projection stalls or spirals -- at the cost of **two** field
     evaluations per step."""
 
-    def step(self, z, v, project):
-        z_half = project(z + self.h * v(z))
-        return project(z + self.h * v(z_half))
+    def step(self, z):
+        z_half = self.project_fn(z + self.step_size * self.operator_fn(z))
+        return self.project_fn(z + self.step_size * self.operator_fn(z_half))
 
 
 class Optimistic(Algorithm):
@@ -98,14 +98,14 @@ class Optimistic(Algorithm):
 class Momentum(Algorithm):
     """Heavy-ball momentum."""
 
-    def __init__(self, h, beta=0.9):
-        super().__init__(h)
+    def __init__(self, step_size, operator_fn, project_fn, beta=0.9):
+        super().__init__(step_size, operator_fn, project_fn)
         self.beta, self.m = beta, None
 
-    def step(self, z, v, project):
-        g = v(z)
+    def step(self, z):
+        g = self.operator_fn(z)
         self.m = g if self.m is None else self.beta * self.m + g
-        return project(z + self.h * self.m)
+        return self.project_fn(z + self.step_size * self.m)
 
 
 class Consensus(Algorithm):
@@ -113,17 +113,17 @@ class Consensus(Algorithm):
     field  v - gamma * J^T v = v - gamma * grad(0.5 * ||v||^2),
     which adds a contractive component and damps the rotation."""
 
-    def __init__(self, h, gamma=1.0):
-        super().__init__(h)
+    def __init__(self, step_size, operator_fn, project_fn, gamma=1.0):
+        super().__init__(step_size, operator_fn, project_fn)
         self.gamma = gamma
 
-    def step(self, z, v, project):
-        g = v(z)
+    def step(self, z):
+        g = self.operator_fn(z)
         # J^T v = grad(0.5 * ||v||^2); computing it as a gradient (not the full Jacobian) is O(n)
         # and shape-agnostic, so it also works on a batched iterate z [B, E] -- the per-instance
         # Jacobians stay decoupled because the batched field has no cross-instance coupling.
-        consensus_term = torch.func.grad(lambda x: 0.5 * (v(x) ** 2).sum())(z)
-        return project(z + self.h * (g - self.gamma * consensus_term))
+        consensus_term = torch.func.grad(lambda x: 0.5 * (self.operator_fn(x) ** 2).sum())(z)
+        return self.project_fn(z + self.step_size * (g - self.gamma * consensus_term))
 
 
 # Names map straight to the classes: every constructor takes ``step_size``, ``operator_fn``, and
