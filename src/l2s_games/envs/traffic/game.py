@@ -12,37 +12,11 @@ from pume import PUMEModel, StackedPUMCMDemandLoader
 from pume.operators import InverseBPRSupply
 from utils.mapping import FlowMapping, RewardMapping
 
-
-def sparse_incidence_matrix(
-    edge_index: torch.Tensor,
-    n_nodes: int = None,
-    n_edges: int = None,
-    dtype: torch.dtype = torch.float32,
-):
-    if n_nodes is None:
-        n_nodes = torch.unique(edge_index).size(0)
-    if n_edges is None:
-        n_edges = edge_index.size(1)
-
-    edge_number = torch.arange(n_edges, device=edge_index.device)
-
-    tails = -torch.ones_like(edge_index[0])
-    heads = torch.ones_like(edge_index[1])
-
-    tail_coords = torch.stack((edge_index[0], edge_number))
-    head_coords = torch.stack((edge_index[1], edge_number))
-
-    indices = torch.cat((tail_coords, head_coords), dim=-1)
-    values = torch.cat((tails, heads), dim=-1).to(dtype)
-
-    return torch.sparse_coo_tensor(indices, values, size=(n_nodes, n_edges))
-
+from .utils import sparse_incidence_matrix
 
 DEFAULT_OUTER_SOLVER_OPTIONS = {
     "oracle_type": "aa1",
     "base_method": "agraal",
-    "max_iterations": 2000,
-    "convergence_tolerance": 1e-3,
     "meta": {
         "safeguard_factor": 0.9,
         "safeguard_tau": 0.999,
@@ -161,12 +135,11 @@ class PotentialCongestion(PUMEModel):
             demand_loader=network.demand,
         )
 
-    def solve(self, initial_costs=None, solver=None, solver_options=None, method="meta"):
+    def solve(self, initial_costs=None, solver=None, method="meta", max_iters=1000, tol=1e-3):
         if initial_costs is None:
             initial_costs = self.free_flow_time * 1.1
-        if solver_options is None:
-            solver_options = DEFAULT_OUTER_SOLVER_OPTIONS
-        solve_info = super().solve(c_initial=initial_costs, solver=solver, method=method, options=solver_options)
+        options = dict(**DEFAULT_OUTER_SOLVER_OPTIONS, max_iterations=max_iters, convergence_tolerance=tol)
+        solve_info = super().solve(c_initial=initial_costs, solver=solver, method=method, options=options)
         return solve_info["cost"], solve_info
 
     def to_data(self) -> Data:
@@ -184,5 +157,5 @@ class PotentialCongestion(PUMEModel):
         return cls.__init__(network, *tensors)
 
 
-class NonPotentialCongestion:
+class NonPotentialCongestion(PotentialCongestion):
     pass
