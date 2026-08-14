@@ -36,7 +36,7 @@ class RandomZeroSumEquilibriumDataset(InMemoryDataset):
     def download(self):
         required_attrs = ["n_instances", "n_actions"]
         assert all(
-            getattr(self, attr) for attr in required_attrs
+            getattr(self, attr) is not None for attr in required_attrs
         ), f"No cache at {self.raw_paths[0]}. Pass {required_attrs} to rebuild it."
 
         progress = range(self.n_instances) if self.quiet else tqdm.trange(self.n_instances)
@@ -77,7 +77,7 @@ class RandomZeroSumOperatorDataset(RandomZeroSumEquilibriumDataset):
     def process(self):
         required_attrs = ["n_points_per_instance"]
         assert all(
-            getattr(self, attr) for attr in required_attrs
+            getattr(self, attr) is not None for attr in required_attrs
         ), f"No cache at {self.processed_paths[0]}. Pass {required_attrs} to rebuild it."
 
         instances = self.load_instances()

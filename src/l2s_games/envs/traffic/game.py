@@ -43,7 +43,7 @@ DEFAULT_INNER_SOLVER_OPTIONS = {
 
 
 @dataclass
-class PUMENetwork:
+class PUMEMapping:
     edge_index: torch.Tensor
     mdps: List[PUMCM]
     reward_mapping: RewardMapping
@@ -103,28 +103,23 @@ class PUMENetwork:
 class PotentialCongestion(PUMEModel):
     def __init__(
         self,
-        network: PUMENetwork,
+        network: PUMEMapping,
         free_flow_time: torch.Tensor,
         capacity: torch.Tensor,
         alpha: torch.Tensor,
         beta: torch.Tensor,
     ):
-        # these are the tensors we need for to_data
         self.edge_index = network.edge_index
-        self.free_flow_time = free_flow_time
-        self.capacity = capacity
-        self.alpha = alpha
-        self.beta = beta
 
         supply = InverseBPRSupply(
-            free_flow_time=self.free_flow_time,
-            capacity=self.capacity,
-            alpha=self.alpha,
-            beta=self.beta,
+            free_flow_time=free_flow_time,
+            capacity=capacity,
+            alpha=alpha,
+            beta=beta,
             eps=1e-6,
         )
 
-        cost_lower = self.free_flow_time.numpy()
+        cost_lower = free_flow_time.numpy()
         super().__init__(
             pumcm_models=network.mdps,
             supply_func=None,
@@ -135,26 +130,31 @@ class PotentialCongestion(PUMEModel):
             demand_loader=network.demand,
         )
 
-    def solve(self, initial_costs=None, solver=None, method="meta", max_iters=1000, tol=1e-3):
-        if initial_costs is None:
-            initial_costs = self.free_flow_time * 1.1
+    def _solve(self, initial_cost=None, solver=None, method="meta", max_iters=1000, tol=1e-3):
+        if initial_cost is None:
+            initial_cost = self.free_flow_time * 1.1
         options = dict(**DEFAULT_OUTER_SOLVER_OPTIONS, max_iterations=max_iters, convergence_tolerance=tol)
-        solve_info = super().solve(c_initial=initial_costs, solver=solver, method=method, options=options)
-        return solve_info["cost"], solve_info
+        solve_info = super().solve(c_initial=initial_cost, solver=solver, method=method, options=options)
+        self.eq, self.eq_info = solve_info["cost"], solve_info
+
+    def solve(self, **kwargs):
+        self._solve(**kwargs)
+        return self.eq, self.eq_info
 
     def to_data(self) -> Data:
         return Data(
             edge_index=self.edge_index,
-            free_flow_time=self.free_flow_time,
-            capacity=self.capacity,
-            alpha=self.alpha,
-            beta=self.beta,
+            free_flow_time=self.supply_operator.t0,
+            capacity=self.supply_operator.cap,
+            alpha=self.supply_operator.alpha,
+            beta=self.supply_operator.beta,
+            eq=self.eq,
         )
 
     @classmethod
     def from_data(cls, network, data: Data):
         tensors = data.multi_get_tensor(["free_flow_time", "capacity", "alpha", "beta"])
-        return cls.__init__(network, *tensors)
+        return cls(network, *tensors)
 
 
 class NonPotentialCongestion(PotentialCongestion):
