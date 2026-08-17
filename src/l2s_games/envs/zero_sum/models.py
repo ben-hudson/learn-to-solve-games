@@ -35,6 +35,9 @@ class AmortizedModel(L.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
 
+    def normalize_feats(self, feats):
+        return (feats - self.feat_mean) / self.feat_scale
+
     def configure_optimizers(self):
         # Adam with linear warmup then optional cosine annealing (ported from train_field_gnn.py):
         # warmup ramps from lr*start_factor up to lr over warmup_epochs, then cosine decays to ~0
@@ -65,26 +68,24 @@ class FieldModel(AmortizedModel):
         self.steps = steps
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
 
-    def on_after_batch_transfer(self, batch, dataloader_idx):
+    def training_step(self, batch, batch_idx):
         # fold the sampled points into the batch dimension: every point is an
         # independent evaluation on the same graph
-        n_points = batch.point.size(1)
+        n_points_per_instance = batch.point.size(1)
         batch = batch._replace(
             point=batch.point.flatten(0, 1),
             payoffs=batch.payoffs.flatten(0, 1),
             operator=batch.operator.flatten(0, 1),
-            in_degree=batch.in_degree.repeat_interleave(n_points, dim=0),
-            out_degree=batch.out_degree.repeat_interleave(n_points, dim=0),
-            spd=batch.spd.repeat_interleave(n_points, dim=0),
+            in_degree=batch.in_degree.repeat_interleave(n_points_per_instance, dim=0),
+            out_degree=batch.out_degree.repeat_interleave(n_points_per_instance, dim=0),
+            spd=batch.spd.repeat_interleave(n_points_per_instance, dim=0),
         )
         # normalize: one global mean/scale for the payoffs, one global scale for the
         # operator (isotropic, so its direction is untouched)
-        return batch._replace(
-            payoffs=(batch.payoffs - self.feat_mean) / self.feat_scale,
+        batch = batch._replace(
+            payoffs=self.normalize_feats(batch.payoffs),
             operator=batch.operator / self.target_scale,
         )
-
-    def training_step(self, batch, batch_idx):
         # feats: the raw point (simplex coordinates need no normalization) alongside
         # the normalized payoffs
         feats = torch.cat([batch.point, batch.payoffs], dim=-1)
@@ -98,17 +99,12 @@ class FieldModel(AmortizedModel):
         # from the uniform profile. The rollout follows the normalized field, an isotropic
         # rescale of the true one, so its equilibria are unchanged and the step size is
         # scale-free.
-
-        # this recovers one instance per game, but its ugly
-        n_points_per_game = batch.point.size(0) // batch.A.size(0)
-        payoffs = batch.payoffs[::n_points_per_game]
-        in_degree = batch.in_degree[::n_points_per_game]
-        out_degree = batch.out_degree[::n_points_per_game]
-        spd = batch.spd[::n_points_per_game]
+        # every sampled point shares the instance's payoffs, so one copy per game suffices
+        payoffs = self.normalize_feats(batch.payoffs[:, 0])
 
         def operator(strategies):
             feats = torch.cat([strategies, payoffs], dim=-1)
-            return self.readout(self.backbone(feats, in_degree, out_degree, spd))
+            return self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd))
 
         algorithm = Optimistic(self.step_size, operator, project_onto_simplex)
         strategies = torch.full_like(batch.eq, 1 / batch.eq.size(-1))
@@ -117,12 +113,9 @@ class FieldModel(AmortizedModel):
         return strategies
 
     def validation_step(self, batch, batch_idx):
-        feats = torch.cat([batch.point, batch.payoffs], dim=-1)
-        prediction = self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd))
-        self.log("val/loss", self.loss(prediction, batch.operator))
         # stationarity of the rollout endpoint under the true operator: zero exactly at a Nash
         # equilibrium, so unlike a distance to the LP solution it is robust to equilibrium
-        # non-uniqueness. target_scale puts it in the same normalized units as val_loss.
+        # non-uniqueness. target_scale puts it in the same normalized units as train/loss.
         strategies = self.solve(batch)
         operator = RandomZeroSumOperatorDataset.eval_operator(batch, strategies)
         residual = dist_to_normal_cone(operator / self.target_scale, strategies)
@@ -148,7 +141,7 @@ class SolutionModel(AmortizedModel):
         # utility shifts and linear in scale, so the minimizers are unchanged): the paper's
         # utilities live in [0, 1], and raw GAMUT payoffs (~1e2) blow up the softmax gradients
         return batch._replace(
-            payoffs=(batch.payoffs - self.feat_mean) / self.feat_scale,
+            payoffs=self.normalize_feats(batch.payoffs),
             A=batch.A / self.feat_scale,
             B=batch.B / self.feat_scale,
         )

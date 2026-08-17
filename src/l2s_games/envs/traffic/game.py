@@ -14,6 +14,8 @@ from utils.mapping import FlowMapping, RewardMapping
 
 from .utils import sparse_incidence_matrix
 
+COST_UPPER_BOUND = 700.0  # exp(-700) underflows
+
 DEFAULT_OUTER_SOLVER_OPTIONS = {
     "oracle_type": "aa1",
     "base_method": "agraal",
@@ -48,7 +50,8 @@ class PUMEMapping:
     mdps: List[PUMCM]
     reward_mapping: RewardMapping
     flow_mapping: FlowMapping
-    demand: StackedPUMCMDemandLoader
+    demand_loader: StackedPUMCMDemandLoader
+    demand_matrix: torch.Tensor
 
     @classmethod
     def from_edges_and_demand(cls, edge_index: torch.Tensor, demand_matrix: torch.Tensor, **inner_solver_kwargs):
@@ -89,7 +92,7 @@ class PUMEMapping:
         flow_mapping = FlowMapping(B_sa_l=sparse.identity(n_edges, format="csr"))
 
         initial_states_list = [demand_matrix[:, dest].to(torch.float64) for dest in dests]
-        demand = StackedPUMCMDemandLoader(
+        demand_loader = StackedPUMCMDemandLoader(
             pumcm_models=mdps,
             flow_mappings=flow_mapping.B_sa_l,
             reward_provider=lambda costs, _dest_idx: reward_mapping.rewards(costs),
@@ -97,7 +100,7 @@ class PUMEMapping:
             reward_invariant=True,
         )
 
-        return cls(edge_index, mdps, reward_mapping, flow_mapping, demand)
+        return cls(edge_index, mdps, reward_mapping, flow_mapping, demand_loader, demand_matrix)
 
 
 class PotentialCongestion(PUMEModel):
@@ -110,6 +113,7 @@ class PotentialCongestion(PUMEModel):
         beta: torch.Tensor,
     ):
         self.edge_index = network.edge_index
+        self.demand_matrix = network.demand_matrix
 
         supply = InverseBPRSupply(
             free_flow_time=free_flow_time,
@@ -126,8 +130,8 @@ class PotentialCongestion(PUMEModel):
             supply=supply,
             reward_mapping=network.reward_mapping,
             flow_mapping=network.flow_mapping,
-            cost_bounds=(cost_lower, np.full_like(cost_lower, 700.0)),  # exp(-700) underflows
-            demand_loader=network.demand,
+            cost_bounds=(cost_lower, np.full_like(cost_lower, COST_UPPER_BOUND)),
+            demand_loader=network.demand_loader,
         )
 
     def _solve(self, initial_cost=None, solver=None, method="meta", max_iters=1000, tol=1e-3):
@@ -191,6 +195,7 @@ class PotentialCongestion(PUMEModel):
             capacity=self.supply_operator.cap.to(dtype),
             alpha=self.supply_operator.alpha.to(dtype),
             beta=self.supply_operator.beta.to(dtype),
+            demand_matrix=self.demand_matrix.to(dtype),
             eq=self.eq.to(dtype),
         )
 
