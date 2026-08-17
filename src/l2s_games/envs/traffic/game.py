@@ -141,14 +141,57 @@ class PotentialCongestion(PUMEModel):
         self._solve(**kwargs)
         return self.eq, self.eq_info
 
-    def to_data(self) -> Data:
+    def operator(self, costs):
+        return self.compute_excess_supply(costs)
+
+    def operator_and_preconditioner(self, costs: torch.Tensor, eps: float = 1e-8):
+        """``(excess_supply, preconditioner_diagonal)``: the raw excess supply
+        ``E(c) = z(c) - x(c)`` and the supply-diagonal metric
+        ``M = diag(max(s'(c), |x(c)|/|c|, 1))`` -- the same element-wise floor PUME's aGRAAL
+        solver builds.
+
+        Neither tensor is rescaled here: the caller applies ``excess_supply / diagonal`` to get
+        the preconditioned field ``M^{-1} E``, and keeps the raw excess supply for the
+        monotonicity constraint, which must be stated about it -- the preconditioned field is not
+        monotone. The raw excess supply is a flow residual at a cost point, so it is stiff: the
+        steep coordinates of the inverse BPR supply curve span orders of magnitude, and the demand
+        floor catches the edges where demand, not supply sensitivity, dominates (making the metric
+        invariant to the demand's units). ``M^{-1} E`` pulls the residual back toward cost units,
+        and ``M > 0``, so the zero (the equilibrium) is unchanged. The demand the floor needs
+        comes out of the same solve the residual already needs, so it is free.
+        """
+        costs = costs.double()  # PUME operates in float64
+        demand = self.compute_demand(costs)
+        excess_supply = self.compute_supply(costs) - demand
+
+        supply_diagonal = self.supply_operator.jacobian_diagonal(costs)
+        demand_floor = demand.abs() / costs.abs().clamp(min=eps)
+        precond = torch.maximum(supply_diagonal, torch.maximum(torch.ones_like(supply_diagonal), demand_floor))
+        return excess_supply, precond
+
+    @property
+    def free_flow_time(self):
+        return self.supply_operator.t0
+
+    @property
+    def n_nodes(self):
+        return self.pumcm_models[0].structure.num_states_full
+
+    @property
+    def n_edges(self):
+        return self.edge_index.size(1)
+
+    def to_data(self, dtype=torch.float32) -> Data:
+        # the solver works in float64, but the learning stack expects float32
         return Data(
             edge_index=self.edge_index,
-            free_flow_time=self.supply_operator.t0,
-            capacity=self.supply_operator.cap,
-            alpha=self.supply_operator.alpha,
-            beta=self.supply_operator.beta,
-            eq=self.eq,
+            num_nodes=self.n_nodes,
+            num_edges=self.n_edges,
+            free_flow_time=self.free_flow_time.to(dtype),
+            capacity=self.supply_operator.cap.to(dtype),
+            alpha=self.supply_operator.alpha.to(dtype),
+            beta=self.supply_operator.beta.to(dtype),
+            eq=self.eq.to(dtype),
         )
 
     @classmethod

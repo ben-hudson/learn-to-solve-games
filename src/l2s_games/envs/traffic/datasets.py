@@ -22,6 +22,7 @@ class TrafficEquilibriumDataset(InMemoryDataset):
         self.n_instances = n_instances
 
         super().__init__(root, **kwargs)
+        self.load(self.processed_paths[0])
 
     @property
     def raw_file_names(self):
@@ -97,7 +98,11 @@ class TrafficOperatorDataset(TrafficEquilibriumDataset):
         for data in progress:
             instance = PotentialCongestion.from_data(self.pume_mapping, data)
             data.point = roi.sample((self.n_points_per_instance,))
-            data.operator = torch.stack([instance.compute_excess_supply(point) for point in data.point])
+            op, precond = zip(*(instance.operator_and_preconditioner(point) for point in data.point))
+            # the operator evaluations run in float64, but the learning stack expects float32
+            data.operator = torch.stack(op).float()
+            data.preconditioner = torch.stack(precond).float()
+            data.preconditioned_operator = data.operator / data.preconditioner
             data_list.append(data)
 
         self.save(data_list, self.processed_paths[0])

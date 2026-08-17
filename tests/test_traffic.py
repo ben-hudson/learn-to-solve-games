@@ -5,7 +5,6 @@ import torch
 from l2s_games.algorithms import SimpleProjection
 from l2s_games.envs.traffic import PUMEMapping, PotentialCongestion, dist_to_normal_cone
 from pathlib import Path
-from pume.preconditioning import MetricPreconditioner
 from torch_geometric.utils import from_networkx
 
 
@@ -81,31 +80,21 @@ def test_normal_cone_dist_nonzero(sioux_falls_congestion_game):
 
 def test_projection_converges(sioux_falls_congestion_game: PotentialCongestion):
     # the ascent operator for z <- project(z + h op(z)) is the excess demand -E (see
-    # test_normal_cone_dist_zero), preconditioned with PUME's supply-diagonal metric
-    # M = diag(max(s'(c), 1)) to tame the steep coordinates of the inverse BPR supply curve
+    # test_normal_cone_dist_zero), preconditioned with the game's supply-diagonal metric to tame
+    # the steep coordinates of the inverse BPR supply curve
     def preconditioned_excess_demand(costs):
-        supply_diagonal = sioux_falls_congestion_game.supply_operator.jacobian_diagonal(costs)
-        diag = torch.maximum(supply_diagonal, torch.ones_like(supply_diagonal))
-        metric = MetricPreconditioner(
-            mode="supply_diagonal",
-            effective_mode="supply_diagonal",
-            matrix=None,
-            diag=diag,
-            inv_diag=1.0 / diag,
-            chol=None,
-            info={},
-        )
-        return -metric.apply_inverse(sioux_falls_congestion_game.compute_excess_supply(costs))
+        excess_supply, precond = sioux_falls_congestion_game.operator_and_preconditioner(costs)
+        return -excess_supply / precond
 
-    # step size tuned over 20 perturbed instances: the dynamics oscillate forever from h=0.25 up,
-    # and h=0.15 has the best worst case (converged in 260 steps, so 400 leaves headroom for the
-    # random perturbation)
-    algorithm = SimpleProjection(0.15, preconditioned_excess_demand, sioux_falls_congestion_game.project_costs)
+    # step size tuned over 20 perturbed instances: the dynamics stop converging from h=0.26 up
+    # (2/20 instances diverge there, most from h=0.27), and h=0.25 converged on all instances in
+    # 135-159 steps, so 200 leaves headroom for the random perturbation
+    algorithm = SimpleProjection(0.25, preconditioned_excess_demand, sioux_falls_congestion_game.project_costs)
     costs = sioux_falls_congestion_game.free_flow_time * 1.1
-    for _ in range(400):
+    for _ in range(200):
         costs = algorithm.step(costs)
 
     lower, upper = (torch.as_tensor(bound) for bound in sioux_falls_congestion_game.cost_bounds)
-    excess_demand = -sioux_falls_congestion_game.compute_excess_supply(costs)
+    excess_demand = -sioux_falls_congestion_game.operator(costs)
     dist = dist_to_normal_cone(excess_demand, costs, lower, upper)
     assert torch.allclose(dist, torch.zeros_like(dist), atol=1e-3)

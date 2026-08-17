@@ -12,8 +12,9 @@ from l2s_games.envs.traffic.datasets import TrafficOperatorDataset
 def get_config():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--dataset", type=Path, required=True)
-    parser.add_argument("--n_actions", type=int, default=3)
-    parser.add_argument("--n_instances", type=int, default=10000)
+    parser.add_argument("--n_instances", type=int, default=512)
+    parser.add_argument("--n_cal_instances", type=int, default=128)
+    parser.add_argument("--n_points_per_instance", type=int, default=256)
     parser.add_argument("--quiet", action="store_true")
 
     config = parser.parse_args()
@@ -21,7 +22,7 @@ def get_config():
 
 
 if __name__ == "__main__":
-    # config = get_config()
+    config = get_config()
 
     root = Path("raw_data/sioux_falls")
 
@@ -37,20 +38,24 @@ if __name__ == "__main__":
     node_list = list(network.nodes)
     demand_table = demand_table.reindex(index=node_list, columns=node_list)
 
-    pume_mapping = PUMEMapping.from_edges_and_demand(base_graph.edge_index, torch.as_tensor(demand_table.values))
+    demand_scale = 1000
+    demand = torch.as_tensor(demand_table.values) / demand_scale
+    base_graph.capacity = base_graph.capacity / demand_scale
+
+    pume_mapping = PUMEMapping.from_edges_and_demand(base_graph.edge_index, demand)
     eq_dataset = TrafficEquilibriumDataset(
-        "datasets/sioux_falls_16_new",
+        config.dataset,
         pume_mapping=pume_mapping,
         base_graph=base_graph,
-        n_instances=16,
+        n_instances=config.n_instances,
         quiet=False,
     )
     op_dataset = TrafficOperatorDataset(
-        "datasets/sioux_falls_16_new",
+        config.dataset,
         pume_mapping=pume_mapping,
         base_graph=base_graph,
-        n_cal_instances=16,
-        n_points_per_instance=256,
+        n_cal_instances=config.n_cal_instances,
+        n_points_per_instance=config.n_points_per_instance,
         force_reload=True,
         quiet=False,
     )
