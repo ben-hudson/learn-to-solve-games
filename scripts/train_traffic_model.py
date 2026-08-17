@@ -4,7 +4,13 @@ import os
 import torch
 import wandb
 
-from l2s_games.envs.traffic import BuildTrafficFeats, PUMEMapping, TrafficFieldModel, TrafficOperatorDataset
+from l2s_games.envs.traffic import (
+    BuildTrafficFeats,
+    PUMEMapping,
+    TrafficFieldModel,
+    TrafficOperatorDataset,
+    TrafficSolutionModel,
+)
 from l2s_games.envs.zero_sum import GraphToTuple
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
@@ -68,11 +74,13 @@ if __name__ == "__main__":
 
     feat_scaler = StandardScaler()
     operator_scaler = StandardScaler(with_mean=False)
+    solution_scaler = StandardScaler()
     for batch in train_loader:
         feat_scaler.partial_fit(batch.feats.reshape(-1, batch.feats.size(-1)))
         # a single column, so the fit yields one global scale: an isotropic rescale of the
         # operator field that preserves its direction
         operator_scaler.partial_fit(batch.preconditioned_operator.reshape(-1, 1))
+        solution_scaler.partial_fit(batch.eq.reshape(-1, 1))
 
     dim = 128
     optimizer_kwargs = dict(
@@ -82,7 +90,27 @@ if __name__ == "__main__":
         cosine_annealing=bool(config.cosine_annealing),
     )
     if config.amortization == "full":
-        raise Exception()
+        backbone = GraphormerBackbone(
+            n_feats=sample.feats.size(-1),
+            in_degree=sample.in_degree,
+            out_degree=sample.out_degree,
+            spd=sample.spd,
+            dim=dim,
+            n_heads=8,
+            n_layers=6,
+            dim_ff=dim * 2,
+            dropout=0.0,
+        )
+        model = TrafficSolutionModel(
+            backbone,
+            dim=dim,
+            feat_mean=feat_scaler.mean_,
+            feat_scale=feat_scaler.scale_,
+            target_mean=solution_scaler.scale_,
+            target_scale=solution_scaler.scale_,
+            pume_mapping=pume_mapping,
+            **optimizer_kwargs,
+        )
     else:
         backbone = GraphormerBackbone(
             n_feats=sample.feats.size(-1),

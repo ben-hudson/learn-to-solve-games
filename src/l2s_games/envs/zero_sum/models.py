@@ -35,7 +35,7 @@ class AmortizedModel(L.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
 
-    def normalize_feats(self, feats):
+    def normalize_feats(self, feats: torch.Tensor):
         return (feats - self.feat_mean) / self.feat_scale
 
     def configure_optimizers(self):

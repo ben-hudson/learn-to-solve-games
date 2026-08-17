@@ -1,10 +1,49 @@
 import torch
 
+from torch.nn import MSELoss
 from l2s_games.algorithms import SimpleProjection
 from l2s_games.envs.zero_sum import AmortizedModel, NormLoss
 
 from .game import PotentialCongestion, COST_UPPER_BOUND
 from .utils import dist_to_normal_cone
+
+
+class TrafficSolutionModel(AmortizedModel):
+    def __init__(self, backbone, dim, feat_mean, feat_scale, target_mean, target_scale, pume_mapping, **kwargs):
+        n_actions = 1
+        super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
+
+        self.loss = MSELoss()
+        self.pume_mapping = pume_mapping
+        self.register_buffer("target_mean", torch.as_tensor(target_mean, dtype=torch.float32))
+        self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
+
+    def normalize_targets(self, targets: torch.Tensor):
+        return (targets - self.target_mean) / self.target_scale
+
+    def predict_sol(self, batch):
+        feats = self.normalize_feats(batch.feats)
+        return self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd)).squeeze(-1)
+
+    def training_step(self, batch, batch_idx):
+        pred = self.predict_sol(batch)
+        targets = self.normalize_targets(batch.eq)
+        loss = self.loss(pred, targets)
+
+        self.log("train/loss", loss, on_step=False, on_epoch=True)
+        return loss
+
+    def validation_step(self, batch, batch_idx):
+        pred = self.predict_sol(batch).cpu()
+        residuals = []
+        for free_flow_time, capacity, alpha, beta, costs in zip(
+            batch.free_flow_time.cpu(), batch.capacity.cpu(), batch.alpha.cpu(), batch.beta.cpu(), pred
+        ):
+            game = PotentialCongestion(self.pume_mapping, free_flow_time, capacity, alpha, beta)
+            lower, upper = (torch.as_tensor(bound) for bound in game.cost_bounds)
+            excess_demand = -game.operator(costs)
+            residuals.append(dist_to_normal_cone(excess_demand, costs, lower, upper))
+        self.log("val/residual", torch.stack(residuals).mean())
 
 
 class TrafficFieldModel(AmortizedModel):
