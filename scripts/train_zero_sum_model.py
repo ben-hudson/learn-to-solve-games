@@ -53,9 +53,7 @@ if __name__ == "__main__":
         [BuildZeroSumFeats(mode=config.amortization), SPDEmbedding(), DegreeEmbedding(), GraphToTuple()]
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
-    dataset = RandomZeroSumOperatorDataset(
-        config.dataset, n_points_per_instance=256, force_reload=True, transform=transforms
-    )
+    dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
 
     train_dataset, val_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)

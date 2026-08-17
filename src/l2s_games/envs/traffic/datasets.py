@@ -2,8 +2,31 @@ import torch
 import tqdm
 import pickle
 from torch_geometric.data import InMemoryDataset
+from torch_geometric.transforms import BaseTransform
 
 from .game import PotentialCongestion
+
+
+class BuildTrafficFeats(BaseTransform):
+    def __init__(self, mode=None):
+        super().__init__()
+
+        assert mode in ["full", "partial"], f"Mode must be 'full' or 'partial', got {mode}."
+        self.mode = mode
+
+    def forward(self, data):
+        feats = torch.stack([data.free_flow_time, data.capacity], dim=-1)
+
+        if self.mode == "partial":
+            n_points_per_instance = data.point.size(0)
+            feats = feats.expand(n_points_per_instance, -1, -1)
+            # here we add the point because it is not constrained to the simplex
+            points = data.point.unsqueeze(-1)
+            data.feats = torch.cat([feats, points], dim=-1)
+        else:
+            data.feats = feats
+
+        return data
 
 
 class TrafficEquilibriumDataset(InMemoryDataset):
