@@ -2,6 +2,7 @@ import torch
 
 from torch.nn import MSELoss
 from l2s_games.algorithms import SimpleProjection
+from l2s_games.envs.traffic.losses import PotentialLoss
 from l2s_games.envs.zero_sum import AmortizedModel, NormLoss
 
 from .game import PotentialCongestion, COST_UPPER_BOUND
@@ -13,33 +14,34 @@ class TrafficSolutionModel(AmortizedModel):
         n_actions = 1
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
-        self.loss = MSELoss()
+        self.loss = PotentialLoss()
         self.pume_mapping = pume_mapping
         self.register_buffer("target_mean", torch.as_tensor(target_mean, dtype=torch.float32))
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
 
-    def normalize_targets(self, targets: torch.Tensor):
-        return (targets - self.target_mean) / self.target_scale
+    def unnormalize_targets(self, targets: torch.Tensor):
+        return targets * self.target_scale + self.target_mean
 
     def predict_sol(self, batch):
-        feats = self.normalize_feats(batch.feats)
-        return self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd)).squeeze(-1)
+        feats = self.normalize_feats(batch["feats"])
+        return self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"])).squeeze(-1)
 
     def training_step(self, batch, batch_idx):
-        pred = self.predict_sol(batch)
-        targets = self.normalize_targets(batch.eq)
-        loss = self.loss(pred, targets)
+        # the network predicts in normalized target space; the loss evaluates the games'
+        # operators, which live in raw cost units
+        pred_costs = self.unnormalize_targets(self.predict_sol(batch))
+        # PUME operates in float64, which MPS does not support, so the games live on the CPU
+        games = [PotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
+        loss = self.loss(games, pred_costs)
 
         self.log("train/loss", loss, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        pred = self.predict_sol(batch).cpu()
+        pred_costs = self.unnormalize_targets(self.predict_sol(batch)).cpu()
+        games = [PotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
         residuals = []
-        for free_flow_time, capacity, alpha, beta, costs in zip(
-            batch.free_flow_time.cpu(), batch.capacity.cpu(), batch.alpha.cpu(), batch.beta.cpu(), pred
-        ):
-            game = PotentialCongestion(self.pume_mapping, free_flow_time, capacity, alpha, beta)
+        for game, costs in zip(games, pred_costs):
             lower, upper = (torch.as_tensor(bound) for bound in game.cost_bounds)
             excess_demand = -game.operator(costs)
             residuals.append(dist_to_normal_cone(excess_demand, costs, lower, upper))
@@ -62,23 +64,18 @@ class TrafficFieldModel(AmortizedModel):
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
 
     def training_step(self, batch, batch_idx):
-        batch_size, n_points_per_instance, n_edges = batch.point.shape
-        batch = batch._replace(
-            feats=batch.feats.flatten(0, 1),
-            in_degree=batch.in_degree.repeat_interleave(n_points_per_instance, dim=0),
-            out_degree=batch.out_degree.repeat_interleave(n_points_per_instance, dim=0),
-            point=batch.point.flatten(0, 1),
-            preconditioned_operator=batch.preconditioned_operator.flatten(0, 1),
-            spd=batch.spd.repeat_interleave(n_points_per_instance, dim=0),
-        )
-        # normalize: per-column mean/scale for the feats, one global scale for the
-        # preconditioned operator (isotropic, so its direction is untouched)
-        batch = batch._replace(
-            feats=self.normalize_feats(batch.feats),
-            preconditioned_operator=batch.preconditioned_operator / self.target_scale,
-        )
-        prediction = self.readout(self.backbone(batch.feats, batch.in_degree, batch.out_degree, batch.spd)).squeeze(-1)
-        loss = self.loss(prediction, batch.preconditioned_operator)
+        # fold the sampled points into the batch dimension: every point is an
+        # independent evaluation on the same graph
+        n_points_per_instance = batch["point"].size(1)
+        feats = self.normalize_feats(batch["feats"].flatten(0, 1))
+        in_degree = batch["in_degree"].repeat_interleave(n_points_per_instance, dim=0)
+        out_degree = batch["out_degree"].repeat_interleave(n_points_per_instance, dim=0)
+        spd = batch["spd"].repeat_interleave(n_points_per_instance, dim=0)
+        # one global scale for the preconditioned operator (isotropic, so its direction is untouched)
+        target = batch["preconditioned_operator"].flatten(0, 1) / self.target_scale
+
+        prediction = self.readout(self.backbone(feats, in_degree, out_degree, spd)).squeeze(-1)
+        loss = self.loss(prediction, target)
         self.log("train/loss", loss)
         return loss
 
@@ -89,15 +86,15 @@ class TrafficFieldModel(AmortizedModel):
         # the step size was tuned for, and the ascent field is its negation (excess demand pushes
         # costs up).
         def preconditioned_excess_demand(costs):
-            feats = self.normalize_feats(torch.stack([batch.free_flow_time, batch.capacity, costs], dim=-1))
-            prediction = self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd)).squeeze(-1)
-            return -prediction * self.target_scale
+            feats = self.normalize_feats(torch.stack([batch["free_flow_time"], batch["capacity"], costs], dim=-1))
+            prediction = self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
+            return -prediction.squeeze(-1) * self.target_scale
 
         def project_costs(costs):
-            return costs.clamp(min=batch.free_flow_time).clamp(max=COST_UPPER_BOUND)
+            return costs.clamp(min=batch["free_flow_time"]).clamp(max=COST_UPPER_BOUND)
 
         algorithm = SimpleProjection(self.step_size, preconditioned_excess_demand, project_costs)
-        costs = batch.free_flow_time * 1.1
+        costs = batch["free_flow_time"] * 1.1
         for _ in range(self.steps):
             costs = algorithm.step(costs)
         return costs
@@ -108,11 +105,9 @@ class TrafficFieldModel(AmortizedModel):
         # value is directly comparable
         # PUME operates in float64, which MPS does not support, so the games live on the CPU
         solved_costs = self.solve(batch).cpu()
+        games = [PotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
         residuals = []
-        for free_flow_time, capacity, alpha, beta, costs in zip(
-            batch.free_flow_time.cpu(), batch.capacity.cpu(), batch.alpha.cpu(), batch.beta.cpu(), solved_costs
-        ):
-            game = PotentialCongestion(self.pume_mapping, free_flow_time, capacity, alpha, beta)
+        for game, costs in zip(games, solved_costs):
             lower, upper = (torch.as_tensor(bound) for bound in game.cost_bounds)
             excess_demand = -game.operator(costs)
             residuals.append(dist_to_normal_cone(excess_demand, costs, lower, upper))

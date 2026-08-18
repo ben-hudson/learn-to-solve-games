@@ -200,9 +200,8 @@ class PotentialCongestion(PUMEModel):
         )
 
     @classmethod
-    def from_data(cls, network, data: Data):
-        tensors = data.multi_get_tensor(["free_flow_time", "capacity", "alpha", "beta"])
-        return cls(network, *tensors)
+    def from_data(cls, network, data):
+        return cls(network, data["free_flow_time"], data["capacity"], data["alpha"], data["beta"])
 
 
 class NonPotentialCongestion(PotentialCongestion):

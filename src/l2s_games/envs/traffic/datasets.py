@@ -1,10 +1,23 @@
 import torch
 import tqdm
-import pickle
+
+from tensordict import TensorDict
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.transforms import BaseTransform
 
 from .game import PotentialCongestion
+
+
+class GraphToTensorDict(BaseTransform):
+    """Convert a ``Data`` instance to a ``TensorDict``.
+
+    ``torch.stack`` collates the per-instance dicts into a batched ``TensorDict``
+    (pass it as the loader's ``collate_fn``), and ``batch[i]``/``batch.unbind(0)``
+    slice it back into per-instance views natively.
+    """
+
+    def forward(self, data):
+        return TensorDict(data.to_dict())
 
 
 class BuildTrafficFeats(BaseTransform):

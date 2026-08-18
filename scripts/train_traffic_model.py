@@ -6,12 +6,12 @@ import wandb
 
 from l2s_games.envs.traffic import (
     BuildTrafficFeats,
+    GraphToTensorDict,
     PUMEMapping,
     TrafficFieldModel,
     TrafficOperatorDataset,
     TrafficSolutionModel,
 )
-from l2s_games.envs.zero_sum import GraphToTuple
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -56,7 +56,7 @@ if __name__ == "__main__":
             LineGraph(force_directed=True),
             SPDEmbedding(),
             DegreeEmbedding(),
-            GraphToTuple(),
+            GraphToTensorDict(),
         ]
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
@@ -67,8 +67,9 @@ if __name__ == "__main__":
     pume_mapping = PUMEMapping.from_edges_and_demand(instance.edge_index, instance.demand_matrix)
 
     train_dataset, val_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size)
+    # torch.stack collates the per-instance TensorDicts into a batched TensorDict
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=torch.stack)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     sample = dataset[0]
 
@@ -76,11 +77,11 @@ if __name__ == "__main__":
     operator_scaler = StandardScaler(with_mean=False)
     solution_scaler = StandardScaler()
     for batch in train_loader:
-        feat_scaler.partial_fit(batch.feats.reshape(-1, batch.feats.size(-1)))
+        feat_scaler.partial_fit(batch["feats"].reshape(-1, batch["feats"].size(-1)))
         # a single column, so the fit yields one global scale: an isotropic rescale of the
         # operator field that preserves its direction
-        operator_scaler.partial_fit(batch.preconditioned_operator.reshape(-1, 1))
-        solution_scaler.partial_fit(batch.eq.reshape(-1, 1))
+        operator_scaler.partial_fit(batch["preconditioned_operator"].reshape(-1, 1))
+        solution_scaler.partial_fit(batch["eq"].reshape(-1, 1))
 
     dim = 128
     optimizer_kwargs = dict(
@@ -91,10 +92,10 @@ if __name__ == "__main__":
     )
     if config.amortization == "full":
         backbone = GraphormerBackbone(
-            n_feats=sample.feats.size(-1),
-            in_degree=sample.in_degree,
-            out_degree=sample.out_degree,
-            spd=sample.spd,
+            n_feats=sample["feats"].size(-1),
+            in_degree=sample["in_degree"],
+            out_degree=sample["out_degree"],
+            spd=sample["spd"],
             dim=dim,
             n_heads=8,
             n_layers=6,
@@ -106,17 +107,17 @@ if __name__ == "__main__":
             dim=dim,
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
-            target_mean=solution_scaler.scale_,
+            target_mean=solution_scaler.mean_,
             target_scale=solution_scaler.scale_,
             pume_mapping=pume_mapping,
             **optimizer_kwargs,
         )
     else:
         backbone = GraphormerBackbone(
-            n_feats=sample.feats.size(-1),
-            in_degree=sample.in_degree,
-            out_degree=sample.out_degree,
-            spd=sample.spd,
+            n_feats=sample["feats"].size(-1),
+            in_degree=sample["in_degree"],
+            out_degree=sample["out_degree"],
+            spd=sample["spd"],
             dim=dim,
             n_heads=8,
             n_layers=6,
