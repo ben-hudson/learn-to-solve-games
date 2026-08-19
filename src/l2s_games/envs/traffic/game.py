@@ -1,15 +1,15 @@
-from dataclasses import dataclass
-from typing import List
-
 import numpy as np
 import torch
-from scipy import sparse
-from torch_geometric.data import Data
 
+from dataclasses import dataclass
 from pumcm import PUMCM, ModifiedPolicyIteration, RelativeEntropy
 from pumcm.utils.structure_builder import build_structures_batch
 from pume import PUMEModel, StackedPUMCMDemandLoader
 from pume.operators import InverseBPRSupply
+from scipy import sparse
+from tensordict import TensorDict
+from torch_geometric.data import Data
+from typing import List
 from utils.mapping import FlowMapping, RewardMapping
 
 from .utils import sparse_incidence_matrix
@@ -172,6 +172,39 @@ class PotentialCongestion(PUMEModel):
         demand_floor = demand.abs() / costs.abs().clamp(min=eps)
         precond = torch.maximum(supply_diagonal, torch.maximum(torch.ones_like(supply_diagonal), demand_floor))
         return excess_supply, precond
+
+    def best_response(self, costs: torch.Tensor, return_demand: bool = False) -> TensorDict:
+        """The perturbed best response to ``costs``, stacked over destinations.
+
+        ``["value"][d, n]`` is the perturbed value at node ``n`` in destination ``d``'s MDP
+        (the negated expected perturbed cost-to-go, zero at the destination) and
+        ``["policy"][d, e]`` the probability of taking edge ``e`` from its tail node. With
+        ``return_flows=True``, ``["flow"][d, e]`` is the edge flow the response loads onto the
+        network from the OD demands bound for ``d`` (trip units, so the aggregate link flow is
+        the sum over destinations). Everything is differentiable w.r.t. ``costs`` through
+        PUMCM's implicit-diff backward.
+        """
+        rewards = -costs.double()
+        destinations = torch.nonzero(self.demand_matrix.sum(dim=0) > 0).flatten()
+        sols = []
+        for mdp, destination in zip(self.pumcm_models, destinations):
+            # PUMCM's autograd path requires initial states even when flows aren't returned
+            demand = self.demand_matrix[:, destination].double()
+            sol = mdp.solve(
+                rewards_full=rewards,
+                initial_states_full=demand,
+                return_value=True,
+                return_policy=True,
+                return_demand=return_demand,
+            )
+            sols.append(TensorDict(**sol))
+        return torch.stack(sols)
+
+    def travel_time(self, flows: torch.Tensor) -> torch.Tensor:
+        """Congested edge times at ``flows``: the Tikhonov-regularized BPR link performance
+        function whose inverse is the supply operator, so ``travel_time(supply(c)) == c``."""
+        supply = self.supply_operator
+        return supply._forward_bpr(flows, supply.t0, supply.cap, supply.alpha, supply.beta)
 
     @property
     def free_flow_time(self):

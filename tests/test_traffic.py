@@ -4,6 +4,7 @@ import torch
 
 from l2s_games.algorithms import SimpleProjection
 from l2s_games.envs.traffic import PUMEMapping, PotentialCongestion, dist_to_normal_cone
+from l2s_games.envs.traffic.losses import PolicyKLDiv, PotentialLoss
 from pathlib import Path
 from torch_geometric.utils import from_networkx
 
@@ -51,19 +52,19 @@ def perturbed_sioux_falls_pume_network(perturbed_sioux_falls_pyg_data):
 def sioux_falls_congestion_game(perturbed_sioux_falls_pyg_data, perturbed_sioux_falls_pume_network):
     tensors = perturbed_sioux_falls_pyg_data.multi_get_tensor(["free_flow_time", "capacity", "b", "power"])
     game = PotentialCongestion(perturbed_sioux_falls_pume_network, *tensors)
+    game.solve(max_iters=2000, tol=1e-4)
     return game
 
 
 def test_normal_cone_dist_zero(sioux_falls_congestion_game):
-    eq, info = sioux_falls_congestion_game.solve(max_iters=2000, tol=1e-4)
-    assert info["converged"]
+    assert sioux_falls_congestion_game.eq_info["converged"]
 
     lower, upper = (torch.as_tensor(bound) for bound in sioux_falls_congestion_game.cost_bounds)
     # dist_to_normal_cone's cone belongs to the ascent dynamics z <- clamp(z + h op(z));
     # PUME's fixed point is c <- clamp(c - lambda E(c)), so the ascent operator is the
     # excess demand -E = x - z (excess demand pushes costs up).
-    excess_demand = -info["excess_supply"]
-    dist = dist_to_normal_cone(excess_demand, eq, lower, upper)
+    excess_demand = -sioux_falls_congestion_game.eq_info["excess_supply"]
+    dist = dist_to_normal_cone(excess_demand, sioux_falls_congestion_game.eq, lower, upper)
     assert torch.allclose(dist, torch.zeros_like(dist), atol=1e-3)
 
 
@@ -98,3 +99,27 @@ def test_projection_converges(sioux_falls_congestion_game: PotentialCongestion):
     excess_demand = -sioux_falls_congestion_game.operator(costs)
     dist = dist_to_normal_cone(excess_demand, costs, lower, upper)
     assert torch.allclose(dist, torch.zeros_like(dist), atol=1e-3)
+
+
+def test_potential_loss_zero(sioux_falls_congestion_game):
+    eq_costs = sioux_falls_congestion_game.eq.unsqueeze(0)
+    loss = PotentialLoss(precondition=False)([sioux_falls_congestion_game], eq_costs)
+    assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5)
+
+
+def test_potential_loss_nonzero(sioux_falls_congestion_game):
+    eq_costs = sioux_falls_congestion_game.free_flow_time.unsqueeze(0)
+    loss = PotentialLoss(precondition=False)([sioux_falls_congestion_game], eq_costs)
+    assert not torch.allclose(loss, torch.zeros_like(loss), atol=1e-5)
+
+
+def test_kl_div_loss_zero(sioux_falls_congestion_game):
+    eq_costs = sioux_falls_congestion_game.eq.unsqueeze(0)
+    loss = PolicyKLDiv()([sioux_falls_congestion_game], eq_costs)
+    assert torch.allclose(loss, torch.zeros_like(loss), atol=1e-5)
+
+
+def test_kl_div_loss_nonzero(sioux_falls_congestion_game):
+    eq_costs = sioux_falls_congestion_game.free_flow_time.unsqueeze(0)
+    loss = PolicyKLDiv()([sioux_falls_congestion_game], eq_costs)
+    assert not torch.allclose(loss, torch.zeros_like(loss), atol=1e-5)
