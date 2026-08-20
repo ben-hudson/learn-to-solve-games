@@ -56,6 +56,8 @@ def get_config():
     parser.add_argument("--gradient_clip_val", type=float, default=0)
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--n_instances_per_epoch", type=int, default=512)
+    parser.add_argument("--n_points_per_instance", type=int, default=2)
     parser.add_argument("--partially_amortized_loss", type=str, choices=["mse", "norm", "huber"], default="norm")
     parser.add_argument("--patience_epochs", type=int, default=40)
     parser.add_argument("--seed", type=int, default=None)
@@ -95,7 +97,14 @@ if __name__ == "__main__":
     base_graph = load_base_graph(Path("raw_data/sioux_falls"))
     pume_mapping = PUMEMapping.from_edges_and_demand(base_graph.edge_index, base_graph.demand_matrix)
     train_dataset = TrafficOperatorStream(
-        pume_mapping, base_graph, cal_dataset, n_instances=1024, solve=False, quiet=True, transform=transforms
+        pume_mapping,
+        base_graph,
+        cal_dataset,
+        n_points_per_instance=config.n_points_per_instance,
+        n_instances=config.n_instances_per_epoch,
+        solve=False,
+        quiet=True,
+        transform=transforms,
     )
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 

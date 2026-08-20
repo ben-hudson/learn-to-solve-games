@@ -59,20 +59,22 @@ class TrafficEquilibriumStream(IterableDataset):
 
 
 class TrafficOperatorStream(TrafficEquilibriumStream):
-    def __init__(self, pume_mapping, base_graph, cal_set, **kwargs):
+    def __init__(self, pume_mapping, base_graph, cal_set, n_points_per_instance=1, **kwargs):
         super().__init__(pume_mapping, base_graph, **kwargs)
 
         lower, _ = torch.stack([inst["free_flow_time"] for inst in cal_set], dim=-1).min(dim=-1)
         upper, _ = torch.stack([inst["eq"] for inst in cal_set], dim=-1).max(dim=-1)
         self.roi = torch.distributions.Uniform(lower, upper)
 
+        self.n_points_per_instance = n_points_per_instance
+
     def __iter__(self):
         for instance in self.generate_instances():
             data = instance.to_data()
-            data.point = self.roi.sample((1,))
-            op, precond = instance.operator_and_preconditioner(data.point)
-            data.operator = op.float()
-            data.preconditioner = precond.float()
+            data.point = self.roi.sample((self.n_points_per_instance,))
+            op, precond = zip(*(instance.operator_and_preconditioner(point) for point in data.point))
+            data.operator = torch.stack(op).float()
+            data.preconditioner = torch.stack(precond).float()
             data.preconditioned_operator = data.operator / data.preconditioner
 
             yield data if self.transform is None else self.transform(data)
