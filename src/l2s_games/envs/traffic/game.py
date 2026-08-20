@@ -114,6 +114,8 @@ class PotentialCongestion(PUMEModel):
     ):
         self.edge_index = network.edge_index
         self.demand_matrix = network.demand_matrix
+        self.eq = None
+        self.eq_info = None
 
         supply = InverseBPRSupply(
             free_flow_time=free_flow_time,
@@ -220,7 +222,7 @@ class PotentialCongestion(PUMEModel):
 
     def to_data(self, dtype=torch.float32) -> Data:
         # the solver works in float64, but the learning stack expects float32
-        return Data(
+        data = Data(
             edge_index=self.edge_index,
             num_nodes=self.n_nodes,
             num_edges=self.n_edges,
@@ -229,8 +231,10 @@ class PotentialCongestion(PUMEModel):
             alpha=self.supply_operator.alpha.to(dtype),
             beta=self.supply_operator.beta.to(dtype),
             demand_matrix=self.demand_matrix.to(dtype),
-            eq=self.eq.to(dtype),
         )
+        if self.eq is not None:
+            data.eq = self.eq.to(dtype)
+        return data
 
     @classmethod
     def from_data(cls, network, data):

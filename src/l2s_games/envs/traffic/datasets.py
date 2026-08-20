@@ -77,6 +77,7 @@ class TrafficEquilibriumDataset(InMemoryDataset):
         instances = self.generate_instances(self.pume_mapping, self.base_graph, self.n_instances)
         torch.save(instances, self.raw_paths[0])
 
+    # TODO: use TrafficEquilibriumStream for this
     def generate_instances(self, pume_mapping, base_graph, n_instances: int):
         progress = range(n_instances) if self.quiet else tqdm.trange(n_instances)
 

@@ -1,7 +1,10 @@
 import argparse
+from pathlib import Path
 import lightning as L
 import os
+import tntp
 import torch
+from torch_geometric.utils import from_networkx
 import wandb
 
 from l2s_games.envs.traffic import (
@@ -12,6 +15,7 @@ from l2s_games.envs.traffic import (
     TrafficOperatorDataset,
     TrafficSolutionModel,
 )
+from l2s_games.envs.traffic.streams import TrafficOperatorStream
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -21,10 +25,29 @@ from torch_geometric.transforms import Compose, LineGraph
 from torch.utils.data import random_split, DataLoader
 
 
+def load_base_graph(root: Path):
+    network = tntp.convert_to_networkx(
+        tntp.read_node_file(root / "SiouxFalls_node.tntp", index_col="Node", x_col="X", y_col="Y", crs="wgs84"),
+        tntp.read_net_file(root / "SiouxFalls_net.tntp", crs="wgs84"),
+    )
+    demand_table = tntp.read_demand_file(root / "SiouxFalls_trips.tntp")
+
+    base_graph = from_networkx(network)
+    base_graph.free_flow_time = base_graph.free_flow_time.float()
+
+    node_list = list(network.nodes)
+    demand_table = demand_table.reindex(index=node_list, columns=node_list)
+
+    demand_scale = 1000
+    base_graph.demand_matrix = torch.as_tensor(demand_table.values) / demand_scale
+    base_graph.capacity = base_graph.capacity / demand_scale
+    return base_graph
+
+
 def get_config():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--amortization", type=str, choices=["full", "partial"], default="partial")
-    parser.add_argument("--batch_size", type=int, default=4)
+    parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--cosine_annealing", type=int, default=0)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
@@ -61,22 +84,28 @@ if __name__ == "__main__":
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
     dataset = TrafficOperatorDataset(config.dataset, transform=transforms)
+
+    cal_dataset, val_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
+    # torch.stack collates the per-instance TensorDicts into a batched TensorDict
+    cal_loader = DataLoader(cal_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
+
     # every instance shares the network and OD demand, and only the untransformed instances keep
     # the road network's edge_index (LineGraph rewrites it), so the mapping is rebuilt from raw
-    instance = dataset.load_instances()[0]
-    pume_mapping = PUMEMapping.from_edges_and_demand(instance.edge_index, instance.demand_matrix)
-
-    train_dataset, val_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
-    # torch.stack collates the per-instance TensorDicts into a batched TensorDict
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, shuffle=True, collate_fn=torch.stack)
-    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
+    base_graph = load_base_graph(Path("raw_data/sioux_falls"))
+    pume_mapping = PUMEMapping.from_edges_and_demand(base_graph.edge_index, base_graph.demand_matrix)
+    train_dataset = TrafficOperatorStream(
+        pume_mapping, base_graph, cal_dataset, n_instances=1024, solve=False, quiet=True, transform=transforms
+    )
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     sample = dataset[0]
 
     feat_scaler = StandardScaler()
     operator_scaler = StandardScaler(with_mean=False)
     solution_scaler = StandardScaler()
-    for batch in train_loader:
+    for batch in cal_loader:
+        # TODO: how is the point itself normalized?
         feat_scaler.partial_fit(batch["feats"].reshape(-1, batch["feats"].size(-1)))
         # a single column, so the fit yields one global scale: an isotropic rescale of the
         # operator field that preserves its direction
@@ -142,7 +171,8 @@ if __name__ == "__main__":
     # Debug runs disable checkpointing, and Lightning rejects a ModelCheckpoint when it's off.
     callbacks = [
         EarlyStopping(
-            monitor="val/residual",
+            # monitor="val/residual",
+            monitor="train/loss",
             mode="min",
             patience=max(1, config.patience_epochs // config.val_every_n_epochs),
             check_finite=False,
