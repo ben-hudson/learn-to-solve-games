@@ -13,6 +13,28 @@ class NormLoss(torch.nn.Module):
         return residual_norm[residual_norm > 0].mean()
 
 
+class NormHuberLoss(torch.nn.Module):
+    """Huber on each sample's residual norm, averaged over samples: MSE-like inside the knee,
+    ``NormLoss``-like beyond it.
+
+    The per-sample gradient is the residual itself for ``||r|| <= delta`` (so fitted samples
+    self-anneal instead of bouncing at a noise floor) and ``delta * r/||r||`` beyond (so
+    badly-fit samples all push with the same bounded magnitude, like ``NormLoss``'s unit
+    vector). Huber on the scalar norm against a zero target realizes exactly this piecewise
+    loss, so the composition reuses ``huber_loss`` rather than restating it. Zero-residual
+    samples are masked out of the mean: the norm's gradient at exactly zero is NaN.
+    """
+
+    def __init__(self, delta: float = 1.0):
+        super().__init__()
+        self.delta = delta
+
+    def forward(self, prediction, target):
+        residual_norm = (prediction - target).flatten(start_dim=1).norm(dim=-1)
+        residual_norm = residual_norm[residual_norm > 0]
+        return torch.nn.functional.huber_loss(residual_norm, torch.zeros_like(residual_norm), delta=self.delta)
+
+
 class NashAprLoss(torch.nn.Module):
     """Nash approximation loss for bimatrix games (Duan et al. 2023, Eq. 1), averaged over the batch.
 

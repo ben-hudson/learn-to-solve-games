@@ -2,8 +2,8 @@ import pytest
 import tntp
 import torch
 
-from l2s_games.algorithms import SimpleProjection
-from l2s_games.envs.traffic import PUMEMapping, PotentialCongestion, dist_to_normal_cone
+from l2s_games.algorithms import Optimistic, SimpleProjection
+from l2s_games.envs.traffic import PUMEMapping, NonPotentialCongestion, dist_to_normal_cone
 from l2s_games.envs.traffic.losses import PolicyKLDiv, PotentialLoss
 from pathlib import Path
 from torch_geometric.utils import from_networkx
@@ -48,10 +48,11 @@ def perturbed_sioux_falls_pume_network(perturbed_sioux_falls_pyg_data):
     )
 
 
-@pytest.fixture
-def sioux_falls_congestion_game(perturbed_sioux_falls_pyg_data, perturbed_sioux_falls_pume_network):
+# the param dict holds game kwargs; tests needing a rotated game override it with an indirect parametrize
+@pytest.fixture(params=[{"kappa": 0}])
+def sioux_falls_congestion_game(request, perturbed_sioux_falls_pyg_data, perturbed_sioux_falls_pume_network):
     tensors = perturbed_sioux_falls_pyg_data.multi_get_tensor(["free_flow_time", "capacity", "b", "power"])
-    game = PotentialCongestion(perturbed_sioux_falls_pume_network, *tensors)
+    game = NonPotentialCongestion(perturbed_sioux_falls_pume_network, *tensors, **request.param)
     game.solve(max_iters=2000, tol=1e-4)
     return game
 
@@ -79,7 +80,7 @@ def test_normal_cone_dist_nonzero(sioux_falls_congestion_game):
     assert not torch.allclose(dist, torch.zeros_like(dist), atol=1e-3)
 
 
-def test_projection_converges(sioux_falls_congestion_game: PotentialCongestion):
+def test_projection_converges(sioux_falls_congestion_game: NonPotentialCongestion):
     # the ascent operator for z <- project(z + h op(z)) is the excess demand -E (see
     # test_normal_cone_dist_zero), preconditioned with the game's supply-diagonal metric to tame
     # the steep coordinates of the inverse BPR supply curve
@@ -123,3 +124,20 @@ def test_kl_div_loss_nonzero(sioux_falls_congestion_game):
     eq_costs = sioux_falls_congestion_game.free_flow_time.unsqueeze(0)
     loss = PolicyKLDiv()([sioux_falls_congestion_game], eq_costs)
     assert not torch.allclose(loss, torch.zeros_like(loss), atol=1e-5)
+
+
+@pytest.mark.parametrize("sioux_falls_congestion_game", [{"kappa": 1}], indirect=True)
+def test_optimistic_converges(sioux_falls_congestion_game: NonPotentialCongestion):
+    def preconditioned_excess_demand(costs):
+        excess_supply, precond = sioux_falls_congestion_game.operator_and_preconditioner(costs)
+        return -excess_supply / precond
+
+    algorithm = Optimistic(0.09, preconditioned_excess_demand, sioux_falls_congestion_game.project_costs)
+    costs = sioux_falls_congestion_game.free_flow_time * 1.1
+    for _ in range(400):
+        costs = algorithm.step(costs)
+
+    lower, upper = (torch.as_tensor(bound) for bound in sioux_falls_congestion_game.cost_bounds)
+    excess_demand = -sioux_falls_congestion_game.operator(costs)
+    dist = dist_to_normal_cone(excess_demand, costs, lower, upper)
+    assert torch.allclose(dist, torch.zeros_like(dist), atol=1e-3)

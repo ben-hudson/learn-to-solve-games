@@ -12,6 +12,7 @@ from torch_geometric.data import Data
 from typing import List
 from utils.mapping import FlowMapping, RewardMapping
 
+from .supply import CoupledBPRSupply, build_rotation_matrix
 from .utils import sparse_incidence_matrix
 
 COST_UPPER_BOUND = 700.0  # exp(-700) underflows
@@ -103,7 +104,19 @@ class PUMEMapping:
         return cls(edge_index, mdps, reward_mapping, flow_mapping, demand_loader, demand_matrix)
 
 
-class PotentialCongestion(PUMEModel):
+class NonPotentialCongestion(PUMEModel):
+    """Congestion game with the rotated supply ``z(c) = f(c) + B c``, ``f`` the inverse BPR link
+    performance function.
+
+    ``B = kappa S`` is antisymmetric, so ``grad z`` is non-symmetric and the excess supply is not
+    the gradient of any potential, yet the operator stays monotone for any ``kappa`` (see
+    ``supply.py``). ``B`` is a pure function of the topology and ``kappa``, so it is rebuilt from
+    ``network.edge_index`` at construction rather than cached; only the scalar ``kappa`` travels
+    with the instance. ``kappa=0`` recovers the potential congestion game, and the supply is then
+    the bare separable ``InverseBPRSupply`` -- not a coupled supply with ``B = 0`` -- so PUME's
+    separable fast paths stay available. The multiplicative coupling is disabled (``A = I``).
+    """
+
     def __init__(
         self,
         network: PUMEMapping,
@@ -111,19 +124,33 @@ class PotentialCongestion(PUMEModel):
         capacity: torch.Tensor,
         alpha: torch.Tensor,
         beta: torch.Tensor,
+        kappa: float = 0.0,
     ):
         self.edge_index = network.edge_index
         self.demand_matrix = network.demand_matrix
+        self.kappa = kappa
         self.eq = None
         self.eq_info = None
 
-        supply = InverseBPRSupply(
-            free_flow_time=free_flow_time,
-            capacity=capacity,
-            alpha=alpha,
-            beta=beta,
-            eps=1e-6,
-        )
+        if self.kappa == 0.0:
+            supply = InverseBPRSupply(
+                free_flow_time=free_flow_time,
+                capacity=capacity,
+                alpha=alpha,
+                beta=beta,
+                eps=1e-6,
+            )
+        else:
+            rotation_matrix = build_rotation_matrix(network.edge_index, self.kappa)
+            supply = CoupledBPRSupply(
+                free_flow_time=free_flow_time,
+                capacity=capacity,
+                interaction_matrix=torch.eye(rotation_matrix.size(0), dtype=torch.float64),
+                rotation_matrix=rotation_matrix,
+                alpha=alpha,
+                beta=beta,
+                eps=1e-6,
+            )
 
         cost_lower = free_flow_time.numpy()
         super().__init__(
@@ -140,7 +167,8 @@ class PotentialCongestion(PUMEModel):
         if initial_cost is None:
             initial_cost = self.free_flow_time * 1.1
         options = dict(**DEFAULT_OUTER_SOLVER_OPTIONS, max_iterations=max_iters, convergence_tolerance=tol)
-        solve_info = super().solve(c_initial=initial_cost, solver=solver, method=method, options=options)
+        # PUME operates in float64
+        solve_info = super().solve(c_initial=initial_cost.double(), solver=solver, method=method, options=options)
         self.eq, self.eq_info = solve_info["cost"], solve_info
 
     def solve(self, **kwargs):
@@ -204,13 +232,30 @@ class PotentialCongestion(PUMEModel):
 
     def travel_time(self, flows: torch.Tensor) -> torch.Tensor:
         """Congested edge times at ``flows``: the Tikhonov-regularized BPR link performance
-        function whose inverse is the supply operator, so ``travel_time(supply(c)) == c``."""
-        supply = self.supply_operator
-        return supply._forward_bpr(flows, supply.t0, supply.cap, supply.alpha, supply.beta)
+        function whose inverse is the separable ``bpr`` core, so ``travel_time(supply(c)) == c``
+        exactly when the supply *is* that core (i.e. only when ``kappa == 0``)."""
+        return self.bpr._forward_bpr(flows, self.free_flow_time, self.capacity, self.alpha, self.beta)
+
+    @property
+    def bpr(self) -> InverseBPRSupply:
+        """The separable inverse-BPR core of the supply operator."""
+        return self.supply_operator if self.kappa == 0.0 else self.supply_operator.inner
 
     @property
     def free_flow_time(self):
-        return self.supply_operator.t0
+        return self.bpr.t0
+
+    @property
+    def capacity(self):
+        return self.bpr.cap
+
+    @property
+    def alpha(self):
+        return self.bpr.alpha
+
+    @property
+    def beta(self):
+        return self.bpr.beta
 
     @property
     def n_nodes(self):
@@ -227,10 +272,11 @@ class PotentialCongestion(PUMEModel):
             num_nodes=self.n_nodes,
             num_edges=self.n_edges,
             free_flow_time=self.free_flow_time.to(dtype),
-            capacity=self.supply_operator.cap.to(dtype),
-            alpha=self.supply_operator.alpha.to(dtype),
-            beta=self.supply_operator.beta.to(dtype),
+            capacity=self.capacity.to(dtype),
+            alpha=self.alpha.to(dtype),
+            beta=self.beta.to(dtype),
             demand_matrix=self.demand_matrix.to(dtype),
+            kappa=torch.as_tensor(self.kappa, dtype=dtype),
         )
         if self.eq is not None:
             data.eq = self.eq.to(dtype)
@@ -238,8 +284,4 @@ class PotentialCongestion(PUMEModel):
 
     @classmethod
     def from_data(cls, network, data):
-        return cls(network, data["free_flow_time"], data["capacity"], data["alpha"], data["beta"])
-
-
-class NonPotentialCongestion(PotentialCongestion):
-    pass
+        return cls(network, data["free_flow_time"], data["capacity"], data["alpha"], data["beta"], data["kappa"])

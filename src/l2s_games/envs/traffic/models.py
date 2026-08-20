@@ -2,19 +2,23 @@ import torch
 
 from torch.nn import MSELoss
 from l2s_games.algorithms import SimpleProjection
-from l2s_games.envs.traffic.losses import PotentialLoss
-from l2s_games.envs.zero_sum import AmortizedModel, NormLoss
+from l2s_games.envs.traffic.losses import PotentialLoss, WardropAprLoss
+from l2s_games.envs.zero_sum import AmortizedModel, NormHuberLoss, NormLoss
 
-from .game import PotentialCongestion, COST_UPPER_BOUND
+from .game import NonPotentialCongestion, COST_UPPER_BOUND
 from .utils import dist_to_normal_cone
 
 
 class TrafficSolutionModel(AmortizedModel):
-    def __init__(self, backbone, dim, feat_mean, feat_scale, target_mean, target_scale, pume_mapping, **kwargs):
+    def __init__(
+        self, backbone, dim, feat_mean, feat_scale, target_mean, target_scale, pume_mapping, loss="potential", **kwargs
+    ):
         n_actions = 1
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
-        self.loss = PotentialLoss()
+        # both losses are self-supervised in raw cost units: potential descends the dual potential's
+        # exact gradient (the excess supply), wardrop the hardest one-step deviation gain
+        self.loss = {"potential": PotentialLoss(), "wardrop": WardropAprLoss()}[loss]
         self.pume_mapping = pume_mapping
         self.register_buffer("target_mean", torch.as_tensor(target_mean, dtype=torch.float32))
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
@@ -31,7 +35,7 @@ class TrafficSolutionModel(AmortizedModel):
         # operators, which live in raw cost units
         pred_costs = self.unnormalize_targets(self.predict_sol(batch))
         # PUME operates in float64, which MPS does not support, so the games live on the CPU
-        games = [PotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
+        games = [NonPotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
         loss = self.loss(games, pred_costs)
 
         self.log("train/loss", loss, on_step=False, on_epoch=True)
@@ -39,7 +43,7 @@ class TrafficSolutionModel(AmortizedModel):
 
     def validation_step(self, batch, batch_idx):
         pred_costs = self.unnormalize_targets(self.predict_sol(batch)).cpu()
-        games = [PotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
+        games = [NonPotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
         residuals = []
         for game, costs in zip(games, pred_costs):
             lower, upper = (torch.as_tensor(bound) for bound in game.cost_bounds)
@@ -52,12 +56,24 @@ class TrafficFieldModel(AmortizedModel):
     # step_size and steps are the rollout parameters validated in
     # tests/test_traffic.py::test_projection_converges
     def __init__(
-        self, backbone, dim, feat_mean, feat_scale, target_scale, pume_mapping, step_size=0.25, steps=200, **kwargs
+        self,
+        backbone,
+        dim,
+        feat_mean,
+        feat_scale,
+        target_scale,
+        pume_mapping,
+        loss="norm",
+        step_size=0.25,
+        steps=200,
+        **kwargs,
     ):
         n_actions = 1
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
-        self.loss = NormLoss()
+        # the model predicts in normalized target space (one global scale), so every loss measures
+        # the error in scale units and the huber knee sits at one target std of the per-sample norm
+        self.loss = {"mse": MSELoss(), "norm": NormLoss(), "huber": NormHuberLoss()}[loss]
         self.pume_mapping = pume_mapping
         self.step_size = step_size
         self.steps = steps
@@ -105,7 +121,7 @@ class TrafficFieldModel(AmortizedModel):
         # value is directly comparable
         # PUME operates in float64, which MPS does not support, so the games live on the CPU
         solved_costs = self.solve(batch).cpu()
-        games = [PotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
+        games = [NonPotentialCongestion.from_data(self.pume_mapping, sample) for sample in batch.cpu().unbind(0)]
         residuals = []
         for game, costs in zip(games, solved_costs):
             lower, upper = (torch.as_tensor(bound) for bound in game.cost_bounds)

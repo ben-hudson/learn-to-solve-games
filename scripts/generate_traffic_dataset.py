@@ -15,6 +15,7 @@ def get_config():
     parser.add_argument("--n_instances", type=int, default=512)
     parser.add_argument("--n_cal_instances", type=int, default=128)
     parser.add_argument("--n_points_per_instance", type=int, default=256)
+    parser.add_argument("--kappa", type=float, default=0.0)
     parser.add_argument("--quiet", action="store_true")
 
     config = parser.parse_args()
@@ -48,6 +49,7 @@ if __name__ == "__main__":
         pume_mapping=pume_mapping,
         base_graph=base_graph,
         n_instances=config.n_instances,
+        kappa=config.kappa,
         quiet=False,
     )
     op_dataset = TrafficOperatorDataset(
@@ -56,6 +58,7 @@ if __name__ == "__main__":
         base_graph=base_graph,
         n_cal_instances=config.n_cal_instances,
         n_points_per_instance=config.n_points_per_instance,
+        kappa=config.kappa,
         force_reload=True,
         quiet=False,
     )

@@ -2,7 +2,7 @@ import torch
 import tqdm
 
 from itertools import count
-from l2s_games.envs.traffic.game import PotentialCongestion
+from l2s_games.envs.traffic.game import NonPotentialCongestion
 from torch.utils.data import IterableDataset
 
 
@@ -11,7 +11,7 @@ class TrafficEquilibriumStream(IterableDataset):
 
     Samples the same perturbations of ``base_graph`` as
     ``TrafficEquilibriumDataset.generate_instances`` and yields ``Data`` objects
-    with the same fields as ``PotentialCongestion.to_data`` minus ``eq``, so the
+    with the same fields as ``NonPotentialCongestion.to_data`` minus ``eq``, so the
     dataset transforms apply unchanged.
 
     Wrap in a ``DataLoader`` (with ``GraphToTensorDict`` and
@@ -21,11 +21,14 @@ class TrafficEquilibriumStream(IterableDataset):
     seed per worker, keeping the streams decorrelated.
     """
 
-    def __init__(self, pume_mapping, base_graph, n_instances=None, quiet=True, solve=True, transform=None):
+    def __init__(
+        self, pume_mapping, base_graph, n_instances=None, kappa=0.0, quiet=True, solve=True, transform=None
+    ):
         super().__init__()
         self.pume_mapping = pume_mapping
         self.base_graph = base_graph
         self.n_instances = n_instances
+        self.kappa = kappa
         self.solve = solve
         self.quiet = quiet
         self.transform = transform
@@ -42,8 +45,13 @@ class TrafficEquilibriumStream(IterableDataset):
                 0.9 + 0.2 * torch.rand_like(self.base_graph.free_flow_time)
             )
             capacity = self.base_graph.capacity * (0.9 + 0.2 * torch.rand_like(self.base_graph.capacity))
-            instance = PotentialCongestion(
-                self.pume_mapping, free_flow_time, capacity, self.base_graph.b, self.base_graph.power
+            instance = NonPotentialCongestion(
+                self.pume_mapping,
+                free_flow_time,
+                capacity,
+                self.base_graph.b,
+                self.base_graph.power,
+                kappa=self.kappa,
             )
             if self.solve:
                 instance.solve(initial_cost=instance.project_costs(warm_start), max_iters=2000, tol=1e-4)

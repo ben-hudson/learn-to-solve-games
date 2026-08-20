@@ -52,7 +52,7 @@ def get_config():
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--fully_amortized_loss", type=str, choices=["mse", "ni"], default="mse")
+    parser.add_argument("--fully_amortized_loss", type=str, choices=["potential", "wardrop"], default="potential")
     parser.add_argument("--gradient_clip_val", type=float, default=0)
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -148,6 +148,7 @@ if __name__ == "__main__":
             target_mean=solution_scaler.mean_,
             target_scale=solution_scaler.scale_,
             pume_mapping=pume_mapping,
+            loss=config.fully_amortized_loss,
             **optimizer_kwargs,
         )
     else:
@@ -169,6 +170,7 @@ if __name__ == "__main__":
             feat_scale=feat_scaler.scale_,
             target_scale=operator_scaler.scale_,
             pume_mapping=pume_mapping,
+            loss=config.partially_amortized_loss,
             **optimizer_kwargs,
         )
     save_dir = os.getenv("SCRATCH", ".")

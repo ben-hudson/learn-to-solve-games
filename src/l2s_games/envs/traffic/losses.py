@@ -1,6 +1,6 @@
 import torch
 
-from l2s_games.envs.traffic.game import PotentialCongestion
+from l2s_games.envs.traffic.game import NonPotentialCongestion
 from torch_geometric.utils import scatter
 from typing import List
 
@@ -28,7 +28,7 @@ class PotentialLoss(torch.nn.Module):
         super().__init__()
         self.precondition = precondition
 
-    def forward(self, games: List[PotentialCongestion], pred_costs: torch.Tensor):
+    def forward(self, games: List[NonPotentialCongestion], pred_costs: torch.Tensor):
         squared_excess_supply = PotentialGradient.apply(games, pred_costs, self.precondition)
         return squared_excess_supply.sum(dim=-1).mean()
 
@@ -54,16 +54,18 @@ class WardropAprLoss(torch.nn.Module):
     pushes infeasible predictions back inside.
     """
 
-    def forward(self, games: List[PotentialCongestion], pred_costs: torch.Tensor):
+    def forward(self, games: List[NonPotentialCongestion], pred_costs: torch.Tensor):
         # PUME solves one instance at a time in float64 on the CPU; MPS cannot cast to
         # float64, so move first. The .cpu()/.double() ops keep the autograd graph intact.
         gains = [
             self._worst_deviation_gain(game, game.project_costs(sample))
             for game, sample in zip(games, pred_costs.cpu().double())
         ]
-        return torch.stack(gains).to(dtype=pred_costs.dtype, device=pred_costs.device).mean()
+        # cast before moving: a fused .to(dtype, device) makes backward cast the incoming
+        # gradient to float64 while still on MPS, which MPS rejects
+        return torch.stack(gains).to(dtype=pred_costs.dtype).to(device=pred_costs.device).mean()
 
-    def _worst_deviation_gain(self, game: PotentialCongestion, costs: torch.Tensor):
+    def _worst_deviation_gain(self, game: NonPotentialCongestion, costs: torch.Tensor):
         best_response = game.best_response(costs)
         values, policies = best_response["value"], best_response["policy"]
         tails, heads = game.edge_index
@@ -95,14 +97,16 @@ class PolicyKLDiv(torch.nn.Module):
     times its own response is optimal for. Self-supervised: no equilibrium labels.
     """
 
-    def forward(self, games: List[PotentialCongestion], pred_costs: torch.Tensor):
+    def forward(self, games: List[NonPotentialCongestion], pred_costs: torch.Tensor):
         divergences = [
             self._flow_weighted_kl(game, game.project_costs(sample))
             for game, sample in zip(games, pred_costs.cpu().double())
         ]
-        return torch.stack(divergences).to(dtype=pred_costs.dtype, device=pred_costs.device).mean()
+        # cast before moving: a fused .to(dtype, device) makes backward cast the incoming
+        # gradient to float64 while still on MPS, which MPS rejects
+        return torch.stack(divergences).to(dtype=pred_costs.dtype).to(device=pred_costs.device).mean()
 
-    def _flow_weighted_kl(self, game: PotentialCongestion, costs: torch.Tensor):
+    def _flow_weighted_kl(self, game: NonPotentialCongestion, costs: torch.Tensor):
         response = game.best_response(costs, return_demand=True)
         # the response's flows congest the network; project because extreme predictions can
         # push the induced times past the box, where the solve's exponentials underflow
@@ -125,7 +129,7 @@ class PotentialGradient(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, games: List[PotentialCongestion], costs: torch.Tensor, precondition: bool):
+    def forward(ctx, games: List[NonPotentialCongestion], costs: torch.Tensor, precondition: bool):
         fields = []
         # move to the CPU before the float64 cast, which MPS does not support
         for game, sample in zip(games, costs.cpu().double()):
