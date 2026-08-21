@@ -64,6 +64,7 @@ class TrafficFieldModel(AmortizedModel):
         target_scale,
         pume_mapping,
         loss="norm",
+        huber_delta=1.0,
         step_size=0.25,
         steps=200,
         **kwargs,
@@ -72,8 +73,9 @@ class TrafficFieldModel(AmortizedModel):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
         # the model predicts in normalized target space (one global scale), so every loss measures
-        # the error in scale units and the huber knee sits at one target std of the per-sample norm
-        self.loss = {"mse": MSELoss(), "norm": NormLoss(), "huber": NormHuberLoss()}[loss]
+        # the error in target-std units. huber_delta caps the per-sample gradient norm at
+        # min(||r||, delta), so it is only a knob between the floor and where training starts.
+        self.loss = {"mse": MSELoss(), "norm": NormLoss(), "huber": NormHuberLoss(huber_delta)}[loss]
         self.pume_mapping = pume_mapping
         self.step_size = step_size
         self.steps = steps

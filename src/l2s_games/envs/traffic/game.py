@@ -176,7 +176,9 @@ class NonPotentialCongestion(PUMEModel):
         return self.eq, self.eq_info
 
     def operator(self, costs):
-        return self.compute_excess_supply(costs)
+        # PUME operates in float64, and the rotated supply's B is built there, so a float32 cost
+        # vector (the learning stack's dtype) would fail the ``B c`` matmul outright
+        return self.compute_excess_supply(costs.double())
 
     def operator_and_preconditioner(self, costs: torch.Tensor, eps: float = 1e-8):
         """``(excess_supply, preconditioner_diagonal)``: the raw excess supply

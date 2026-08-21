@@ -47,17 +47,18 @@ def load_base_graph(root: Path):
 def get_config():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--amortization", type=str, choices=["full", "partial"], default="partial")
-    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--batch_size", type=int, default=16)
     parser.add_argument("--cosine_annealing", type=int, default=0)
     parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--fully_amortized_loss", type=str, choices=["potential", "wardrop"], default="potential")
     parser.add_argument("--gradient_clip_val", type=float, default=0)
+    parser.add_argument("--huber_delta", type=float, default=1.0)
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--n_instances_per_epoch", type=int, default=512)
-    parser.add_argument("--n_points_per_instance", type=int, default=2)
+    parser.add_argument("--n_points_per_instance", type=int, default=128)
     parser.add_argument("--partially_amortized_loss", type=str, choices=["mse", "norm", "huber"], default="norm")
     parser.add_argument("--patience_epochs", type=int, default=40)
     parser.add_argument("--seed", type=int, default=None)
@@ -102,6 +103,7 @@ if __name__ == "__main__":
         cal_dataset,
         n_points_per_instance=config.n_points_per_instance,
         n_instances=config.n_instances_per_epoch,
+        kappa=cal_dataset[0]["kappa"],
         solve=False,
         quiet=True,
         transform=transforms,
@@ -171,6 +173,7 @@ if __name__ == "__main__":
             target_scale=operator_scaler.scale_,
             pume_mapping=pume_mapping,
             loss=config.partially_amortized_loss,
+            huber_delta=config.huber_delta,
             **optimizer_kwargs,
         )
     save_dir = os.getenv("SCRATCH", ".")
@@ -182,8 +185,8 @@ if __name__ == "__main__":
     # Debug runs disable checkpointing, and Lightning rejects a ModelCheckpoint when it's off.
     callbacks = [
         EarlyStopping(
-            # monitor="val/residual",
-            monitor="train/loss",
+            monitor="val/residual",
+            # monitor="train/loss",
             mode="min",
             patience=max(1, config.patience_epochs // config.val_every_n_epochs),
             check_finite=False,
