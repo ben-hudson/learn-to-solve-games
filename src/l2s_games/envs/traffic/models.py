@@ -61,6 +61,8 @@ class TrafficFieldModel(AmortizedModel):
         dim,
         feat_mean,
         feat_scale,
+        point_min,
+        point_max,
         target_scale,
         pume_mapping,
         loss="norm",
@@ -79,20 +81,28 @@ class TrafficFieldModel(AmortizedModel):
         self.pume_mapping = pume_mapping
         self.step_size = step_size
         self.steps = steps
+
+        self.register_buffer("point_min", torch.as_tensor(point_min, dtype=torch.float32))
+        self.register_buffer("point_max", torch.as_tensor(point_max, dtype=torch.float32))
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
+
+    def normalize_point(self, point):
+        return (point - self.point_min) / (self.point_max - self.point_min)
 
     def training_step(self, batch, batch_idx):
         # fold the sampled points into the batch dimension: every point is an
         # independent evaluation on the same graph
         n_points_per_instance = batch["point"].size(1)
-        feats = self.normalize_feats(batch["feats"].flatten(0, 1))
+        feats = self.normalize_feats(batch["feats"].repeat_interleave(n_points_per_instance, dim=0))
+        points = self.normalize_point(batch["point"].flatten(0, 1))
+        feats_and_point = torch.cat([feats, points.unsqueeze(-1)], dim=-1)
         in_degree = batch["in_degree"].repeat_interleave(n_points_per_instance, dim=0)
         out_degree = batch["out_degree"].repeat_interleave(n_points_per_instance, dim=0)
         spd = batch["spd"].repeat_interleave(n_points_per_instance, dim=0)
         # one global scale for the preconditioned operator (isotropic, so its direction is untouched)
         target = batch["preconditioned_operator"].flatten(0, 1) / self.target_scale
 
-        prediction = self.readout(self.backbone(feats, in_degree, out_degree, spd)).squeeze(-1)
+        prediction = self.readout(self.backbone(feats_and_point, in_degree, out_degree, spd)).squeeze(-1)
         loss = self.loss(prediction, target)
         self.log("train/loss", loss)
         return loss
@@ -104,8 +114,12 @@ class TrafficFieldModel(AmortizedModel):
         # the step size was tuned for, and the ascent field is its negation (excess demand pushes
         # costs up).
         def preconditioned_excess_demand(costs):
-            feats = self.normalize_feats(torch.stack([batch["free_flow_time"], batch["capacity"], costs], dim=-1))
-            prediction = self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
+            feats = self.normalize_feats(batch["feats"])
+            points = self.normalize_point(costs)
+            feats_and_point = torch.cat([feats, points.unsqueeze(-1)], dim=-1)
+            prediction = self.readout(
+                self.backbone(feats_and_point, batch["in_degree"], batch["out_degree"], batch["spd"])
+            )
             return -prediction.squeeze(-1) * self.target_scale
 
         def project_costs(costs):

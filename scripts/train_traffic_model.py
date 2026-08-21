@@ -10,17 +10,17 @@ import wandb
 from l2s_games.envs.traffic import (
     BuildTrafficFeats,
     GraphToTensorDict,
-    PUMEMapping,
+    NetworkLoading,
     TrafficFieldModel,
     TrafficOperatorDataset,
+    TrafficOperatorStream,
     TrafficSolutionModel,
 )
-from l2s_games.envs.traffic.streams import TrafficOperatorStream
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
-from sklearn.preprocessing import StandardScaler
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
 from torch_geometric.transforms import Compose, LineGraph
 from torch.utils.data import random_split, DataLoader
 
@@ -87,28 +87,12 @@ if __name__ == "__main__":
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
     dataset = TrafficOperatorDataset(config.dataset, transform=transforms)
+    network_loading = NetworkLoading.from_pyg_data(dataset.base_graph)
 
-    cal_dataset, val_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
+    cal_dataset, val_dataset, test_dataset, _ = random_split(dataset, [128, 128, 128, len(dataset) - 3 * 128])
     # torch.stack collates the per-instance TensorDicts into a batched TensorDict
     cal_loader = DataLoader(cal_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
-
-    # every instance shares the network and OD demand, and only the untransformed instances keep
-    # the road network's edge_index (LineGraph rewrites it), so the mapping is rebuilt from raw
-    base_graph = load_base_graph(Path("raw_data/sioux_falls"))
-    pume_mapping = PUMEMapping.from_edges_and_demand(base_graph.edge_index, base_graph.demand_matrix)
-    train_dataset = TrafficOperatorStream(
-        pume_mapping,
-        base_graph,
-        cal_dataset,
-        n_points_per_instance=config.n_points_per_instance,
-        n_instances=config.n_instances_per_epoch,
-        kappa=cal_dataset[0]["kappa"],
-        solve=False,
-        quiet=True,
-        transform=transforms,
-    )
-    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     sample = dataset[0]
 
@@ -116,12 +100,25 @@ if __name__ == "__main__":
     operator_scaler = StandardScaler(with_mean=False)
     solution_scaler = StandardScaler()
     for batch in cal_loader:
-        # TODO: how is the point itself normalized?
+        # TODO: should these be per-edge or edges together?
         feat_scaler.partial_fit(batch["feats"].reshape(-1, batch["feats"].size(-1)))
         # a single column, so the fit yields one global scale: an isotropic rescale of the
         # operator field that preserves its direction
         operator_scaler.partial_fit(batch["preconditioned_operator"].reshape(-1, 1))
         solution_scaler.partial_fit(batch["eq"].reshape(-1, 1))
+
+    train_dataset = TrafficOperatorStream(
+        network_loading,
+        dataset.base_graph,
+        dataset.sample_lo,
+        dataset.sample_hi,
+        n_points_per_instance=config.n_points_per_instance,
+        n_instances=config.n_instances_per_epoch,
+        solve=False,
+        quiet=True,
+        transform=transforms,
+    )
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     dim = 128
     optimizer_kwargs = dict(
@@ -149,13 +146,13 @@ if __name__ == "__main__":
             feat_scale=feat_scaler.scale_,
             target_mean=solution_scaler.mean_,
             target_scale=solution_scaler.scale_,
-            pume_mapping=pume_mapping,
+            pume_mapping=network_loading,
             loss=config.fully_amortized_loss,
             **optimizer_kwargs,
         )
     else:
         backbone = GraphormerBackbone(
-            n_feats=sample["feats"].size(-1),
+            n_feats=sample["feats"].size(-1) + 1,
             in_degree=sample["in_degree"],
             out_degree=sample["out_degree"],
             spd=sample["spd"],
@@ -170,8 +167,10 @@ if __name__ == "__main__":
             dim=dim,
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
+            point_min=dataset.sample_lo,
+            point_max=dataset.sample_hi,
             target_scale=operator_scaler.scale_,
-            pume_mapping=pume_mapping,
+            pume_mapping=network_loading,
             loss=config.partially_amortized_loss,
             huber_delta=config.huber_delta,
             **optimizer_kwargs,
