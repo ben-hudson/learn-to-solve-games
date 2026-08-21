@@ -1,13 +1,13 @@
 import torch
 import tqdm
 
+from sklearn.preprocessing import MinMaxScaler
 from tensordict import TensorDict
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.transforms import BaseTransform
 
-from l2s_games.envs.traffic.streams import TrafficEquilibriumStream
-
-from .game import NonPotentialCongestion
+from .game import NetworkLoading, NonPotentialCongestion
+from .streams import TrafficEquilibriumStream, TrafficOperatorStream
 
 
 class GraphToTensorDict(BaseTransform):
@@ -30,16 +30,16 @@ class BuildTrafficFeats(BaseTransform):
         self.mode = mode
 
     def forward(self, data):
-        feats = torch.stack([data.free_flow_time, data.capacity], dim=-1)
+        data.feats = torch.stack([data.free_flow_time, data.capacity], dim=-1)
 
-        if self.mode == "partial":
-            n_points_per_instance = data.point.size(0)
-            feats = feats.expand(n_points_per_instance, -1, -1)
-            # here we add the point because it is not constrained to the simplex
-            points = data.point.unsqueeze(-1)
-            data.feats = torch.cat([feats, points], dim=-1)
-        else:
-            data.feats = feats
+        # if self.mode == "partial":
+        #     n_points_per_instance = data.point.size(0)
+        #     feats = feats.expand(n_points_per_instance, -1, -1)
+        #     # here we add the point because it is not constrained to the simplex
+        #     points = data.point.unsqueeze(-1)
+        #     data.feats = torch.cat([feats, points], dim=-1)
+        # else:
+        #     data.feats = feats
 
         return data
 
@@ -48,47 +48,48 @@ class TrafficEquilibriumDataset(InMemoryDataset):
     def __init__(
         self,
         root,
-        pume_mapping=None,
+        network_loading: NetworkLoading = None,
         base_graph=None,
         n_instances=None,
         kappa=0.0,
         quiet=True,
         **kwargs,
     ):
-        self.pume_mapping = pume_mapping
+        self.network_loading = network_loading
         self.base_graph = base_graph
         self.quiet = quiet
         self.n_instances = n_instances
         self.kappa = kappa
 
         super().__init__(root, **kwargs)
+        self.base_graph = torch.load(self.raw_paths[1], weights_only=False)
         self.load(self.processed_paths[0])
 
     @property
     def raw_file_names(self):
-        return ["instances.pt"]
+        return ["instances.pt", "base_graph.pt"]
 
     @property
     def processed_file_names(self):
         return ["instances.pt"]
 
     def download(self):
-        required_attrs = ["pume_mapping", "base_graph", "n_instances"]
+        required_attrs = ["network_loading", "base_graph", "n_instances"]
         assert all(
             getattr(self, attr) is not None for attr in required_attrs
         ), f"No cache at {self.raw_paths[0]}. Pass {required_attrs} to rebuild it."
 
         instances = list(
             TrafficEquilibriumStream(
-                self.pume_mapping,
+                self.network_loading,
                 self.base_graph,
                 self.n_instances,
-                kappa=self.kappa,
                 quiet=self.quiet,
                 solve=True,
             )
         )
         torch.save(instances, self.raw_paths[0])
+        torch.save(self.base_graph, self.raw_paths[1])
 
     def load_instances(self):
         return torch.load(self.raw_paths[0], weights_only=False)
@@ -98,50 +99,54 @@ class TrafficEquilibriumDataset(InMemoryDataset):
         self.save(self.load_instances(), self.processed_paths[0])
 
 
-# TODO: if we are using a separate stream at training time now, this class is useless
 class TrafficOperatorDataset(TrafficEquilibriumDataset):
     def __init__(self, root, n_cal_instances=None, n_points_per_instance=None, **kwargs):
         self.n_cal_instances = n_cal_instances
         self.n_points_per_instance = n_points_per_instance
+
         super().__init__(root, **kwargs)
+        self.sample_lo, self.sample_hi = torch.load(self.processed_paths[1]).unbind(0)
 
     @property
     def processed_file_names(self):
-        return ["operators.pt"]
+        return ["operators.pt", "sample_box.pt"]
 
     def process(self):
-        required_attrs = ["pume_mapping", "base_graph", "n_cal_instances", "n_points_per_instance"]
+        required_attrs = ["network_loading", "base_graph", "n_cal_instances", "n_points_per_instance"]
         assert all(
             getattr(self, attr) is not None for attr in required_attrs
         ), f"No cache at {self.processed_paths[0]}. Pass {required_attrs} to rebuild it."
 
-        # compute K_U, the subset of the feasible space to sample from
-        cal_set = list(
-            TrafficEquilibriumStream(
-                self.pume_mapping,
-                self.base_graph,
-                self.n_cal_instances,
-                kappa=self.kappa,
-                quiet=self.quiet,
-                solve=True,
-            )
+        scaler = MinMaxScaler()
+        cal_set = TrafficEquilibriumStream(
+            self.network_loading,
+            self.base_graph,
+            self.n_cal_instances,
+            quiet=self.quiet,
+            solve=True,
         )
-        lower, _ = torch.stack([inst.free_flow_time for inst in cal_set], dim=-1).min(dim=-1)
-        upper, _ = torch.stack([inst.eq for inst in cal_set], dim=-1).max(dim=-1)
-        roi = torch.distributions.Uniform(lower, upper)
+        for sample in cal_set:
+            scaler.partial_fit(sample.free_flow_time.reshape(1, -1))
+            scaler.partial_fit(sample.eq.reshape(1, -1))
+
+        sample_lo = torch.as_tensor(scaler.data_min_)
+        sample_hi = torch.as_tensor(scaler.data_max_)
+        sample_box = torch.distributions.Uniform(sample_lo, sample_hi)
 
         instances = self.load_instances()
         progress = instances if self.quiet else tqdm.tqdm(instances)
 
-        data_list = []
+        # TrafficOperatorStream generates new instances, but we want to attach operators to existing ones
+        # TODO: there is a risk here that the generation process must match between TrafficOperatorStream and TrafficOperatorDataset
+        operators = []
         for data in progress:
-            instance = NonPotentialCongestion.from_data(self.pume_mapping, data)
-            data.point = roi.sample((self.n_points_per_instance,))
+            instance = NonPotentialCongestion.from_data(self.network_loading, data)
+            data.point = sample_box.sample((self.n_points_per_instance,)).float()
             op, precond = zip(*(instance.operator_and_preconditioner(point) for point in data.point))
-            # the operator evaluations run in float64, but the learning stack expects float32
             data.operator = torch.stack(op).float()
             data.preconditioner = torch.stack(precond).float()
             data.preconditioned_operator = data.operator / data.preconditioner
-            data_list.append(data)
+            operators.append(data)
 
-        self.save(data_list, self.processed_paths[0])
+        self.save(operators, self.processed_paths[0])
+        torch.save(torch.stack([sample_lo, sample_hi]), self.processed_paths[1])

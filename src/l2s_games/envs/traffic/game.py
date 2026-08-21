@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pumcm import PUMCM, ModifiedPolicyIteration, RelativeEntropy
 from pumcm.utils.structure_builder import build_structures_batch
 from pume import PUMEModel, StackedPUMCMDemandLoader
-from pume.operators import InverseBPRSupply
+from pume.operators import AsymmetricBPRSupply, InverseBPRSupply
 from scipy import sparse
 from tensordict import TensorDict
 from torch_geometric.data import Data
@@ -46,16 +46,23 @@ DEFAULT_INNER_SOLVER_OPTIONS = {
 
 
 @dataclass
-class PUMEMapping:
+class NetworkLoading:
     edge_index: torch.Tensor
     mdps: List[PUMCM]
     reward_mapping: RewardMapping
     flow_mapping: FlowMapping
     demand_loader: StackedPUMCMDemandLoader
     demand_matrix: torch.Tensor
+    interaction_matrix: torch.Tensor = None
 
     @classmethod
-    def from_edges_and_demand(cls, edge_index: torch.Tensor, demand_matrix: torch.Tensor, **inner_solver_kwargs):
+    def from_tensors(
+        cls,
+        edge_index: torch.Tensor,
+        demand_matrix: torch.Tensor,
+        interaction_matrix: torch.Tensor = None,
+        **inner_solver_kwargs,
+    ):
         n_nodes = demand_matrix.size(0)
         n_edges = edge_index.size(1)
 
@@ -101,38 +108,34 @@ class PUMEMapping:
             reward_invariant=True,
         )
 
-        return cls(edge_index, mdps, reward_mapping, flow_mapping, demand_loader, demand_matrix)
+        return cls(edge_index, mdps, reward_mapping, flow_mapping, demand_loader, demand_matrix, interaction_matrix)
+
+    @classmethod
+    def from_pyg_data(
+        cls,
+        base_graph: Data,
+        **inner_solver_kwargs,
+    ):
+        return cls.from_tensors(
+            base_graph.edge_index, base_graph.demand_matrix, base_graph.interaction_matrix, **inner_solver_kwargs
+        )
 
 
 class NonPotentialCongestion(PUMEModel):
-    """Congestion game with the rotated supply ``z(c) = f(c) + B c``, ``f`` the inverse BPR link
-    performance function.
-
-    ``B = kappa S`` is antisymmetric, so ``grad z`` is non-symmetric and the excess supply is not
-    the gradient of any potential, yet the operator stays monotone for any ``kappa`` (see
-    ``supply.py``). ``B`` is a pure function of the topology and ``kappa``, so it is rebuilt from
-    ``network.edge_index`` at construction rather than cached; only the scalar ``kappa`` travels
-    with the instance. ``kappa=0`` recovers the potential congestion game, and the supply is then
-    the bare separable ``InverseBPRSupply`` -- not a coupled supply with ``B = 0`` -- so PUME's
-    separable fast paths stay available. The multiplicative coupling is disabled (``A = I``).
-    """
-
     def __init__(
         self,
-        network: PUMEMapping,
+        edge_index: torch.Tensor,
+        network_loading: NetworkLoading,
         free_flow_time: torch.Tensor,
         capacity: torch.Tensor,
         alpha: torch.Tensor,
         beta: torch.Tensor,
-        kappa: float = 0.0,
     ):
-        self.edge_index = network.edge_index
-        self.demand_matrix = network.demand_matrix
-        self.kappa = kappa
+        self.edge_index = edge_index
         self.eq = None
         self.eq_info = None
 
-        if self.kappa == 0.0:
+        if network_loading.interaction_matrix is None:
             supply = InverseBPRSupply(
                 free_flow_time=free_flow_time,
                 capacity=capacity,
@@ -141,37 +144,38 @@ class NonPotentialCongestion(PUMEModel):
                 eps=1e-6,
             )
         else:
-            rotation_matrix = build_rotation_matrix(network.edge_index, self.kappa)
-            supply = CoupledBPRSupply(
+            supply = AsymmetricBPRSupply(
                 free_flow_time=free_flow_time,
                 capacity=capacity,
-                interaction_matrix=torch.eye(rotation_matrix.size(0), dtype=torch.float64),
-                rotation_matrix=rotation_matrix,
+                interaction_matrix=network_loading.interaction_matrix,
                 alpha=alpha,
                 beta=beta,
                 eps=1e-6,
+                validate_monotone=True,
             )
 
-        cost_lower = free_flow_time.numpy()
+        cost_lo = free_flow_time.numpy()
+        cost_hi = np.full_like(cost_lo, COST_UPPER_BOUND)
         super().__init__(
-            pumcm_models=network.mdps,
+            pumcm_models=network_loading.mdps,
             supply_func=None,
             supply=supply,
-            reward_mapping=network.reward_mapping,
-            flow_mapping=network.flow_mapping,
-            cost_bounds=(cost_lower, np.full_like(cost_lower, COST_UPPER_BOUND)),
-            demand_loader=network.demand_loader,
+            reward_mapping=network_loading.reward_mapping,
+            flow_mapping=network_loading.flow_mapping,
+            cost_bounds=(cost_lo, cost_hi),
+            demand_loader=network_loading.demand_loader,
         )
 
     def _solve(self, initial_cost=None, solver=None, method="meta", max_iters=1000, tol=1e-3):
+        """Solve in-place."""
         if initial_cost is None:
             initial_cost = self.free_flow_time * 1.1
         options = dict(**DEFAULT_OUTER_SOLVER_OPTIONS, max_iterations=max_iters, convergence_tolerance=tol)
-        # PUME operates in float64
         solve_info = super().solve(c_initial=initial_cost.double(), solver=solver, method=method, options=options)
         self.eq, self.eq_info = solve_info["cost"], solve_info
 
     def solve(self, **kwargs):
+        """Solve in-place and return solution."""
         self._solve(**kwargs)
         return self.eq, self.eq_info
 
@@ -215,11 +219,12 @@ class NonPotentialCongestion(PUMEModel):
         PUMCM's implicit-diff backward.
         """
         rewards = -costs.double()
-        destinations = torch.nonzero(self.demand_matrix.sum(dim=0) > 0).flatten()
+        stacked_demand = self._demand_loader._initial_states
+        state_maps = self._demand_loader.stacked.state_maps
         sols = []
-        for mdp, destination in zip(self.pumcm_models, destinations):
+        for mdp, state_map in zip(self.pumcm_models, state_maps):
             # PUMCM's autograd path requires initial states even when flows aren't returned
-            demand = self.demand_matrix[:, destination].double()
+            demand = stacked_demand[torch.as_tensor(state_map, dtype=torch.long)]
             sol = mdp.solve(
                 rewards_full=rewards,
                 initial_states_full=demand,
@@ -231,31 +236,27 @@ class NonPotentialCongestion(PUMEModel):
         return torch.stack(sols)
 
     def travel_time(self, flows: torch.Tensor) -> torch.Tensor:
-        """Congested edge times at ``flows``: the Tikhonov-regularized BPR link performance
-        function whose inverse is the separable ``bpr`` core, so ``travel_time(supply(c)) == c``
-        exactly when the supply *is* that core (i.e. only when ``kappa == 0``)."""
-        return self.bpr._forward_bpr(flows, self.free_flow_time, self.capacity, self.alpha, self.beta)
+        if isinstance(self.supply_operator, AsymmetricBPRSupply):
+            supply = self.supply_operator._inner
+        else:
+            supply = self.supply_operator
+        return supply._forward_bpr(flows, supply.t0, supply.cap, supply.alpha, supply.beta)
 
     @property
-    def bpr(self) -> InverseBPRSupply:
-        """The separable inverse-BPR core of the supply operator."""
-        return self.supply_operator if self.kappa == 0.0 else self.supply_operator.inner
+    def free_flow_time(self) -> torch.Tensor:
+        return self.supply_operator.t0
 
     @property
-    def free_flow_time(self):
-        return self.bpr.t0
+    def capacity(self) -> torch.Tensor:
+        return self.supply_operator.cap
 
     @property
-    def capacity(self):
-        return self.bpr.cap
+    def alpha(self) -> torch.Tensor:
+        return self.supply_operator.alpha
 
     @property
-    def alpha(self):
-        return self.bpr.alpha
-
-    @property
-    def beta(self):
-        return self.bpr.beta
+    def beta(self) -> torch.Tensor:
+        return self.supply_operator.beta
 
     @property
     def n_nodes(self):
@@ -275,13 +276,13 @@ class NonPotentialCongestion(PUMEModel):
             capacity=self.capacity.to(dtype),
             alpha=self.alpha.to(dtype),
             beta=self.beta.to(dtype),
-            demand_matrix=self.demand_matrix.to(dtype),
-            kappa=torch.as_tensor(self.kappa, dtype=dtype),
         )
         if self.eq is not None:
             data.eq = self.eq.to(dtype)
         return data
 
     @classmethod
-    def from_data(cls, network, data):
-        return cls(network, data["free_flow_time"], data["capacity"], data["alpha"], data["beta"], data["kappa"])
+    def from_data(cls, network_loading, data):
+        return cls(
+            data["edge_index"], network_loading, data["free_flow_time"], data["capacity"], data["alpha"], data["beta"]
+        )

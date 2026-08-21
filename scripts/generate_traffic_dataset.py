@@ -1,12 +1,11 @@
 import argparse
-
-from pathlib import Path
-
 import tntp
 import torch
+
+from l2s_games.envs.traffic import TrafficEquilibriumDataset, TrafficOperatorDataset, NetworkLoading
+from pathlib import Path
+from pume.operators import build_asymmetric_interaction_matrix
 from torch_geometric.utils import from_networkx
-from l2s_games.envs.traffic import TrafficEquilibriumDataset, PUMEMapping
-from l2s_games.envs.traffic.datasets import TrafficOperatorDataset
 
 
 def get_config():
@@ -15,7 +14,6 @@ def get_config():
     parser.add_argument("--n_instances", type=int, default=512)
     parser.add_argument("--n_cal_instances", type=int, default=128)
     parser.add_argument("--n_points_per_instance", type=int, default=256)
-    parser.add_argument("--kappa", type=float, default=0.0)
     parser.add_argument("--quiet", action="store_true")
 
     config = parser.parse_args()
@@ -40,25 +38,27 @@ if __name__ == "__main__":
     demand_table = demand_table.reindex(index=node_list, columns=node_list)
 
     demand_scale = 1000
-    demand = torch.as_tensor(demand_table.values) / demand_scale
+    base_graph.demand_matrix = torch.as_tensor(demand_table.values) / demand_scale
     base_graph.capacity = base_graph.capacity / demand_scale
 
-    pume_mapping = PUMEMapping.from_edges_and_demand(base_graph.edge_index, demand)
+    base_graph.interaction_matrix = build_asymmetric_interaction_matrix(
+        base_graph.num_edges, base_graph.edge_index.t().tolist()
+    )
+
+    network_loading = NetworkLoading.from_pyg_data(base_graph)
     eq_dataset = TrafficEquilibriumDataset(
         config.dataset,
-        pume_mapping=pume_mapping,
+        network_loading=network_loading,
         base_graph=base_graph,
         n_instances=config.n_instances,
-        kappa=config.kappa,
         quiet=False,
     )
     op_dataset = TrafficOperatorDataset(
         config.dataset,
-        pume_mapping=pume_mapping,
+        network_loading=network_loading,
         base_graph=base_graph,
         n_cal_instances=config.n_cal_instances,
         n_points_per_instance=config.n_points_per_instance,
-        kappa=config.kappa,
         force_reload=True,
         quiet=False,
     )
