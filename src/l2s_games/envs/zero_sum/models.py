@@ -4,8 +4,7 @@ import torch
 from l2s_games.algorithms import Optimistic
 from l2s_games.envs.zero_sum.game import operator
 
-from .datasets import RandomZeroSumOperatorDataset
-from .losses import NashAprLoss, NormLoss
+from .losses import NashAprLoss, NormHuberLoss, NormLoss
 from .utils import dist_to_normal_cone, project_onto_simplex
 
 
@@ -64,7 +63,7 @@ class FieldModel(AmortizedModel):
     ):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
-        self.loss = NormLoss()
+        self.loss = NormHuberLoss(delta=1.0)
         self.step_size = step_size
         self.steps = steps
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
@@ -72,26 +71,25 @@ class FieldModel(AmortizedModel):
     def training_step(self, batch, batch_idx):
         # fold the sampled points into the batch dimension: every point is an
         # independent evaluation on the same graph
-        n_points_per_instance = batch.point.size(1)
-        batch = batch._replace(
-            point=batch.point.flatten(0, 1),
-            payoffs=batch.payoffs.flatten(0, 1),
-            operator=batch.operator.flatten(0, 1),
-            in_degree=batch.in_degree.repeat_interleave(n_points_per_instance, dim=0),
-            out_degree=batch.out_degree.repeat_interleave(n_points_per_instance, dim=0),
-            spd=batch.spd.repeat_interleave(n_points_per_instance, dim=0),
-        )
+        n_points_per_instance = batch["point"].size(1)
+        # release the batch dims so per-point keys ([B * P, ...]) can coexist with
+        # per-instance keys ([B, ...])
+        batch.batch_size = []
+        batch["point"] = batch["point"].flatten(0, 1)
+        batch["payoffs"] = batch["payoffs"].flatten(0, 1)
+        batch["operator"] = batch["operator"].flatten(0, 1)
+        batch["in_degree"] = batch["in_degree"].repeat_interleave(n_points_per_instance, dim=0)
+        batch["out_degree"] = batch["out_degree"].repeat_interleave(n_points_per_instance, dim=0)
+        batch["spd"] = batch["spd"].repeat_interleave(n_points_per_instance, dim=0)
         # normalize: one global mean/scale for the payoffs, one global scale for the
         # operator (isotropic, so its direction is untouched)
-        batch = batch._replace(
-            payoffs=self.normalize_feats(batch.payoffs),
-            operator=batch.operator / self.target_scale,
-        )
+        batch["payoffs"] = self.normalize_feats(batch["payoffs"])
+        batch["operator"] = batch["operator"] / self.target_scale
         # feats: the raw point (simplex coordinates need no normalization) alongside
         # the normalized payoffs
-        feats = torch.cat([batch.point, batch.payoffs], dim=-1)
-        prediction = self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd))
-        loss = self.loss(prediction, batch.operator)
+        feats = torch.cat([batch["point"], batch["payoffs"]], dim=-1)
+        prediction = self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
+        loss = self.loss(prediction, batch["operator"])
         self.log("train/loss", loss)
         return loss
 
@@ -101,14 +99,16 @@ class FieldModel(AmortizedModel):
         # rescale of the true one, so its equilibria are unchanged and the step size is
         # scale-free.
         # every sampled point shares the instance's payoffs, so one copy per game suffices
-        payoffs = self.normalize_feats(batch.payoffs[:, 0])
+        payoffs = self.normalize_feats(batch["payoffs"][:, 0])
 
         def operator(strategies):
             feats = torch.cat([strategies, payoffs], dim=-1)
-            return self.readout(self.backbone(feats, batch.in_degree, batch.out_degree, batch.spd))
+            return self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
 
         algorithm = Optimistic(self.step_size, operator, project_onto_simplex)
-        strategies = torch.full_like(batch.eq, 1 / batch.eq.size(-1))
+        # start from the uniform profile: one [2, n] profile per instance, shaped like a
+        # single sampled point
+        strategies = torch.full_like(batch["point"][:, 0], 1 / batch["point"].size(-1))
         for _ in range(self.steps):
             strategies = algorithm.step(strategies)
         return strategies
@@ -118,8 +118,8 @@ class FieldModel(AmortizedModel):
         # equilibrium, so unlike a distance to the LP solution it is robust to equilibrium
         # non-uniqueness. target_scale puts it in the same normalized units as train/loss.
         strategies = self.solve(batch)
-        operator = RandomZeroSumOperatorDataset.eval_operator(batch, strategies)
-        residual = dist_to_normal_cone(operator / self.target_scale, strategies)
+        op = operator(batch["A"], batch["B"], strategies)
+        residual = dist_to_normal_cone(op / self.target_scale, strategies)
         self.log("val/residual", residual.norm(dim=-1).mean())
 
 

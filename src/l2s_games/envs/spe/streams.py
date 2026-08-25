@@ -30,15 +30,15 @@ class EquilibriumStream(IterableDataset):
     def __init__(
         self,
         sample_fn: Callable,
-        solve_fn: Callable = None,
         n_instances: int = None,
+        solve: bool = False,
         quiet: bool = True,
         transform: BaseTransform = None,
     ):
         super().__init__()
         self.sample_fn = sample_fn
-        self.solve_fn = solve_fn
         self.n_instances = n_instances
+        self.solve = solve
         self.quiet = quiet
         self.transform = transform
 
@@ -48,7 +48,7 @@ class EquilibriumStream(IterableDataset):
 
         for _ in progress:
             instance = self.sample_fn()
-            eq = self.solve_fn(instance) if self.solve_fn else None
+            eq = instance.solve() if self.solve else None
             yield instance, eq
 
     def __iter__(self):
@@ -59,19 +59,17 @@ class EquilibriumStream(IterableDataset):
 
 
 class OperatorStream(EquilibriumStream):
-    def __init__(self, *args, sample_domain_fn, operator_fn, n_points_per_instance=1, **kwargs):
-        super().__init__(*args, **kwargs)
+    def __init__(self, sample_fn, sample_domain_fn, n_points_per_instance=1, **kwargs):
+        super().__init__(sample_fn, **kwargs)
 
         self.sample_domain_fn = sample_domain_fn
-        self.operator_fn = operator_fn
-        # self.sample_box = torch.distributions.Uniform(sample_lo, sample_hi)
         self.n_points_per_instance = n_points_per_instance
 
     def __iter__(self):
         for instance, eq in self.generate_instances():
             data = instance.to_data()
             data.eq = eq
-            data.point = self.sample_domain_fn(data, self.n_points_per_instance).float()
-            data.operator = self.operator_fn(data).float()
+            data.point = self.sample_domain_fn(instance, self.n_points_per_instance).float()
+            data.operator = instance.operator(data.point).float()
 
             yield data if self.transform is None else self.transform(data)

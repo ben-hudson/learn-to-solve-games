@@ -3,18 +3,15 @@ import lightning as L
 import os
 import torch
 import wandb
-import pygambit as gambit
 
-from l2s_games.envs.spe.streams import EquilibriumStream
+from l2s_games.envs.spe.streams import OperatorStream
 from l2s_games.envs.traffic.datasets import GraphToTensorDict
 from l2s_games.envs.zero_sum import (
     BuildZeroSumFeats,
     FieldModel,
-    GraphToTuple,
-    RandomZeroSumOperatorDataset,
     SolutionModel,
 )
-from l2s_games.envs.zero_sum.game import RandomZeroSum, operator, profile_to_tensor, solve
+from l2s_games.envs.zero_sum.game import RandomZeroSum
 from l2s_games.envs.zero_sum.losses import NashAprLoss, PotentialLoss
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
@@ -60,14 +57,28 @@ if __name__ == "__main__":
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
     # dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
-    sample = partial(RandomZeroSum, n_actions=3)
-    dataset = list(EquilibriumStream(sample, solve, n_instances=512, quiet=False, transform=transforms))
+    sample = partial(RandomZeroSum.from_gambit, n_actions=3)
+    sample_domain = lambda instance, n: torch.distributions.Dirichlet(torch.ones(instance.n_actions)).sample(
+        (n, instance.n_players)
+    )
+    dataset = list(
+        OperatorStream(
+            sample,
+            sample_domain,
+            n_instances=512,
+            n_points_per_instance=16,
+            quiet=False,
+            transform=transforms,
+        )
+    )
 
     cal_dataset, val_dataset, test_dataset, _ = random_split(dataset, [128, 128, 128, len(dataset) - 3 * 128])
     cal_loader = DataLoader(cal_dataset, batch_size=64, collate_fn=torch.stack)
     val_loader = DataLoader(val_dataset, batch_size=64, collate_fn=torch.stack)
 
-    train_dataset = EquilibriumStream(sample, n_instances=512, quiet=True, transform=transforms)
+    train_dataset = OperatorStream(
+        sample, sample_domain, n_instances=512, n_points_per_instance=16, quiet=True, transform=transforms
+    )
     train_loader = DataLoader(train_dataset, batch_size=64, collate_fn=torch.stack)
 
     feat_scaler = StandardScaler()
@@ -78,7 +89,7 @@ if __name__ == "__main__":
         feat_scaler.partial_fit(batch["payoffs"].reshape(-1, 1))
         # a single column, so the fit yields one global scale: an isotropic rescale of the
         # operator field that preserves its direction
-        # operator_scaler.partial_fit(batch.operator.reshape(-1, 1))
+        operator_scaler.partial_fit(batch["operator"].reshape(-1, 1))
 
     sample = dataset[0]
     dim = 128
@@ -122,10 +133,10 @@ if __name__ == "__main__":
         )
     else:
         backbone = GraphormerBackbone(
-            n_feats=sample.payoffs.size(-1) + sample.point.size(-1),
-            in_degree=sample.in_degree,
-            out_degree=sample.out_degree,
-            spd=sample.spd,
+            n_feats=sample["point"].size(-1) + sample["payoffs"].size(-1),
+            in_degree=sample["in_degree"],
+            out_degree=sample["out_degree"],
+            spd=sample["spd"],
             dim=dim,
             n_heads=8,
             n_layers=6,
@@ -135,7 +146,7 @@ if __name__ == "__main__":
         model = FieldModel(
             backbone,
             dim=dim,
-            n_actions=sample.A.size(-1),
+            n_actions=sample["n_actions"],
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
             target_scale=operator_scaler.scale_,
