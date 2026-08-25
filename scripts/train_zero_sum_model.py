@@ -57,7 +57,7 @@ if __name__ == "__main__":
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
     # dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
-    sample = partial(RandomZeroSum.from_gambit, n_actions=3)
+    sample = partial(RandomZeroSum.sample, n_actions=3)
     sample_domain = lambda instance, n: torch.distributions.Dirichlet(torch.ones(instance.n_actions)).sample(
         (n, instance.n_players)
     )
@@ -73,13 +73,13 @@ if __name__ == "__main__":
     )
 
     cal_dataset, val_dataset, test_dataset, _ = random_split(dataset, [128, 128, 128, len(dataset) - 3 * 128])
-    cal_loader = DataLoader(cal_dataset, batch_size=64, collate_fn=torch.stack)
-    val_loader = DataLoader(val_dataset, batch_size=64, collate_fn=torch.stack)
+    cal_loader = DataLoader(cal_dataset, batch_size=128, collate_fn=torch.stack)
+    val_loader = DataLoader(val_dataset, batch_size=128, collate_fn=torch.stack)
 
     train_dataset = OperatorStream(
         sample, sample_domain, n_instances=512, n_points_per_instance=16, quiet=True, transform=transforms
     )
-    train_loader = DataLoader(train_dataset, batch_size=64, collate_fn=torch.stack)
+    train_loader = DataLoader(train_dataset, batch_size=128, collate_fn=torch.stack)
 
     feat_scaler = StandardScaler()
     operator_scaler = StandardScaler(with_mean=False)

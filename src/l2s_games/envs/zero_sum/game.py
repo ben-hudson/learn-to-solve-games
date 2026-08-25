@@ -38,6 +38,19 @@ class RandomZeroSum:
         return gambit.Game.from_arrays(self.A.numpy(), self.B.numpy())
 
     @classmethod
+    def sample(cls, n_actions=3, payoff_range=(-100.0, 100.0), dtype=torch.float32):
+        """Draw an instance directly in torch, matching what GAMUT's ``RandomZeroSum`` produces.
+
+        With ``normalize: 0`` that generator just draws A uniformly over [-100, 100] and sets
+        B = -A -- no structure worth shelling out for. ``from_gambit`` spawns a JVM per instance
+        (~72 ms), which dominates the training loop when the stream regenerates every epoch; this
+        is the same distribution at microsecond cost.
+        """
+        low, high = payoff_range
+        A = torch.rand(n_actions, n_actions, dtype=dtype) * (high - low) + low
+        return cls(A, -A, 2, n_actions)
+
+    @classmethod
     def from_gambit(cls, n_actions=3, gamut_jar="./gamut.jar", dtype=torch.float32):
         game = gambit.catalog.generate_gamut(
             "RandomZeroSum",

@@ -56,6 +56,26 @@ class AmortizedModel(L.LightningModule):
             scheduler = warmup
         return {"optimizer": optim, "lr_scheduler": {"scheduler": scheduler, "interval": "epoch"}}
 
+    def predict_strategies(self, batch):
+        """The model's strategy profile per instance, ``[B, n_players, n_actions]`` on the simplex.
+
+        The one thing the two amortizations disagree on: ``FieldModel`` rolls its learned field out
+        to a fixed point, ``SolutionModel`` reads a profile straight off the payoffs.
+        """
+        raise NotImplementedError
+
+    def validation_step(self, batch, batch_idx):
+        # stationarity of the predicted profile under the true operator: zero exactly at a Nash
+        # equilibrium, so unlike a distance to the LP solution it is robust to equilibrium
+        # non-uniqueness. A and B are the raw payoffs -- nothing rescales them, in either
+        # subclass -- so this is in ground-truth payoff units, and the two amortizations are
+        # directly comparable on it. Subclasses add their own val/loss on top via super().
+        strategies = self.predict_strategies(batch)
+        op = operator(batch["A"], batch["B"], strategies)
+        residual = dist_to_normal_cone(op, strategies)
+        self.log("val/residual", residual.norm(dim=-1).mean())
+        return strategies
+
 
 class FieldModel(AmortizedModel):
     def __init__(
@@ -68,32 +88,35 @@ class FieldModel(AmortizedModel):
         self.steps = steps
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
 
-    def training_step(self, batch, batch_idx):
-        # fold the sampled points into the batch dimension: every point is an
-        # independent evaluation on the same graph
+    def predict_field(self, batch):
+        """Field prediction and target at every sampled point, both ``[B * P, n_players, n_actions]``.
+
+        Folds the sampled points into the batch dimension: every point is an independent evaluation
+        on the same graph. Reads the batch without mutating it, so the caller can go on to use the
+        per-instance keys (``validation_step`` scores the rollout off the same batch).
+        """
         n_points_per_instance = batch["point"].size(1)
-        # release the batch dims so per-point keys ([B * P, ...]) can coexist with
-        # per-instance keys ([B, ...])
-        batch.batch_size = []
-        batch["point"] = batch["point"].flatten(0, 1)
-        batch["payoffs"] = batch["payoffs"].flatten(0, 1)
-        batch["operator"] = batch["operator"].flatten(0, 1)
-        batch["in_degree"] = batch["in_degree"].repeat_interleave(n_points_per_instance, dim=0)
-        batch["out_degree"] = batch["out_degree"].repeat_interleave(n_points_per_instance, dim=0)
-        batch["spd"] = batch["spd"].repeat_interleave(n_points_per_instance, dim=0)
+        point = batch["point"].flatten(0, 1)
         # normalize: one global mean/scale for the payoffs, one global scale for the
         # operator (isotropic, so its direction is untouched)
-        batch["payoffs"] = self.normalize_feats(batch["payoffs"])
-        batch["operator"] = batch["operator"] / self.target_scale
+        payoffs = self.normalize_feats(batch["payoffs"].flatten(0, 1))
+        target = batch["operator"].flatten(0, 1) / self.target_scale
+        in_degree = batch["in_degree"].repeat_interleave(n_points_per_instance, dim=0)
+        out_degree = batch["out_degree"].repeat_interleave(n_points_per_instance, dim=0)
+        spd = batch["spd"].repeat_interleave(n_points_per_instance, dim=0)
         # feats: the raw point (simplex coordinates need no normalization) alongside
         # the normalized payoffs
-        feats = torch.cat([batch["point"], batch["payoffs"]], dim=-1)
-        prediction = self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
-        loss = self.loss(prediction, batch["operator"])
-        self.log("train/loss", loss)
+        feats = torch.cat([point, payoffs], dim=-1)
+        return self.readout(self.backbone(feats, in_degree, out_degree, spd)), target
+
+    def training_step(self, batch, batch_idx):
+        loss = self.loss(*self.predict_field(batch))
+        # epoch-level, matching SolutionModel and the val metrics: an epoch is only a handful of
+        # steps, so the per-step default is noisy and CSVLogger's 100-step flush would drop it
+        self.log("train/loss", loss, on_step=False, on_epoch=True)
         return loss
 
-    def solve(self, batch):
+    def predict_strategies(self, batch):
         # the learned field stands in for the true operator: one Optimistic rollout per game,
         # from the uniform profile. The rollout follows the normalized field, an isotropic
         # rescale of the true one, so its equilibria are unchanged and the step size is
@@ -114,13 +137,11 @@ class FieldModel(AmortizedModel):
         return strategies
 
     def validation_step(self, batch, batch_idx):
-        # stationarity of the rollout endpoint under the true operator: zero exactly at a Nash
-        # equilibrium, so unlike a distance to the LP solution it is robust to equilibrium
-        # non-uniqueness. target_scale puts it in the same normalized units as train/loss.
-        strategies = self.solve(batch)
-        op = operator(batch["A"], batch["B"], strategies)
-        residual = dist_to_normal_cone(op / self.target_scale, strategies)
-        self.log("val/residual", residual.norm(dim=-1).mean())
+        super().validation_step(batch, batch_idx)
+        # the training objective on held-out points: how well the field itself is fit, as opposed
+        # to val/residual's verdict on where rolling it out lands. Stays in the normalized units
+        # train/loss lives in, so the two curves are comparable.
+        self.log("val/loss", self.loss(*self.predict_field(batch)))
 
 
 class SolutionModel(AmortizedModel):
@@ -137,10 +158,9 @@ class SolutionModel(AmortizedModel):
         self.loss = loss
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
-        # normalize the payoff features fed to the network. A and B, which the loss scores
-        # deviations against, are isotropically rescaled (deviation gains are invariant to
-        # utility shifts and linear in scale, so the minimizers are unchanged): the paper's
-        # utilities live in [0, 1], and raw GAMUT payoffs (~1e2) blow up the softmax gradients
+        # normalize only the payoff features fed to the network. A and B are left at their raw
+        # scale, so everything scored against them -- the loss and the val/residual -- is
+        # reported in ground-truth payoff units, matching FieldModel.validation_step.
         batch["payoffs"] = self.normalize_feats(batch["payoffs"])
         return batch
 
@@ -157,10 +177,6 @@ class SolutionModel(AmortizedModel):
         return loss
 
     def validation_step(self, batch, batch_idx):
-        strategies = self.predict_strategies(batch)
+        # the base step already predicted the profile; reuse it rather than paying a second forward
+        strategies = super().validation_step(batch, batch_idx)
         self.log("val/loss", self.loss(strategies, batch["A"], batch["B"]))
-        # stationarity of the prediction under the operator: zero exactly at a Nash equilibrium,
-        # so unlike a distance to the LP solution it is robust to equilibrium non-uniqueness.
-        op = operator(batch["A"], batch["B"], strategies)
-        residual = dist_to_normal_cone(op, strategies)
-        self.log("val/residual", residual.norm(dim=-1).mean())
