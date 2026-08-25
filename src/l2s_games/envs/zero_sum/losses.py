@@ -1,5 +1,7 @@
 import torch
 
+from l2s_games.envs.zero_sum.game import operator
+
 
 class NormLoss(torch.nn.Module):
     """``||prediction - target||`` over each sample's flattened field, averaged over samples.
@@ -54,3 +56,25 @@ class NashAprLoss(torch.nn.Module):
         gain_1 = pure_payoffs_1.max(dim=-1).values - torch.einsum("bi,bi->b", x, pure_payoffs_1)
         gain_2 = pure_payoffs_2.max(dim=-1).values - torch.einsum("bj,bj->b", y, pure_payoffs_2)
         return torch.maximum(gain_1, gain_2).mean()
+
+
+class PotentialLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+
+    def forward(self, strategies: torch.Tensor, A, B):
+        operator = PotentialGradient.apply(strategies, A, B)
+        return operator.sum(dim=-1).mean()
+
+
+class PotentialGradient(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, strategies, A, B):
+        op = operator(A, B, strategies)
+        ctx.save_for_backward(op)
+        return op.square()
+
+    @staticmethod
+    def backward(ctx, grad_loss: torch.Tensor):
+        (op,) = ctx.saved_tensors
+        return None, op * grad_loss, None

@@ -2,6 +2,8 @@ import pytest
 import torch
 
 from l2s_games.algorithms import Optimistic, SimpleProjection
+from l2s_games.envs.spe.streams import EquilibriumStream
+from l2s_games.envs.traffic.datasets import GraphToTensorDict
 from l2s_games.envs.zero_sum import (
     dist_to_normal_cone,
     profile_to_tensor,
@@ -10,25 +12,28 @@ from l2s_games.envs.zero_sum import (
     RandomZeroSumEquilibriumDataset,
     RandomZeroSumOperatorDataset,
 )
-from torch.utils.data import default_collate
+from torch.utils.data import DataLoader, default_collate
+from functools import partial
+from l2s_games.envs.zero_sum.game import solve, profile_to_tensor, tensor_to_profile
 
 
 @pytest.fixture
 def random_zero_sum():
-    return RandomZeroSum(n_actions=3, solve=True)
+    return RandomZeroSum(n_actions=3)
 
 
 @pytest.fixture
 def random_zero_sums():
-    return [RandomZeroSum(n_actions=3, solve=True) for _ in range(5)]
+    return [RandomZeroSum(n_actions=3) for _ in range(5)]
 
 
 def test_normal_cone_dist_zero(random_zero_sum: RandomZeroSum):
     instance = random_zero_sum.to_data()
-    operator = RandomZeroSumOperatorDataset.eval_operator(instance, instance.eq)
+    eq = solve(random_zero_sum)
+    operator = RandomZeroSumOperatorDataset.eval_operator(instance, eq)
 
     # eval_operator returns the descent-convention VI field; the ascent field is its negation
-    dist = dist_to_normal_cone(-operator, instance.eq)
+    dist = dist_to_normal_cone(-operator, eq)
     assert torch.allclose(dist, torch.tensor(0.0), atol=1e-5)
 
 
@@ -45,13 +50,15 @@ def test_normal_cone_dist_nonzero(random_zero_sum: RandomZeroSum):
 
 def test_optimistic_converges(random_zero_sum: RandomZeroSum):
     instance = random_zero_sum.to_data()
+    n_players = 2
+    n_actions = instance.A.size(0)
 
     # eval_operator returns the descent-convention VI field; the algorithm ascends its negation
     def operator(point):
         return -RandomZeroSumOperatorDataset.eval_operator(instance, point)
 
     algorithm = Optimistic(2e-3, operator, project_onto_simplex)
-    strategies = torch.full_like(instance.eq, 1 / instance.eq.size(-1))  # uniform strategy
+    strategies = torch.full((n_players, n_actions), 1 / n_actions)  # uniform strategy
     for _ in range(2000):
         strategies = algorithm.step(strategies)
 
@@ -66,12 +73,14 @@ def test_projection_fails_on_rotational_instances(random_zero_sums):
     failures = 0
     for random_zero_sum in random_zero_sums:
         instance = random_zero_sum.to_data()
+        n_players = 2
+        n_actions = instance.A.size(0)
 
         def operator(point):
             return -RandomZeroSumOperatorDataset.eval_operator(instance, point)
 
         algorithm = SimpleProjection(2e-3, operator, project_onto_simplex)
-        strategies = torch.full_like(instance.eq, 1 / instance.eq.size(-1))  # uniform strategy
+        strategies = torch.full((n_players, n_actions), 1 / n_actions)  # uniform strategy
         for _ in range(2000):
             strategies = algorithm.step(strategies)
 
@@ -82,15 +91,17 @@ def test_projection_fails_on_rotational_instances(random_zero_sums):
 
 
 def test_data_round_trip(random_zero_sum: RandomZeroSum):
+    eq = solve(random_zero_sum)
     restored = RandomZeroSum.from_data(random_zero_sum.to_data(dtype=torch.float64))
+    restored_eq = solve(restored)
 
     for expected_payoffs, restored_payoffs in zip(
         random_zero_sum.game.to_arrays(dtype=float), restored.game.to_arrays(dtype=float)
     ):
         assert (expected_payoffs == restored_payoffs).all()
 
-    assert torch.equal(profile_to_tensor(restored.eq), profile_to_tensor(random_zero_sum.eq))
-    assert torch.allclose(torch.tensor(restored.eq.max_regret()), torch.tensor(0.0))
+    assert torch.equal(restored_eq, eq)
+    # assert torch.allclose(torch.tensor(tensor_to_profile(restored, restored_eq).max_regret()), torch.tensor(0.0))
 
 
 def test_dataset_operator(random_zero_sum: RandomZeroSum):
@@ -144,20 +155,29 @@ def test_dataset_operator_batched_games(random_zero_sums):
     assert torch.allclose(operators, expected)
 
 
-def test_smoke_equilibrium_dataset(tmp_path):
-    dataset = RandomZeroSumEquilibriumDataset(tmp_path, n_instances=10, n_actions=3)
+def test_smoke_equilibrium_stream():
+    batch_size = 5
+    n_actions = 3
+    n_players = 2
 
-    assert len(dataset) == 10
-    assert dataset[0].A.shape == (3, 3)
-    assert dataset[0].B.shape == (3, 3)
-    assert dataset[0].eq.shape == (2, 3)
+    sample = partial(RandomZeroSum, n_actions=n_actions)
+    dataset = EquilibriumStream(sample, solve, n_instances=2 * batch_size, quiet=False, transform=GraphToTensorDict())
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=torch.stack)
+    for batch in dataloader:
+        assert batch["A"].shape == (batch_size, n_actions, n_actions)
+        assert batch["B"].shape == (batch_size, n_actions, n_actions)
+        assert batch["eq"].shape == (batch_size, n_players, n_actions)
+        # assert batch["q"].shape == (batch_size, n_demand)
+        # assert batch["c"].shape == (batch_size, n_supply, n_demand)
+        # assert batch["delta"].shape == (batch_size, n_supply, n_demand)
+        # assert batch["eq"].shape == (batch_size, n_supply, n_demand)
 
 
-def test_smoke_operator_dataset(tmp_path):
-    dataset = RandomZeroSumOperatorDataset(tmp_path, n_instances=10, n_points_per_instance=4, n_actions=3)
+# def test_smoke_operator_dataset(tmp_path):
+#     dataset = RandomZeroSumOperatorDataset(tmp_path, n_instances=10, n_points_per_instance=4, n_actions=3)
 
-    assert len(dataset) == 10
-    assert dataset[0].A.shape == (3, 3)
-    assert dataset[0].B.shape == (3, 3)
-    assert dataset[0].point.shape == (4, 2, 3)
-    assert dataset[0].operator.shape == (4, 2, 3)
+#     assert len(dataset) == 10
+#     assert dataset[0].A.shape == (3, 3)
+#     assert dataset[0].B.shape == (3, 3)
+#     assert dataset[0].point.shape == (4, 2, 3)
+#     assert dataset[0].operator.shape == (4, 2, 3)

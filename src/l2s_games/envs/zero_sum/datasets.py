@@ -4,7 +4,7 @@ import tqdm
 from torch_geometric.data import InMemoryDataset
 from torch_geometric.transforms import BaseTransform
 
-from .game import RandomZeroSum
+from .game import RandomZeroSum, operator
 
 
 class BuildZeroSumFeats(BaseTransform):
@@ -99,10 +99,7 @@ class RandomZeroSumOperatorDataset(RandomZeroSumEquilibriumDataset):
     def eval_operator(cls, instance, points):
         # batch-agnostic: A/B may be one game's [n, n] (points [P, 2, n]) or a collated
         # batch's [B, n, n] (points [B, 2, n])
-        x, y = points.unbind(dim=-2)
-        F_x = -(instance.A @ y.unsqueeze(-1)).squeeze(-1)
-        F_y = -(instance.B.transpose(-1, -2) @ x.unsqueeze(-1)).squeeze(-1)
-        return torch.stack([F_x, F_y], dim=-2)
+        return operator(instance.A, instance.B, points)
 
     def process(self):
         required_attrs = ["n_points_per_instance"]

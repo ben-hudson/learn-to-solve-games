@@ -2,6 +2,7 @@ import lightning as L
 import torch
 
 from l2s_games.algorithms import Optimistic
+from l2s_games.envs.zero_sum.game import operator
 
 from .datasets import RandomZeroSumOperatorDataset
 from .losses import NashAprLoss, NormLoss
@@ -130,40 +131,36 @@ class SolutionModel(AmortizedModel):
     are needed and equilibrium non-uniqueness is a non-issue.
     """
 
-    def __init__(self, backbone, dim, n_actions, feat_mean, feat_scale, **kwargs):
+    def __init__(self, backbone, dim, n_actions, feat_mean, feat_scale, loss, **kwargs):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
-        self.loss = NashAprLoss()
+        self.loss = loss
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
         # normalize the payoff features fed to the network. A and B, which the loss scores
         # deviations against, are isotropically rescaled (deviation gains are invariant to
         # utility shifts and linear in scale, so the minimizers are unchanged): the paper's
         # utilities live in [0, 1], and raw GAMUT payoffs (~1e2) blow up the softmax gradients
-        return batch._replace(
-            payoffs=self.normalize_feats(batch.payoffs),
-            A=batch.A / self.feat_scale,
-            B=batch.B / self.feat_scale,
-        )
+        batch["payoffs"] = self.normalize_feats(batch["payoffs"])
+        return batch
 
     def predict_strategies(self, batch):
         # one embedding per player node; softmax puts each player's readout on the simplex,
         # so the prediction is a valid mixed-strategy profile
-        embedding = self.backbone(batch.payoffs, batch.in_degree, batch.out_degree, batch.spd)
+        embedding = self.backbone(batch["payoffs"], batch["in_degree"], batch["out_degree"], batch["spd"])
         # return self.readout(embedding).softmax(dim=-1)
         return project_onto_simplex(self.readout(embedding))
 
     def training_step(self, batch, batch_idx):
-        loss = self.loss(self.predict_strategies(batch), batch.A, batch.B)
+        loss = self.loss(self.predict_strategies(batch), batch["A"], batch["B"])
         self.log("train/loss", loss, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx):
         strategies = self.predict_strategies(batch)
-        self.log("val/loss", self.loss(strategies, batch.A, batch.B))
+        self.log("val/loss", self.loss(strategies, batch["A"], batch["B"]))
         # stationarity of the prediction under the operator: zero exactly at a Nash equilibrium,
         # so unlike a distance to the LP solution it is robust to equilibrium non-uniqueness.
-        # A/B are already feat_scale-normalized here, so the residual is in the loss's units.
-        operator = RandomZeroSumOperatorDataset.eval_operator(batch, strategies)
-        residual = dist_to_normal_cone(operator, strategies)
+        op = operator(batch["A"], batch["B"], strategies)
+        residual = dist_to_normal_cone(op, strategies)
         self.log("val/residual", residual.norm(dim=-1).mean())

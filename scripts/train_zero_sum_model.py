@@ -3,7 +3,10 @@ import lightning as L
 import os
 import torch
 import wandb
+import pygambit as gambit
 
+from l2s_games.envs.spe.streams import EquilibriumStream
+from l2s_games.envs.traffic.datasets import GraphToTensorDict
 from l2s_games.envs.zero_sum import (
     BuildZeroSumFeats,
     FieldModel,
@@ -11,6 +14,8 @@ from l2s_games.envs.zero_sum import (
     RandomZeroSumOperatorDataset,
     SolutionModel,
 )
+from l2s_games.envs.zero_sum.game import RandomZeroSum, operator, profile_to_tensor, solve
+from l2s_games.envs.zero_sum.losses import NashAprLoss, PotentialLoss
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
@@ -19,16 +24,17 @@ from lightning.pytorch.loggers import CSVLogger, WandbLogger
 from sklearn.preprocessing import StandardScaler
 from torch_geometric.transforms import Compose
 from torch.utils.data import random_split, DataLoader
+from functools import partial
 
 
 def get_config():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--amortization", type=str, choices=["full", "partial"], default="partial")
     parser.add_argument("--cosine_annealing", type=int, default=0)
-    parser.add_argument("--dataset", type=str, required=True)
+    # parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
-    parser.add_argument("--fully_amortized_loss", type=str, choices=["mse", "ni"], default="mse")
+    parser.add_argument("--fully_amortized_loss", type=str, choices=["potential", "eg", "ni"], default="ni")
     parser.add_argument("--gradient_clip_val", type=float, default=0)
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -50,27 +56,31 @@ if __name__ == "__main__":
     L.seed_everything(config.seed, workers=True)
 
     transforms = Compose(
-        [BuildZeroSumFeats(mode=config.amortization), SPDEmbedding(), DegreeEmbedding(), GraphToTuple()]
+        [BuildZeroSumFeats(mode=config.amortization), SPDEmbedding(), DegreeEmbedding(), GraphToTensorDict()]
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
-    dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
+    # dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
+    sample = partial(RandomZeroSum, n_actions=3)
+    dataset = list(EquilibriumStream(sample, solve, n_instances=512, quiet=False, transform=transforms))
 
-    train_dataset, val_dataset, test_dataset = random_split(dataset, [0.8, 0.1, 0.1])
-    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=64)
+    cal_dataset, val_dataset, test_dataset, _ = random_split(dataset, [128, 128, 128, len(dataset) - 3 * 128])
+    cal_loader = DataLoader(cal_dataset, batch_size=64, collate_fn=torch.stack)
+    val_loader = DataLoader(val_dataset, batch_size=64, collate_fn=torch.stack)
 
-    sample = dataset[0]
+    train_dataset = EquilibriumStream(sample, n_instances=512, quiet=True, transform=transforms)
+    train_loader = DataLoader(train_dataset, batch_size=64, collate_fn=torch.stack)
 
     feat_scaler = StandardScaler()
     operator_scaler = StandardScaler(with_mean=False)
-    for batch in train_loader:
+    for batch in cal_loader:
         # payoff entries are mutually comparable, so they share one global mean/scale
         # (a single column) rather than per-entry stats that would distort the game
-        feat_scaler.partial_fit(batch.payoffs.reshape(-1, 1))
+        feat_scaler.partial_fit(batch["payoffs"].reshape(-1, 1))
         # a single column, so the fit yields one global scale: an isotropic rescale of the
         # operator field that preserves its direction
-        operator_scaler.partial_fit(batch.operator.reshape(-1, 1))
+        # operator_scaler.partial_fit(batch.operator.reshape(-1, 1))
 
+    sample = dataset[0]
     dim = 128
     optimizer_kwargs = dict(
         lr=config.lr,
@@ -79,19 +89,35 @@ if __name__ == "__main__":
         cosine_annealing=bool(config.cosine_annealing),
     )
     if config.amortization == "full":
-        # the paper's NE-approximator MLP: its [0, 1]-projected parameters bound the embedding
-        # scale, so the softmax readout cannot saturate under the vertex-seeking NashApr gradient
-        backbone = NashMLPBackbone(
-            n_feats=sample.payoffs.size(-1),
-            n_players=sample.payoffs.size(0),
-            dim=dim,
-        )
+        if config.fully_amortized_loss == "ni":
+            # the paper's NE-approximator MLP: its [0, 1]-projected parameters bound the embedding
+            # scale, so the softmax readout cannot saturate under the vertex-seeking NashApr gradient
+            backbone = NashMLPBackbone(
+                n_feats=sample["payoffs"].size(-1),
+                n_players=sample["payoffs"].size(0),
+                dim=dim,
+            )
+            loss = NashAprLoss()
+        else:
+            backbone = GraphormerBackbone(
+                n_feats=sample["payoffs"].size(-1),
+                in_degree=sample["in_degree"],
+                out_degree=sample["out_degree"],
+                spd=sample["spd"],
+                dim=dim,
+                n_heads=8,
+                n_layers=6,
+                dim_ff=dim * 2,
+                dropout=0.0,
+            )
+            loss = PotentialLoss()
         model = SolutionModel(
             backbone,
             dim=dim,
-            n_actions=sample.A.size(-1),
+            n_actions=sample["A"].size(-1),
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
+            loss=loss,
             **optimizer_kwargs,
         )
     else:
