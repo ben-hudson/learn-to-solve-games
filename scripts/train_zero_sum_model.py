@@ -13,6 +13,7 @@ from l2s_games.envs.zero_sum import (
 )
 from l2s_games.envs.zero_sum.game import RandomZeroSum
 from l2s_games.envs.zero_sum.losses import NashAprLoss, PotentialLoss
+from l2s_games.envs.zero_sum.utils import simplex_projection, softmax_projection
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
@@ -37,6 +38,16 @@ def get_config():
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--partially_amortized_loss", type=str, choices=["mse", "norm", "huber"], default="norm")
     parser.add_argument("--patience_epochs", type=int, default=40)
+    parser.add_argument(
+        "--projection",
+        type=str,
+        choices=["hard", "soft"],
+        default="hard",
+        help="how the fully amortized model's readout is mapped onto the simplex: 'hard' is the "
+        "exact Euclidean projection, which reaches the boundary and so can output pure strategies; "
+        "'soft' is a softmax, smooth everywhere but confined to the interior. Ignored when "
+        "--amortization=partial (the field rollout always needs the exact projection).",
+    )
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--start_factor", type=float, default=0.01)
     parser.add_argument("--val_every_n_epochs", type=int, default=10)
@@ -129,6 +140,7 @@ if __name__ == "__main__":
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
             loss=loss,
+            projection=simplex_projection if config.projection == "hard" else softmax_projection,
             **optimizer_kwargs,
         )
     else:

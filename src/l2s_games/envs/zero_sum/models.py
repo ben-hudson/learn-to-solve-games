@@ -5,7 +5,7 @@ from l2s_games.algorithms import Optimistic
 from l2s_games.envs.zero_sum.game import operator
 
 from .losses import NashAprLoss, NormHuberLoss, NormLoss
-from .utils import dist_to_normal_cone, project_onto_simplex
+from .utils import dist_to_normal_cone, simplex_projection
 
 
 class AmortizedModel(L.LightningModule):
@@ -128,7 +128,7 @@ class FieldModel(AmortizedModel):
             feats = torch.cat([strategies, payoffs], dim=-1)
             return self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
 
-        algorithm = Optimistic(self.step_size, operator, project_onto_simplex)
+        algorithm = Optimistic(self.step_size, operator, simplex_projection)
         # start from the uniform profile: one [2, n] profile per instance, shaped like a
         # single sampled point
         strategies = torch.full_like(batch["point"][:, 0], 1 / batch["point"].size(-1))
@@ -152,10 +152,15 @@ class SolutionModel(AmortizedModel):
     are needed and equilibrium non-uniqueness is a non-issue.
     """
 
-    def __init__(self, backbone, dim, n_actions, feat_mean, feat_scale, loss, **kwargs):
+    def __init__(self, backbone, dim, n_actions, feat_mean, feat_scale, loss, projection=simplex_projection, **kwargs):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
         self.loss = loss
+        # maps the readout onto the simplex: project_onto_simplex (hard -- exact, reaches the
+        # boundary, so pure strategies are attainable) or softmax_projection (soft -- smooth, but
+        # interior-only). Only the readout is affected; FieldModel's rollout always needs the
+        # exact projection, since Optimistic's convergence assumes a true projection.
+        self.projection = projection
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
         # normalize only the payoff features fed to the network. A and B are left at their raw
@@ -165,11 +170,10 @@ class SolutionModel(AmortizedModel):
         return batch
 
     def predict_strategies(self, batch):
-        # one embedding per player node; softmax puts each player's readout on the simplex,
+        # one embedding per player node; the projection puts each player's readout on the simplex,
         # so the prediction is a valid mixed-strategy profile
         embedding = self.backbone(batch["payoffs"], batch["in_degree"], batch["out_degree"], batch["spd"])
-        # return self.readout(embedding).softmax(dim=-1)
-        return project_onto_simplex(self.readout(embedding))
+        return self.projection(self.readout(embedding))
 
     def training_step(self, batch, batch_idx):
         loss = self.loss(self.predict_strategies(batch), batch["A"], batch["B"])

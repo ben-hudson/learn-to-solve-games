@@ -7,7 +7,7 @@ from l2s_games.envs.traffic.datasets import GraphToTensorDict
 from l2s_games.envs.zero_sum import (
     dist_to_normal_cone,
     profile_to_tensor,
-    project_onto_simplex,
+    simplex_projection,
     RandomZeroSum,
     RandomZeroSumEquilibriumDataset,
     RandomZeroSumOperatorDataset,
@@ -42,7 +42,7 @@ def test_normal_cone_dist_nonzero(random_zero_sum: RandomZeroSum):
 
 
 def test_optimistic_converges(random_zero_sum: RandomZeroSum):
-    algorithm = Optimistic(2e-3, random_zero_sum.operator, project_onto_simplex)
+    algorithm = Optimistic(2e-3, random_zero_sum.operator, simplex_projection)
     strategy = torch.full((random_zero_sum.n_players, random_zero_sum.n_actions), 1 / random_zero_sum.n_actions)
     for _ in range(2000):
         strategy = algorithm.step(strategy)
@@ -57,7 +57,7 @@ def test_projection_fails_on_rotational_instances(random_zero_sums):
     # equilibria, which sit on simplex vertices), while optimistic solves these instances
     failures = 0
     for random_zero_sum in random_zero_sums:
-        algorithm = SimpleProjection(2e-3, random_zero_sum.operator, project_onto_simplex)
+        algorithm = SimpleProjection(2e-3, random_zero_sum.operator, simplex_projection)
         strategy = torch.full((random_zero_sum.n_players, random_zero_sum.n_actions), 1 / random_zero_sum.n_actions)
         for _ in range(2000):
             strategy = algorithm.step(strategy)

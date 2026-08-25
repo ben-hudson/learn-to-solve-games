@@ -1,7 +1,7 @@
 import torch
 
 
-def project_onto_simplex(strategies):
+def simplex_projection(strategies):
     """Exact Euclidean projection of each strategy vector (last dim) onto the probability simplex.
 
     The sort-and-threshold algorithm (Held et al. 1974; Duchi et al. 2008): shift every coordinate
@@ -15,6 +15,17 @@ def project_onto_simplex(strategies):
     support_size = (sorted_strategies * actions > excess).sum(dim=-1, keepdim=True)
     tau = excess.gather(-1, support_size - 1) / support_size
     return (strategies - tau).clamp(min=0)
+
+
+def softmax_projection(strategies):
+    """Soft counterpart to ``project_onto_simplex``: a smooth map onto the simplex's *interior*.
+
+    Not a projection in the Euclidean sense -- it never returns the nearest feasible point, and it
+    cannot put mass exactly on a vertex, so a pure strategy is only ever approached in the limit of
+    diverging logits. In exchange it is smooth everywhere, where the exact projection is piecewise
+    linear and has zero gradient off the active support.
+    """
+    return strategies.softmax(dim=-1)
 
 
 def dist_to_normal_cone(operator, strategies):
