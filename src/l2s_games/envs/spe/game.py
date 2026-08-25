@@ -49,11 +49,12 @@ class SpatialPriceEquilibrium:
         self.q = demand_side_min
         self.delta = route_cost_slope
         self.c = route_cost_min
+        self.eq = None
 
     @classmethod
-    def random_bipartite(cls, n_supply, n_demand, kappa, eps, delta):
-        P = random_psd_plus_skew(1, n_supply, kappa, eps).squeeze(0)
-        Q = random_psd_plus_skew(1, n_demand, kappa, eps).squeeze(0)
+    def random_bipartite(cls, n_supply, n_demand, kappa, eps, delta, scale=1.0):
+        P = random_psd_plus_skew(1, n_supply, kappa, eps, scale=scale).squeeze(0)
+        Q = random_psd_plus_skew(1, n_demand, kappa, eps, scale=scale).squeeze(0)
 
         p = torch.empty(n_supply).uniform_(1.0, 3.0)
         q = torch.empty(n_demand).uniform_(4.0, 8.0)
@@ -86,6 +87,7 @@ class SpatialPriceEquilibrium:
             q=self.q,
             delta=self.delta,
             c=self.c,
+            eq=self.eq,
         )
 
     @classmethod

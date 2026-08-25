@@ -20,6 +20,7 @@ class RandomZeroSum:
             params={"actions": [n_actions, n_actions], "normalize": 0},
             gamut_jar=gamut_jar,
         )
+        self.eq = None
         if solve:
             self.solve()
 

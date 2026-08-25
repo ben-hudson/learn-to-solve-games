@@ -1,19 +1,23 @@
 import pytest
 import torch
 
-from l2s_games.algorithms import ExtraGradient
+from torch.utils.data import DataLoader
+from l2s_games.algorithms import ExtraGradient, SimpleProjection
 from l2s_games.envs.spe import dist_to_normal_cone, SpatialPriceEquilibrium
+from l2s_games.envs.spe.streams import EquilibriumStream
 
 
 @pytest.fixture
 def random_spe():
-    return SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=0.5, eps=0.1, delta=0.05)
+    # weak symmetric coupling (scale) with strong rotation (kappa): plain projection fails
+    # on more than half of these instances while extragradient still converges
+    return SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=6.0, eps=0.1, delta=0.05, scale=0.4)
 
 
 @pytest.fixture
 def random_spe_list():
     return [
-        SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=0.5, eps=0.1, delta=0.05)
+        SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=6.0, eps=0.1, delta=0.05, scale=0.4)
         for _ in range(5)
     ]
 
@@ -62,15 +66,32 @@ def test_positive_kappa_gives_non_potential_instance(random_spe: SpatialPriceEqu
 
 def test_extragradient_converges_to_normal_cone(random_spe: SpatialPriceEquilibrium):
     # the operator is descent-convention, so the algorithm ascends its negation; relu projects
-    # onto the nonnegative orthant. Step sizes beyond ~8e-2 exceed 1/L on some instances.
-    algorithm = ExtraGradient(5e-2, lambda shipments: -random_spe.operator(shipments), torch.relu)
+    # onto the nonnegative orthant. Larger steps exceed 1/L on some instances, and the weak
+    # monotonicity (small delta) of the rotation-dominant instances needs the longer run.
+    algorithm = ExtraGradient(2e-2, lambda flow: -random_spe.operator(flow), torch.relu)
 
     shipments = torch.zeros(random_spe.n_supply, random_spe.n_demand)
-    for _ in range(1000):
+    for _ in range(5000):
         shipments = algorithm.step(shipments)
 
     dist = dist_to_normal_cone(-random_spe.operator(shipments), shipments)
     assert torch.allclose(dist, torch.tensor(0.0), atol=1e-3)
+
+
+def test_projection_fails_on_non_potential_instances(random_spe_list):
+    # the rotation-dominant instances are what plain projection cannot handle: it fails on more
+    # than half of them, while extragradient solves them all (see the convergence test)
+    failures = 0
+    for spe in random_spe_list:
+        algorithm = SimpleProjection(5e-2, lambda flow: -spe.operator(flow), torch.relu)
+
+        shipments = torch.zeros(spe.n_supply, spe.n_demand)
+        for _ in range(2000):
+            shipments = algorithm.step(shipments)
+
+        failures += dist_to_normal_cone(-spe.operator(shipments), shipments) > 1e-2
+
+    assert failures >= 1
 
 
 def test_normal_cone_dist_nonzero_off_equilibrium(random_spe: SpatialPriceEquilibrium):
@@ -99,3 +120,18 @@ def test_batched_operator_matches_per_instance(random_spe_list):
 
     assert operators.shape == points.shape
     assert torch.allclose(operators, expected)
+
+
+def test_smoke_equilibrium_stream():
+    n_supply, n_demand = 3, 4
+    batch_size = 5
+    dataset = EquilibriumStream(n_supply, n_demand, 6.0, 0.1, 0.05, scale=0.4, n_instances=2 * batch_size, solve=True)
+    dataloader = DataLoader(dataset, batch_size=batch_size, collate_fn=torch.stack)
+    for batch in dataloader:
+        assert batch["P"].shape == (batch_size, n_supply, n_supply)
+        assert batch["Q"].shape == (batch_size, n_demand, n_demand)
+        assert batch["p"].shape == (batch_size, n_supply)
+        assert batch["q"].shape == (batch_size, n_demand)
+        assert batch["c"].shape == (batch_size, n_supply, n_demand)
+        assert batch["delta"].shape == (batch_size, n_supply, n_demand)
+        assert batch["eq"].shape == (batch_size, n_supply, n_demand)

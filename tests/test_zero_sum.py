@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from l2s_games.algorithms import Optimistic
+from l2s_games.algorithms import Optimistic, SimpleProjection
 from l2s_games.envs.zero_sum import (
     dist_to_normal_cone,
     profile_to_tensor,
@@ -57,6 +57,28 @@ def test_optimistic_converges(random_zero_sum: RandomZeroSum):
 
     dist = dist_to_normal_cone(operator(strategies), strategies)
     assert torch.allclose(dist, torch.tensor(0.0), atol=1e-3)
+
+
+def test_projection_fails_on_rotational_instances(random_zero_sums):
+    # the zero-sum field is purely rotational, which plain projection cannot handle: it cycles
+    # around mixed equilibria instead of converging (it can still land on pure-strategy
+    # equilibria, which sit on simplex vertices), while optimistic solves these instances
+    failures = 0
+    for random_zero_sum in random_zero_sums:
+        instance = random_zero_sum.to_data()
+
+        def operator(point):
+            return -RandomZeroSumOperatorDataset.eval_operator(instance, point)
+
+        algorithm = SimpleProjection(2e-3, operator, project_onto_simplex)
+        strategies = torch.full_like(instance.eq, 1 / instance.eq.size(-1))  # uniform strategy
+        for _ in range(2000):
+            strategies = algorithm.step(strategies)
+
+        dist = dist_to_normal_cone(operator(strategies), strategies)
+        failures += (dist > 1e-2).any()
+
+    assert failures >= 1
 
 
 def test_data_round_trip(random_zero_sum: RandomZeroSum):
