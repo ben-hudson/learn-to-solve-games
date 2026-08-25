@@ -12,7 +12,7 @@ from l2s_games.envs.zero_sum import (
     SolutionModel,
 )
 from l2s_games.envs.zero_sum.game import RandomZeroSum
-from l2s_games.envs.zero_sum.losses import NashAprLoss, PotentialLoss
+from l2s_games.envs.zero_sum.losses import EGLoss, NashAprLoss, PotentialLoss
 from l2s_games.envs.zero_sum.utils import simplex_projection, softmax_projection
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
@@ -34,6 +34,14 @@ def get_config():
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--fully_amortized_loss", type=str, choices=["potential", "eg", "ni"], default="ni")
     parser.add_argument("--gradient_clip_val", type=float, default=0)
+    parser.add_argument(
+        "--huber_delta",
+        type=float,
+        default=1.0,
+        help="knee of the partially amortized model's NormHuberLoss, in normalized operator units: "
+        "residual norms below it get an MSE-like gradient that anneals as they fit, ones above it "
+        "a bounded gradient of fixed magnitude. Ignored when --amortization=full.",
+    )
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--partially_amortized_loss", type=str, choices=["mse", "norm", "huber"], default="norm")
@@ -52,6 +60,9 @@ def get_config():
     parser.add_argument("--start_factor", type=float, default=0.01)
     parser.add_argument("--val_every_n_epochs", type=int, default=10)
     parser.add_argument("--warmup_epochs", type=int, default=10)
+    parser.add_argument("--n_instances", type=int, default=1024)
+    parser.add_argument("--n_points_per_instance", type=int, default=16)
+    parser.add_argument("--batch_size", type=int, default=128)
 
     config = parser.parse_args()
     if config.seed is None:
@@ -76,21 +87,21 @@ if __name__ == "__main__":
         OperatorStream(
             sample,
             sample_domain,
-            n_instances=512,
-            n_points_per_instance=16,
+            n_instances=config.n_instances,
+            n_points_per_instance=config.n_points_per_instance,
             quiet=False,
             transform=transforms,
         )
     )
 
     cal_dataset, val_dataset, test_dataset, _ = random_split(dataset, [128, 128, 128, len(dataset) - 3 * 128])
-    cal_loader = DataLoader(cal_dataset, batch_size=128, collate_fn=torch.stack)
-    val_loader = DataLoader(val_dataset, batch_size=128, collate_fn=torch.stack)
+    cal_loader = DataLoader(cal_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     train_dataset = OperatorStream(
         sample, sample_domain, n_instances=512, n_points_per_instance=16, quiet=True, transform=transforms
     )
-    train_loader = DataLoader(train_dataset, batch_size=128, collate_fn=torch.stack)
+    train_loader = DataLoader(train_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     feat_scaler = StandardScaler()
     operator_scaler = StandardScaler(with_mean=False)
@@ -132,7 +143,13 @@ if __name__ == "__main__":
                 dim_ff=dim * 2,
                 dropout=0.0,
             )
-            loss = PotentialLoss()
+            if config.fully_amortized_loss == "potential":
+                loss = PotentialLoss()
+            elif config.fully_amortized_loss == "eg":
+                # the lookahead has to match the step the optimizer is about to take, so the loss
+                # reads the live (scheduled) learning rate at every call. ``model`` is bound below
+                # and the closure only runs inside the training loop, by which point it exists.
+                loss = EGLoss(step_size=lambda: model.current_lr)
         model = SolutionModel(
             backbone,
             dim=dim,
@@ -162,6 +179,7 @@ if __name__ == "__main__":
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
             target_scale=operator_scaler.scale_,
+            huber_delta=config.huber_delta,
             **optimizer_kwargs,
         )
     save_dir = os.getenv("SCRATCH", ".")

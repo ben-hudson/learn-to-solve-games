@@ -35,6 +35,17 @@ class AmortizedModel(L.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
 
+    @property
+    def current_lr(self):
+        """The learning rate the optimizer will actually use for the next step.
+
+        ``self.lr`` is only the peak: the warmup/annealing schedule scales it, and the scaled value
+        lives on the optimizer's parameter group. Losses whose own step size has to match the
+        update the optimizer is about to take (``EGLoss``) read it from here. Valid only once the
+        trainer has set the optimizer up, so inside the training/validation steps.
+        """
+        return self.trainer.optimizers[0].param_groups[0]["lr"]
+
     def normalize_feats(self, feats: torch.Tensor):
         return (feats - self.feat_mean) / self.feat_scale
 
@@ -79,11 +90,23 @@ class AmortizedModel(L.LightningModule):
 
 class FieldModel(AmortizedModel):
     def __init__(
-        self, backbone, dim, n_actions, feat_mean, feat_scale, target_scale, step_size=2e-3, steps=2000, **kwargs
+        self,
+        backbone,
+        dim,
+        n_actions,
+        feat_mean,
+        feat_scale,
+        target_scale,
+        step_size=2e-3,
+        steps=2000,
+        huber_delta=1.0,
+        **kwargs,
     ):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
-        self.loss = NormHuberLoss(delta=1.0)
+        # the knee, in normalized operator units: samples inside it get an MSE-like gradient that
+        # anneals as they fit, samples beyond it all push with the same bounded magnitude
+        self.loss = NormHuberLoss(delta=huber_delta)
         self.step_size = step_size
         self.steps = steps
         self.register_buffer("target_scale", torch.as_tensor(target_scale, dtype=torch.float32))
