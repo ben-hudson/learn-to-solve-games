@@ -29,15 +29,14 @@ def random_zero_sums():
 
 def test_normal_cone_dist_zero(random_zero_sum: RandomZeroSum):
     eq = solve(random_zero_sum)
-    # eval_operator returns the descent-convention VI field; the ascent field is its negation
-    dist = dist_to_normal_cone(-random_zero_sum.operator(eq), eq)
+    dist = dist_to_normal_cone(random_zero_sum.operator(eq), eq)
     assert torch.allclose(dist, torch.zeros_like(dist), atol=1e-5)
 
 
 def test_normal_cone_dist_nonzero(random_zero_sum: RandomZeroSum):
     profile = random_zero_sum.to_gambit().random_strategy_profile()
     point = profile_to_tensor(profile)
-    dist = dist_to_normal_cone(-random_zero_sum.operator(point), point)
+    dist = dist_to_normal_cone(random_zero_sum.operator(point), point)
     assert (dist > 0.0).all()
 
 
@@ -84,13 +83,15 @@ def test_operator(random_zero_sum: RandomZeroSum):
     game = random_zero_sum.to_gambit()
     profile = game.random_strategy_profile()
     strategy_values = [[profile.strategy_value(strategy) for strategy in player.strategies] for player in game.players]
-    expected = -torch.tensor(strategy_values, dtype=torch.float32)
+    expected = torch.tensor(strategy_values, dtype=torch.float32)
 
     point = profile_to_tensor(profile)
     operator_values = operator(random_zero_sum.A, random_zero_sum.B, point)
 
     assert operator_values.shape == point.shape
-    assert torch.allclose(operator_values, expected)
+    # float32 matmul vs gambit's float64 strategy values on ±100-scale payoffs: entries near
+    # zero fall under the default atol, so give it the accumulation noise floor
+    assert torch.allclose(operator_values, expected, atol=1e-4)
 
 
 def test_operator_batched_points(random_zero_sum: RandomZeroSum):
@@ -100,13 +101,15 @@ def test_operator_batched_points(random_zero_sum: RandomZeroSum):
         [[profile.strategy_value(strategy) for strategy in player.strategies] for player in game.players]
         for profile in profiles
     ]
-    expected = -torch.tensor(strategy_values, dtype=torch.float32)
+    expected = torch.tensor(strategy_values, dtype=torch.float32)
 
     points = torch.stack([profile_to_tensor(profile) for profile in profiles])
     operator_values = operator(random_zero_sum.A, random_zero_sum.B, points)
 
     assert operator_values.shape == points.shape
-    assert torch.allclose(operator_values, expected)
+    # float32 matmul vs gambit's float64 strategy values on ±100-scale payoffs: entries near
+    # zero fall under the default atol, so give it the accumulation noise floor
+    assert torch.allclose(operator_values, expected, atol=1e-4)
 
 
 def test_operator_batched_games(random_zero_sums):
@@ -116,14 +119,16 @@ def test_operator_batched_games(random_zero_sums):
         [[profile.strategy_value(strategy) for strategy in player.strategies] for player in game.players]
         for game, profile in zip(games, profiles)
     ]
-    expected = -torch.tensor(strategy_values, dtype=torch.float32)
+    expected = torch.tensor(strategy_values, dtype=torch.float32)
 
     batch = torch.stack(random_zero_sums)
     points = torch.stack([profile_to_tensor(profile) for profile in profiles])
     operator_values = operator(batch.A, batch.B, points)
 
     assert operator_values.shape == points.shape
-    assert torch.allclose(operator_values, expected)
+    # float32 matmul vs gambit's float64 strategy values on ±100-scale payoffs: entries near
+    # zero fall under the default atol, so give it the accumulation noise floor
+    assert torch.allclose(operator_values, expected, atol=1e-4)
 
 
 def test_smoke_equilibrium_stream():

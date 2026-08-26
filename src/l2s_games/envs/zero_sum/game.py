@@ -21,9 +21,14 @@ def solve(instance, dtype=torch.float32):
 
 
 def operator(A, B, strategies):
+    """Each player's payoff gradient (``Ay``, ``B^T x``): the ascent field. The projected ascent
+    dynamics ``z <- project(z + h operator(z))`` are stationary exactly at the equilibria
+    ``solve`` finds, which is the sign convention everything downstream assumes
+    (``algorithms``, ``dist_to_normal_cone``, the losses).
+    """
     x, y = strategies.unbind(dim=-2)
-    F_x = -(A @ y.unsqueeze(-1)).squeeze(-1)
-    F_y = -(B.transpose(-1, -2) @ x.unsqueeze(-1)).squeeze(-1)
+    F_x = (A @ y.unsqueeze(-1)).squeeze(-1)
+    F_y = (B.transpose(-1, -2) @ x.unsqueeze(-1)).squeeze(-1)
     return torch.stack([F_x, F_y], dim=-2)
 
 
