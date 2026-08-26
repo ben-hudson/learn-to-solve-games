@@ -13,7 +13,7 @@ from l2s_games.envs.zero_sum import (
 )
 from l2s_games.envs.zero_sum.game import RandomZeroSum
 from l2s_games.envs.zero_sum.losses import EGLoss, NashAprLoss, PotentialLoss
-from l2s_games.envs.zero_sum.utils import simplex_projection, softmax_projection
+from l2s_games.envs.zero_sum.utils import simplex_projection, softmax_projection, straight_through_projection
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
@@ -31,6 +31,14 @@ def get_config():
     parser.add_argument("--cosine_annealing", type=int, default=0)
     # parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument(
+        "--eg_step_size",
+        type=float,
+        default=2e-3,
+        help="fixed lookahead distance of EGLoss, in raw payoff units (the same units the rollout "
+        "algorithms step in). Ignored unless --amortization=full and --fully_amortized_loss=eg.",
+    )
+    parser.add_argument("--eg_projection", type=int, default=1, help="Apply projection in EGLoss forward.")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--fully_amortized_loss", type=str, choices=["potential", "eg", "ni"], default="ni")
     parser.add_argument("--gradient_clip_val", type=float, default=0)
@@ -44,16 +52,27 @@ def get_config():
     )
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--normalize_logits",
+        type=int,
+        default=0,
+        help="apply a non-affine LayerNorm to the fully amortized model's readout logits before "
+        "the simplex projection: pins the logit scale so vertex-seeking loss gradients cannot "
+        "saturate the softmax backward. Caps softmax at ~0.8 mass per action, so pair with "
+        "--projection=sparsemax or ste. Ignored when --amortization=partial.",
+    )
     parser.add_argument("--partially_amortized_loss", type=str, choices=["mse", "norm", "huber"], default="norm")
     parser.add_argument("--patience_epochs", type=int, default=40)
     parser.add_argument(
         "--projection",
         type=str,
-        choices=["hard", "soft"],
-        default="hard",
-        help="how the fully amortized model's readout is mapped onto the simplex: 'hard' is the "
-        "exact Euclidean projection, which reaches the boundary and so can output pure strategies; "
-        "'soft' is a softmax, smooth everywhere but confined to the interior. Ignored when "
+        choices=["softmax", "sparsemax", "ste"],
+        default="sparsemax",
+        help="how the fully amortized model's readout is mapped onto the simplex: 'sparsemax' is "
+        "the exact Euclidean projection, which reaches the boundary and so can output pure "
+        "strategies, but passes no gradient off the active support; 'softmax' is smooth everywhere "
+        "but confined to the interior; 'ste' is a straight-through estimator combining the two -- "
+        "the exact projection's value with the softmax's gradient. Ignored when "
         "--amortization=partial (the field rollout always needs the exact projection).",
     )
     parser.add_argument("--seed", type=int, default=None)
@@ -63,6 +82,7 @@ def get_config():
     parser.add_argument("--n_instances", type=int, default=1024)
     parser.add_argument("--n_points_per_instance", type=int, default=16)
     parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--n_actions", type=int, default=3)
 
     config = parser.parse_args()
     if config.seed is None:
@@ -79,7 +99,7 @@ if __name__ == "__main__":
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
     # dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
-    sample = partial(RandomZeroSum.sample, n_actions=3)
+    sample = partial(RandomZeroSum.sample, n_actions=config.n_actions)
     sample_domain = lambda instance, n: torch.distributions.Dirichlet(torch.ones(instance.n_actions)).sample(
         (n, instance.n_players)
     )
@@ -146,10 +166,7 @@ if __name__ == "__main__":
             if config.fully_amortized_loss == "potential":
                 loss = PotentialLoss()
             elif config.fully_amortized_loss == "eg":
-                # the lookahead has to match the step the optimizer is about to take, so the loss
-                # reads the live (scheduled) learning rate at every call. ``model`` is bound below
-                # and the closure only runs inside the training loop, by which point it exists.
-                loss = EGLoss(step_size=lambda: model.current_lr)
+                loss = EGLoss(step_size=config.eg_step_size, project=bool(config.eg_projection))
         model = SolutionModel(
             backbone,
             dim=dim,
@@ -157,7 +174,12 @@ if __name__ == "__main__":
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
             loss=loss,
-            projection=simplex_projection if config.projection == "hard" else softmax_projection,
+            projection={
+                "softmax": softmax_projection,
+                "sparsemax": simplex_projection,
+                "ste": straight_through_projection,
+            }[config.projection],
+            normalize_logits=bool(config.normalize_logits),
             **optimizer_kwargs,
         )
     else:

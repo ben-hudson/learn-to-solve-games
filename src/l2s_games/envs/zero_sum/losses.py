@@ -88,32 +88,29 @@ class PotentialGradient(torch.autograd.Function):
 
 class EGLoss(torch.nn.Module):
     """Extragradient surrogate: reports the squared operator norm at the *lookahead* point, and
-    hands back a gradient that makes one optimizer step reproduce one extragradient update.
+    hands back the field there as the descent direction, Korpelevich-style.
 
     The backward substitutes the field itself for the true Jacobian-vector product, which turns
-    ``z <- z - lr * dL/dz`` into Korpelevich's ``z <- z + lr * op(z_half)``
-    (``algorithms.ExtraGradient``), pushed back through the network. The forward value is only
-    what that surrogate is reported as: like ``PotentialLoss`` it is the squared field norm, which
-    a zero-sum game does *not* drive to zero (at an interior equilibrium the field is a nonzero
+    ``z <- z - lr * dL/dz`` into ``z <- z + lr * op(z_half)`` (``algorithms.ExtraGradient``),
+    pushed back through the network. ``step_size`` is the fixed lookahead distance ``h`` in
+    ``z_half = project(z + h * op(z))``; it is independent of the optimizer's learning rate, which
+    only scales how far the update follows the lookahead field. The forward value is only what
+    that surrogate is reported as: like ``PotentialLoss`` it is the squared field norm, which a
+    zero-sum game does *not* drive to zero (at an interior equilibrium the field is a nonzero
     constant vector, normal to the simplex), so it is not monotone over training and
     ``val/residual`` is the metric to read.
-
-    That equivalence only holds while the lookahead ``h`` matches the step the optimizer is about
-    to take, so ``step_size`` accepts a zero-argument callable as well as a float: pass
-    ``lambda: model.current_lr`` to track the live learning rate through warmup and annealing.
 
     ``project`` controls whether the lookahead point is projected back onto the simplex, as the
     textbook constrained form does; turning it off queries the field off the feasible set.
     """
 
-    def __init__(self, step_size, project: bool = True):
+    def __init__(self, step_size: float, project: bool = True):
         super().__init__()
         self.step_size = step_size
         self.project = project
 
     def forward(self, strategies: torch.Tensor, A, B):
-        step_size = self.step_size() if callable(self.step_size) else self.step_size
-        operator = EGGradient.apply(strategies, A, B, step_size, self.project)
+        operator = EGGradient.apply(strategies, A, B, self.step_size, self.project)
         return operator.sum(dim=-1).mean()
 
 

@@ -28,6 +28,18 @@ def softmax_projection(strategies):
     return strategies.softmax(dim=-1)
 
 
+def straight_through_projection(strategies):
+    """Exact projection forward, softmax gradients backward: a straight-through estimator.
+
+    The value is ``simplex_projection``'s -- boundary reachable, identical in training and eval --
+    while the backward pass routes through ``softmax_projection``, so every coordinate gets a
+    gradient where the exact projection's is zero off the active support. The price is bias: the
+    gradient is the softmax's at the same logits, not the projection's.
+    """
+    soft = softmax_projection(strategies)
+    return soft + (simplex_projection(strategies) - soft).detach()
+
+
 def dist_to_normal_cone(operator, strategies):
     """Euclidean distance from ``operator`` to the normal cone of the probability simplex at
     ``strategies`` (actions on the last dim): the VI stationarity residual, zero exactly where

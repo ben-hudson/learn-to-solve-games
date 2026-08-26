@@ -35,17 +35,6 @@ class AmortizedModel(L.LightningModule):
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
 
-    @property
-    def current_lr(self):
-        """The learning rate the optimizer will actually use for the next step.
-
-        ``self.lr`` is only the peak: the warmup/annealing schedule scales it, and the scaled value
-        lives on the optimizer's parameter group. Losses whose own step size has to match the
-        update the optimizer is about to take (``EGLoss``) read it from here. Valid only once the
-        trainer has set the optimizer up, so inside the training/validation steps.
-        """
-        return self.trainer.optimizers[0].param_groups[0]["lr"]
-
     def normalize_feats(self, feats: torch.Tensor):
         return (feats - self.feat_mean) / self.feat_scale
 
@@ -175,14 +164,37 @@ class SolutionModel(AmortizedModel):
     are needed and equilibrium non-uniqueness is a non-issue.
     """
 
-    def __init__(self, backbone, dim, n_actions, feat_mean, feat_scale, loss, projection=simplex_projection, **kwargs):
+    def __init__(
+        self,
+        backbone,
+        dim,
+        n_actions,
+        feat_mean,
+        feat_scale,
+        loss,
+        projection=simplex_projection,
+        normalize_logits=False,
+        **kwargs,
+    ):
         super().__init__(backbone, dim, n_actions, feat_mean, feat_scale, **kwargs)
 
         self.loss = loss
-        # maps the readout onto the simplex: project_onto_simplex (hard -- exact, reaches the
-        # boundary, so pure strategies are attainable) or softmax_projection (soft -- smooth, but
-        # interior-only). Only the readout is affected; FieldModel's rollout always needs the
-        # exact projection, since Optimistic's convergence assumes a true projection.
+        # LayerNorm over the actions pins the logit scale, ending the norm race that saturates the
+        # softmax under vertex-seeking loss gradients: the LN Jacobian is orthogonal to its input,
+        # so the gradient component that grows the logits is discarded and only direction changes
+        # pass. No learnable affine -- a trainable gain would restart the race one parameter
+        # deeper. The pinned scale still reaches vertices through sparsemax (the top-1 logit gap
+        # can exceed sparsemax's support threshold of 1) but caps softmax at ~0.8 mass on an
+        # action, so pair it with the sparsemax or ste projections.
+        self.logit_norm = (
+            torch.nn.LayerNorm(n_actions, elementwise_affine=False) if normalize_logits else torch.nn.Identity()
+        )
+        # maps the readout onto the simplex: simplex_projection (sparsemax -- exact, reaches the
+        # boundary, but zero gradient off the active support), softmax_projection (smooth
+        # everywhere, but interior-only), or straight_through_projection (the exact projection's
+        # value with the softmax's gradient). Only the readout is affected; FieldModel's rollout
+        # always needs the exact projection, since Optimistic's convergence assumes a true
+        # projection.
         self.projection = projection
 
     def on_after_batch_transfer(self, batch, dataloader_idx):
@@ -196,7 +208,7 @@ class SolutionModel(AmortizedModel):
         # one embedding per player node; the projection puts each player's readout on the simplex,
         # so the prediction is a valid mixed-strategy profile
         embedding = self.backbone(batch["payoffs"], batch["in_degree"], batch["out_degree"], batch["spd"])
-        return self.projection(self.readout(embedding))
+        return self.projection(self.logit_norm(self.readout(embedding)))
 
     def training_step(self, batch, batch_idx):
         loss = self.loss(self.predict_strategies(batch), batch["A"], batch["B"])
