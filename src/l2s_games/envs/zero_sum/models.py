@@ -16,6 +16,7 @@ class AmortizedModel(L.LightningModule):
         n_actions,
         feat_mean,
         feat_scale,
+        readout=None,
         lr=1e-3,
         start_factor=0.01,
         warmup_epochs=10,
@@ -25,7 +26,10 @@ class AmortizedModel(L.LightningModule):
         super().__init__(**kwargs)
 
         self.backbone = backbone
-        self.readout = torch.nn.Linear(dim, n_actions)
+        # the readout has to match what the backbone embeds: a graph backbone gives one embedding
+        # per player, off which every action's logit is read at once, while an action-token backbone
+        # gives one per action and wants an `ActionReadout` scoring them one at a time
+        self.readout = torch.nn.Linear(dim, n_actions) if readout is None else readout
         # fitted normalization stats as buffers: they move to the model's device with the
         # module and serialize into checkpoints
         self.register_buffer("feat_mean", torch.as_tensor(feat_mean, dtype=torch.float32))

@@ -7,6 +7,8 @@ import wandb
 from l2s_games.envs.spe.streams import OperatorStream
 from l2s_games.envs.traffic.datasets import GraphToTensorDict
 from l2s_games.envs.zero_sum import (
+    ActionReadout,
+    ActionTokenBackbone,
     BuildZeroSumFeats,
     FieldModel,
     SolutionModel,
@@ -14,8 +16,12 @@ from l2s_games.envs.zero_sum import (
 from l2s_games.envs.zero_sum.game import RandomZeroSum
 from l2s_games.envs.zero_sum.losses import EGLoss, NashAprLoss, PotentialLoss
 from l2s_games.envs.zero_sum.utils import simplex_projection, softmax_projection, straight_through_projection
+from l2s_games.models.axial import AxialBackbone
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
+from l2s_games.models.nfg_transformer import NfgTransformerBackbone
+from l2s_games.models.payoff_bias import PayoffBiasBackbone
+from l2s_games.models.zero_sum_transformer import ZeroSumTransformerBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 from lightning.pytorch.loggers import CSVLogger, WandbLogger
@@ -28,15 +34,41 @@ from functools import partial
 def get_config():
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument("--amortization", type=str, choices=["full", "partial"], default="partial")
+    parser.add_argument(
+        "--backbone",
+        type=str,
+        choices=["graphormer", "nash_mlp", "payoff_bias", "axial", "zero_sum_transformer", "nfg_transformer"],
+        default="graphormer",
+        help="what embeds the game. 'graphormer' and 'nash_mlp' read the payoff matrix as one flat "
+        "vector per player, so the action count is baked into their input and readout widths and "
+        "the action-relabelling symmetry has to be learned from data. The other four tokenize by "
+        "action and are equivariant to that relabelling by construction, at a cost that rises in "
+        "that order: 'payoff_bias' keeps P*T tokens and lets the payoffs in only as an attention "
+        "bias, 'axial' carries them in T**2 joint-action tokens, and the two NfgTransformers rebuild "
+        "the joint-action grid every layer -- 'zero_sum_transformer' over one shared grid, "
+        "'nfg_transformer' over the reference's per-player grid, whose second copy holds nothing but "
+        "the negation of the first once the game is zero-sum.",
+    )
     parser.add_argument("--cosine_annealing", type=int, default=0)
     # parser.add_argument("--dataset", type=str, required=True)
     parser.add_argument("--debug", action="store_true")
+    parser.add_argument("--dim", type=int, default=128, help="hidden dimension of the backbone.")
+    parser.add_argument(
+        "--dim_ff_mult",
+        type=int,
+        default=2,
+        help="feed-forward dimension of each attention layer, as a multiple of --dim. Ignored when "
+        "--backbone=nash_mlp.",
+    )
     parser.add_argument(
         "--eg_step_size",
         type=float,
-        default=2e-3,
+        default=0.1,
         help="fixed lookahead distance of EGLoss, in raw payoff units (the same units the rollout "
-        "algorithms step in). Ignored unless --amortization=full and --fully_amortized_loss=eg.",
+        "algorithms step in). RandomZeroSum.sample now normalizes each instance to unit variance, "
+        "which shrank the field by the ~57.7 standard deviation of the old [-100, 100] draw, so "
+        "this is the rescaled counterpart of the 2e-3 that was tuned against unnormalized payoffs. "
+        "Ignored unless --amortization=full and --fully_amortized_loss=eg.",
     )
     parser.add_argument("--eg_projection", type=int, default=1, help="Apply projection in EGLoss forward.")
     parser.add_argument("--epochs", type=int, default=100)
@@ -52,6 +84,15 @@ def get_config():
     )
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--n_heads", type=int, default=8, help="attention heads in each attention layer.")
+    parser.add_argument("--n_layers", type=int, default=6, help="layers in the backbone.")
+    parser.add_argument(
+        "--n_self_attend_per_block",
+        type=int,
+        default=1,
+        help="action-to-action self-attention layers in each NfgTransformer block (the paper's A). "
+        "Ignored unless --backbone is nfg_transformer or zero_sum_transformer.",
+    )
     parser.add_argument(
         "--normalize_logits",
         type=int,
@@ -67,7 +108,7 @@ def get_config():
         "--projection",
         type=str,
         choices=["softmax", "sparsemax", "ste"],
-        default="sparsemax",
+        default="ste",
         help="how the fully amortized model's readout is mapped onto the simplex: 'sparsemax' is "
         "the exact Euclidean projection, which reaches the boundary and so can output pure "
         "strategies, but passes no gradient off the active support; 'softmax' is smooth everywhere "
@@ -90,6 +131,57 @@ def get_config():
     return config
 
 
+def build_backbone(config, sample):
+    """The backbone named by --backbone, and the readout that matches what it embeds.
+
+    A graph backbone embeds each player from the flat feature vector ``BuildZeroSumFeats`` builds and
+    reads every action's logit off that single embedding, which fixes the action count in the
+    readout's output width. An action-token backbone embeds each action and scores them one at a
+    time, so nothing in the model is sized by the action count.
+    """
+    dim = config.dim
+    n_players, n_actions = int(sample["n_players"]), int(sample["n_actions"])
+    # the partially amortized models prepend the query point to the payoffs
+    n_feats = n_actions**2 + (n_actions if config.amortization == "partial" else 0)
+
+    if config.backbone == "nash_mlp":
+        # the paper's NE-approximator MLP: its [0, 1]-projected parameters bound the embedding
+        # scale, so the softmax readout cannot saturate under the vertex-seeking NashApr gradient
+        backbone = NashMLPBackbone(n_feats=n_feats, n_players=n_players, dim=dim)
+        return backbone, torch.nn.Linear(dim, n_actions)
+
+    transformer_kwargs = dict(
+        dim=dim,
+        n_heads=config.n_heads,
+        n_layers=config.n_layers,
+        dim_ff=dim * config.dim_ff_mult,
+        dropout=0.0,
+    )
+    if config.backbone == "graphormer":
+        backbone = GraphormerBackbone(
+            n_feats=n_feats,
+            in_degree=sample["in_degree"],
+            out_degree=sample["out_degree"],
+            spd=sample["spd"],
+            **transformer_kwargs,
+        )
+        return backbone, torch.nn.Linear(dim, n_actions)
+
+    # one token per action, with the query point -- one coordinate per action -- as a token feature
+    action_token_backbones = {
+        "payoff_bias": partial(PayoffBiasBackbone, n_players=n_players),
+        "axial": partial(AxialBackbone, n_players=n_players),
+        "zero_sum_transformer": partial(
+            ZeroSumTransformerBackbone, n_self_attend_per_block=config.n_self_attend_per_block
+        ),
+        "nfg_transformer": partial(NfgTransformerBackbone, n_self_attend_per_block=config.n_self_attend_per_block),
+    }
+    backbone = action_token_backbones[config.backbone](
+        n_feats=1 if config.amortization == "partial" else 0, **transformer_kwargs
+    )
+    return ActionTokenBackbone(backbone, n_actions), ActionReadout(dim)
+
+
 if __name__ == "__main__":
     config = get_config()
     L.seed_everything(config.seed, workers=True)
@@ -99,7 +191,7 @@ if __name__ == "__main__":
     )
     # the operator dataset contains the equilibrium solutions too, so it works for the fully amortized model
     # dataset = RandomZeroSumOperatorDataset(config.dataset, n_points_per_instance=256, transform=transforms)
-    sample = partial(RandomZeroSum.sample, n_actions=config.n_actions)
+    sample = partial(RandomZeroSum.sample_normalized, n_actions=config.n_actions)
     sample_domain = lambda instance, n: torch.distributions.Dirichlet(torch.ones(instance.n_actions)).sample(
         (n, instance.n_players)
     )
@@ -134,45 +226,27 @@ if __name__ == "__main__":
         operator_scaler.partial_fit(batch["operator"].reshape(-1, 1))
 
     sample = dataset[0]
-    dim = 128
+    dim = config.dim
     optimizer_kwargs = dict(
         lr=config.lr,
         start_factor=config.start_factor,
         warmup_epochs=config.warmup_epochs,
         cosine_annealing=bool(config.cosine_annealing),
     )
+    backbone, readout = build_backbone(config, sample)
     if config.amortization == "full":
-        if config.fully_amortized_loss == "ni":
-            # the paper's NE-approximator MLP: its [0, 1]-projected parameters bound the embedding
-            # scale, so the softmax readout cannot saturate under the vertex-seeking NashApr gradient
-            backbone = NashMLPBackbone(
-                n_feats=sample["payoffs"].size(-1),
-                n_players=sample["payoffs"].size(0),
-                dim=dim,
-            )
-            loss = NashAprLoss()
-        else:
-            backbone = GraphormerBackbone(
-                n_feats=sample["payoffs"].size(-1),
-                in_degree=sample["in_degree"],
-                out_degree=sample["out_degree"],
-                spd=sample["spd"],
-                dim=dim,
-                n_heads=8,
-                n_layers=6,
-                dim_ff=dim * 2,
-                dropout=0.0,
-            )
-            if config.fully_amortized_loss == "potential":
-                loss = PotentialLoss()
-            elif config.fully_amortized_loss == "eg":
-                loss = EGLoss(step_size=config.eg_step_size, project=bool(config.eg_projection))
+        loss = {
+            "ni": NashAprLoss,
+            "potential": PotentialLoss,
+            "eg": partial(EGLoss, step_size=config.eg_step_size, project=bool(config.eg_projection)),
+        }[config.fully_amortized_loss]()
         model = SolutionModel(
             backbone,
             dim=dim,
             n_actions=sample["A"].size(-1),
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
+            readout=readout,
             loss=loss,
             projection={
                 "softmax": softmax_projection,
@@ -183,23 +257,13 @@ if __name__ == "__main__":
             **optimizer_kwargs,
         )
     else:
-        backbone = GraphormerBackbone(
-            n_feats=sample["point"].size(-1) + sample["payoffs"].size(-1),
-            in_degree=sample["in_degree"],
-            out_degree=sample["out_degree"],
-            spd=sample["spd"],
-            dim=dim,
-            n_heads=8,
-            n_layers=6,
-            dim_ff=dim * 2,
-            dropout=0.0,
-        )
         model = FieldModel(
             backbone,
             dim=dim,
             n_actions=sample["n_actions"],
             feat_mean=feat_scaler.mean_,
             feat_scale=feat_scaler.scale_,
+            readout=readout,
             target_scale=operator_scaler.scale_,
             huber_delta=config.huber_delta,
             **optimizer_kwargs,
