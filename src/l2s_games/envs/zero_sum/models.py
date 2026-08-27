@@ -30,6 +30,10 @@ class AmortizedModel(L.LightningModule):
         # module and serialize into checkpoints
         self.register_buffer("feat_mean", torch.as_tensor(feat_mean, dtype=torch.float32))
         self.register_buffer("feat_scale", torch.as_tensor(feat_scale, dtype=torch.float32))
+        # scored at validation for every model, whether or not it is the training objective:
+        # nfg_transformer's NE objective (its `equilibria.nash_approx`) is this same quantity, so
+        # logging it always makes our runs comparable to theirs and to each other
+        self.nash_apr = NashAprLoss()
         self.lr = lr
         self.start_factor = start_factor
         self.warmup_epochs = warmup_epochs
@@ -74,6 +78,10 @@ class AmortizedModel(L.LightningModule):
         op = operator(batch["A"], batch["B"], strategies)
         residual = dist_to_normal_cone(op, strategies)
         self.log("val/residual", residual.norm(dim=-1).mean())
+        # the deviation gain of the predicted profile: also zero exactly at a Nash equilibrium, but
+        # in payoff units rather than the residual's operator-distance units, and the metric
+        # nfg_transformer reports. Redundant with val/loss only when NashAprLoss is the objective.
+        self.log("val/nash_apr", self.nash_apr(strategies, batch["A"], batch["B"]))
         return strategies
 
 
