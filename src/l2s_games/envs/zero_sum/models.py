@@ -128,19 +128,28 @@ class FieldModel(AmortizedModel):
         self.log("train/loss", loss, on_step=False, on_epoch=True)
         return loss
 
+    def predict_operator(self, batch):
+        """The learned operator as a callable on one profile per instance, ``[B, n_players, n_actions]``.
+
+        The field is trained against ``operator / target_scale``, so what it returns is in the
+        normalized units, an isotropic rescale of the true operator: equilibria are unchanged, but
+        magnitudes are not comparable to anything scored against the raw payoffs.
+        """
+        # every sampled point shares the instance's payoffs, so one copy per game suffices
+        payoffs = self.normalize_feats(batch["payoffs"][:, 0])
+
+        def field(strategies):
+            feats = torch.cat([strategies, payoffs], dim=-1)
+            return self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
+
+        return field
+
     def predict_strategies(self, batch):
         # the learned field stands in for the true operator: one Optimistic rollout per game,
         # from the uniform profile. The rollout follows the normalized field, an isotropic
         # rescale of the true one, so its equilibria are unchanged and the step size is
         # scale-free.
-        # every sampled point shares the instance's payoffs, so one copy per game suffices
-        payoffs = self.normalize_feats(batch["payoffs"][:, 0])
-
-        def operator(strategies):
-            feats = torch.cat([strategies, payoffs], dim=-1)
-            return self.readout(self.backbone(feats, batch["in_degree"], batch["out_degree"], batch["spd"]))
-
-        algorithm = Optimistic(self.step_size, operator, simplex_projection)
+        algorithm = Optimistic(self.step_size, self.predict_operator(batch), simplex_projection)
         # start from the uniform profile: one [2, n] profile per instance, shaped like a
         # single sampled point
         strategies = torch.full_like(batch["point"][:, 0], 1 / batch["point"].size(-1))
@@ -149,11 +158,23 @@ class FieldModel(AmortizedModel):
         return strategies
 
     def validation_step(self, batch, batch_idx):
-        super().validation_step(batch, batch_idx)
+        # the base step already rolled the field out; score that profile again rather than paying a
+        # second rollout
+        strategies = super().validation_step(batch, batch_idx)
         # the training objective on held-out points: how well the field itself is fit, as opposed
         # to val/residual's verdict on where rolling it out lands. Stays in the normalized units
         # train/loss lives in, so the two curves are comparable.
         self.log("val/loss", self.loss(*self.predict_field(batch)))
+        # the same stationarity measure as val/residual, but under the learned field the rollout
+        # actually follows instead of the true operator, which separates the two ways the prediction
+        # can be off: it goes to zero once the rollout reaches a fixed point of its own field,
+        # however wrong that field is. A large val/residual next to a small
+        # val/rollout_convergence is field error; a large val/rollout_convergence is a rollout that
+        # has not converged (too few steps, too small a step size, or a field whose fixed point the
+        # dynamics do not reach). Normalized field units, like val/loss -- not comparable to
+        # val/residual.
+        residual = dist_to_normal_cone(self.predict_operator(batch)(strategies), strategies)
+        self.log("val/rollout_convergence", residual.norm(dim=-1).mean(), prog_bar=True)
 
 
 class SolutionModel(AmortizedModel):

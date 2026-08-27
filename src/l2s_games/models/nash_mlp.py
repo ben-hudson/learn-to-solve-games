@@ -19,11 +19,12 @@ class NashMLPBackbone(torch.nn.Module):
         n_feats: per-player feature width (the flattened payoff matrix).
         n_players: number of player nodes; input and output are joint over all of them.
         dim: per-player embedding dimension handed to the wrapping model's readout.
-        hidden_dim: hidden-layer width (1024 in the paper).
-        n_layers: number of hidden layers (4 in the paper).
+        hidden_dim: hidden-layer width (512 in the paper).
+        n_layers: number of hidden layers; the paper's "5-layer fully connected network" counts
+            weight layers, so 4 hidden blocks plus the output ``Linear`` is its depth.
     """
 
-    def __init__(self, n_feats, n_players, dim, hidden_dim=1024, n_layers=4):
+    def __init__(self, n_feats, n_players, dim, hidden_dim=512, n_layers=4):
         super().__init__()
 
         self.n_players = n_players
