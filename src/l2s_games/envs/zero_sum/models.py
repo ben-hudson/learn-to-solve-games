@@ -174,6 +174,12 @@ class SolutionModel(AmortizedModel):
     Trained self-supervised on the Nash approximation loss (Duan et al. 2023, Algorithm 1): the
     predicted profile is scored by how much any player gains by deviating, so no solver labels
     are needed and equilibrium non-uniqueness is a non-issue.
+
+    Unlike ``FieldModel``, the payoffs reach the network at their raw scale: ``sample_normalized``
+    already centers each instance and puts it at unit variance, so the fitted ``feat_mean`` /
+    ``feat_scale`` would only add a second, global affine on top -- one the network sees but the
+    loss and ``val/residual``, both scored on raw A and B, do not. nfg_transformer's NE objective
+    reads and scores the same payoffs, and now so does this.
     """
 
     def __init__(
@@ -208,13 +214,6 @@ class SolutionModel(AmortizedModel):
         # always needs the exact projection, since Optimistic's convergence assumes a true
         # projection.
         self.projection = projection
-
-    def on_after_batch_transfer(self, batch, dataloader_idx):
-        # normalize only the payoff features fed to the network. A and B are left at their raw
-        # scale, so everything scored against them -- the loss and the val/residual -- is
-        # reported in ground-truth payoff units, matching FieldModel.validation_step.
-        batch["payoffs"] = self.normalize_feats(batch["payoffs"])
-        return batch
 
     def predict_strategies(self, batch):
         # one embedding per player node; the projection puts each player's readout on the simplex,

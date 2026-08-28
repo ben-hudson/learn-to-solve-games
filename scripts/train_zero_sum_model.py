@@ -16,11 +16,9 @@ from l2s_games.envs.zero_sum import (
 from l2s_games.envs.zero_sum.game import RandomZeroSum
 from l2s_games.envs.zero_sum.losses import EGLoss, NashAprLoss, PotentialLoss
 from l2s_games.envs.zero_sum.utils import simplex_projection, softmax_projection, straight_through_projection
-from l2s_games.models.axial import AxialBackbone
 from l2s_games.models.graphormer import GraphormerBackbone
 from l2s_games.models.nash_mlp import NashMLPBackbone
 from l2s_games.models.nfg_transformer import NfgTransformerBackbone
-from l2s_games.models.payoff_bias import PayoffBiasBackbone
 from l2s_games.models.zero_sum_transformer import ZeroSumTransformerBackbone
 from l2s_games.transforms import DegreeEmbedding, SPDEmbedding
 from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
@@ -169,12 +167,16 @@ def build_backbone(config, sample):
 
     # one token per action, with the query point -- one coordinate per action -- as a token feature
     action_token_backbones = {
-        "payoff_bias": partial(PayoffBiasBackbone, n_players=n_players),
-        "axial": partial(AxialBackbone, n_players=n_players),
         "zero_sum_transformer": partial(
             ZeroSumTransformerBackbone, n_self_attend_per_block=config.n_self_attend_per_block
         ),
-        "nfg_transformer": partial(NfgTransformerBackbone, n_self_attend_per_block=config.n_self_attend_per_block),
+        "nfg_transformer": partial(
+            NfgTransformerBackbone,
+            n_self_attend_per_block=config.n_self_attend_per_block,
+            # the reference only ever seeds from zeros, so the fully amortized backbone must own no
+            # feature projection at all -- not the identity one a zero-width Linear would give
+            partially_amortized=config.amortization == "partial",
+        ),
     }
     backbone = action_token_backbones[config.backbone](
         n_feats=1 if config.amortization == "partial" else 0, **transformer_kwargs

@@ -6,10 +6,16 @@ reference implementation operates on a single game with per-player action counts
 to ``jax.vmap``; here the batch is explicit and both players share one action count ``T``, which is
 what the rest of the pipeline assumes.
 
-Deviations from the reference, all of them local: LayerNorm where it uses RMSNorm (matching the
-sibling backbones), ``TransformerEncoderLayer`` / ``TransformerDecoderLayer`` in place of its
-hand-rolled pre-norm blocks, and no joint-action mask (nothing upstream produces one -- every joint
-action of a dense payoff tensor is observed).
+Two deviations from the reference are deliberate scope reductions: two players rather than n, and no
+joint-action mask (nothing upstream produces one -- every joint action of a dense payoff tensor is
+observed). The rest follow from building the blocks out of ``TransformerEncoderLayer`` /
+``TransformerDecoderLayer`` rather than the reference's hand-rolled pre-norm ones, which fixes
+choices those layers do not expose: LayerNorm where it uses RMSNorm, no query/key normalization and
+biased q/k/v projections where it has neither, qk/v width tied to ``dim`` where it decouples them,
+unnormalized keys and values into the ``a2p`` cross-attention where it normalizes them, and a
+self-attention sublayer prepended to that cross-attention that it does not have -- harmless, since
+the query sequence has length one, so the softmax is trivial and the sublayer collapses to a learned
+linear residual.
 """
 
 import torch
@@ -21,6 +27,8 @@ def _encoder_layer(dim, n_heads, dim_ff, dropout):
         nhead=n_heads,
         dim_feedforward=dim_ff,
         dropout=dropout,
+        # the reference's `Dense` is gelu; torch.nn defaults to relu
+        activation="gelu",
         norm_first=True,
         batch_first=True,
     )
@@ -66,6 +74,7 @@ class NfgTransformerBlock(torch.nn.Module):
             nhead=n_heads,
             dim_feedforward=dim_ff,
             dropout=dropout,
+            activation="gelu",
             norm_first=True,
             batch_first=True,
         )
@@ -151,8 +160,9 @@ class NfgTransformerBackbone(torch.nn.Module):
 
     Equivariant to permutations of either player's actions and to swapping the players: initial
     embeddings are zeros, there is no positional or player-type embedding anywhere, and the payoffs
-    are the only thing that distinguishes one action from another. Nothing is sized by the action
-    count, so a trained module runs on games of any size.
+    (with the query point, when partially amortized -- itself one coordinate per action, so it
+    permutes with them) are the only thing that distinguishes one action from another. Nothing is
+    sized by the action count, so a trained module runs on games of any size.
 
     Two players only -- ``embed_joint_actions`` builds the grid from the two axes of the payoff
     tensor. (The reference is n-player; generalizing means broadcasting each player's embedding along
@@ -164,17 +174,24 @@ class NfgTransformerBackbone(torch.nn.Module):
         n_layers: number of refinement blocks.
         dim_ff: feed-forward dimension in each attention stage.
         dropout: dropout rate.
-        n_feats: per-action feature width, ``0`` when ``forward`` is called without ``feats``.
+        n_feats: per-action feature width. Read only when ``partially_amortized``.
         n_self_attend_per_block: number of ``a2a`` layers per block.
+        partially_amortized: add a projection of the per-action features to the seed embedding. The
+            reference has no counterpart for it, so it is off by default and the fully amortized
+            backbone is exactly the reference's.
     """
 
-    def __init__(self, dim, n_heads, n_layers, dim_ff, dropout, n_feats=0, n_self_attend_per_block=1):
+    def __init__(
+        self, dim, n_heads, n_layers, dim_ff, dropout, n_feats=0, n_self_attend_per_block=1, partially_amortized=False
+    ):
         super().__init__()
 
         self.dim = dim
-        # the reference seeds the blocks with zero embeddings and exposes the seed as
-        # `initial_action_embeddings`; per-action features are exactly that seed
-        self.feature_embedding = torch.nn.Linear(n_feats, dim)
+        # The reference seeds the blocks with zeros, and with nothing else: it exposes the seed as
+        # `initial_action_embeddings`, but never passes it. Fully amortized, we do the same and own no
+        # module that could perturb those zeros -- not even a bias. Partially amortized, the query
+        # point has to reach the tokens somehow, and the seed is the only place it fits.
+        self.feature_embedding = torch.nn.Linear(n_feats, dim) if partially_amortized else None
         self.blocks = torch.nn.ModuleList(
             NfgTransformerBlock(dim, n_heads, dim_ff, dropout, n_self_attend_per_block) for _ in range(n_layers)
         )
@@ -185,13 +202,13 @@ class NfgTransformerBackbone(torch.nn.Module):
     def forward(self, payoffs, feats=None):
         """Per-action embedding ``[B, P, T, dim]``.
 
-        ``payoffs`` is ``[B, P, T, T]``; ``feats`` is optional per-action features ``[B, P, T,
-        n_feats]``, such as the query point a field model is evaluated at.
+        ``payoffs`` is ``[B, P, T, T]``; ``feats`` is per-action features ``[B, P, T, n_feats]``, such
+        as the query point a field model is evaluated at, and is read only when partially amortized.
         """
         batch_size, n_players, n_actions, _ = payoffs.shape
 
         embedding = payoffs.new_zeros(batch_size, n_players, n_actions, self.dim)
-        if feats is not None:
+        if self.feature_embedding is not None:
             embedding = embedding + self.feature_embedding(feats)
 
         for block in self.blocks:
