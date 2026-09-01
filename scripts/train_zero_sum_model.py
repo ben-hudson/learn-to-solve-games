@@ -90,6 +90,14 @@ def get_config():
         "moved by one projected ascent step on the true operator, which is zero exactly where "
         "val/residual is. Runs are only comparable on it at a shared value.",
     )
+    parser.add_argument(
+        "--dim_qkv",
+        type=int,
+        default=None,
+        help="hidden dimension of each attention layer's query/key/value projections, independent of "
+        "--dim. Defaults to --dim; the paper's models use 128 at every --dim. Ignored unless "
+        "--backbone=nfg_transformer.",
+    )
     parser.add_argument("--n_heads", type=int, default=8, help="attention heads in each attention layer.")
     parser.add_argument("--n_layers", type=int, default=6, help="layers in the backbone.")
     parser.add_argument(
@@ -181,6 +189,7 @@ def build_backbone(config, sample):
         "nfg_transformer": partial(
             NfgTransformerBackbone,
             n_self_attend_per_block=config.n_self_attend_per_block,
+            dim_qkv=config.dim_qkv,
             # the reference only ever seeds from zeros, so the fully amortized backbone must own no
             # feature projection at all -- not the identity one a zero-width Linear would give
             partially_amortized=config.amortization == "partial",

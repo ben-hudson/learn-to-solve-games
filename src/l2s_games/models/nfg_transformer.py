@@ -6,32 +6,21 @@ reference implementation operates on a single game with per-player action counts
 to ``jax.vmap``; here the batch is explicit and both players share one action count ``T``, which is
 what the rest of the pipeline assumes.
 
-Two deviations from the reference are deliberate scope reductions: two players rather than n, and no
-joint-action mask (nothing upstream produces one -- every joint action of a dense payoff tensor is
-observed). The rest follow from building the blocks out of ``TransformerEncoderLayer`` /
-``TransformerDecoderLayer`` rather than the reference's hand-rolled pre-norm ones, which fixes
-choices those layers do not expose: LayerNorm where it uses RMSNorm, no query/key normalization and
-biased q/k/v projections where it has neither, qk/v width tied to ``dim`` where it decouples them,
-unnormalized keys and values into the ``a2p`` cross-attention where it normalizes them, and a
-self-attention sublayer prepended to that cross-attention that it does not have -- harmless, since
-the query sequence has length one, so the softmax is trivial and the sublayer collapses to a learned
-linear residual.
+The attention sublayers are the reference's, transcribed in ``nfg_attention`` rather than taken from
+``torch.nn`` -- see that module for the choices the stock layers cannot express. What remains of the
+reference is here: the three-stage block, the weight sharing that makes it equivariant, and the
+tensor layout that stands in for its ``jax.vmap``.
+
+Three deviations from the reference remain, all deliberate. Two are scope reductions: two players
+rather than n, and no joint-action mask (nothing upstream produces one -- every joint action of a
+dense payoff tensor is observed). The third is an addition: ``partially_amortized`` seeds the action
+embeddings from per-action features, through the ``initial_action_embeddings`` argument the reference
+exposes and never passes.
 """
 
 import torch
 
-
-def _encoder_layer(dim, n_heads, dim_ff, dropout):
-    return torch.nn.TransformerEncoderLayer(
-        d_model=dim,
-        nhead=n_heads,
-        dim_feedforward=dim_ff,
-        dropout=dropout,
-        # the reference's `Dense` is gelu; torch.nn defaults to relu
-        activation="gelu",
-        norm_first=True,
-        batch_first=True,
-    )
+from l2s_games.models.nfg_attention import CrossAttention, SelfAttention, gelu, rms_norm
 
 
 class NfgTransformerBlock(torch.nn.Module):
@@ -56,30 +45,25 @@ class NfgTransformerBlock(torch.nn.Module):
 
     Args:
         dim: hidden dimension carried by the action embeddings.
+        dim_qkv: hidden dimension of every stage's attention projections.
         n_heads: number of attention heads in every stage.
         dim_ff: feed-forward dimension in every stage.
         dropout: dropout rate.
         n_self_attend: number of ``a2a`` layers per block.
     """
 
-    def __init__(self, dim, n_heads, dim_ff, dropout, n_self_attend):
+    def __init__(self, dim, dim_qkv, n_heads, dim_ff, dropout, n_self_attend):
         super().__init__()
 
         # the payoff arrives as a single channel appended to the acting player's own embedding, so
         # this input width is independent of the player count
         self.joint_embedding = torch.nn.Linear(dim + 1, dim)
-        self.action_to_joint = _encoder_layer(dim, n_heads, dim_ff, dropout)
-        self.action_to_play = torch.nn.TransformerDecoderLayer(
-            d_model=dim,
-            nhead=n_heads,
-            dim_feedforward=dim_ff,
-            dropout=dropout,
-            activation="gelu",
-            norm_first=True,
-            batch_first=True,
-        )
+        self.action_to_joint = SelfAttention(dim, dim_qkv, n_heads, dim_ff, dropout)
+        self.action_to_play = CrossAttention(dim, dim_qkv, n_heads, dim_ff, dropout)
+        # the reference builds these one at a time, so unlike the two stages above they do not share
+        # weights across the repeats
         self.action_to_action = torch.nn.ModuleList(
-            _encoder_layer(dim, n_heads, dim_ff, dropout) for _ in range(n_self_attend)
+            SelfAttention(dim, dim_qkv, n_heads, dim_ff, dropout) for _ in range(n_self_attend)
         )
 
     def embed_joint_actions(self, payoffs, embedding):
@@ -100,7 +84,7 @@ class NfgTransformerBlock(torch.nn.Module):
             ],
             dim=1,
         )  # [B, P, T_row, T_col, dim]
-        return torch.nn.functional.gelu(self.joint_embedding(torch.cat([acting, payoffs.unsqueeze(-1)], dim=-1)))
+        return gelu(self.joint_embedding(torch.cat([acting, payoffs.unsqueeze(-1)], dim=-1)))
 
     def attend_across_players(self, joint):
         """Refined joint-action tokens ``[B, P, T, T, dim]``: the players at a joint action attend.
@@ -158,31 +142,46 @@ class NfgTransformerBackbone(torch.nn.Module):
     the payoffs stay in the tokens, so neither the soft-argmax bottleneck of a bias nor the
     permutation-invariant mean of a line readout limits what an action embedding can encode.
 
-    Equivariant to permutations of either player's actions and to swapping the players: initial
-    embeddings are zeros, there is no positional or player-type embedding anywhere, and the payoffs
-    (with the query point, when partially amortized -- itself one coordinate per action, so it
-    permutes with them) are the only thing that distinguishes one action from another. Nothing is
-    sized by the action count, so a trained module runs on games of any size.
+    Equivariant to permutations of either player's actions: initial embeddings are zeros, there is no
+    positional embedding anywhere, and the payoffs (with the query point, when partially amortized --
+    itself one coordinate per action, so it permutes with them) are the only thing that distinguishes
+    one action from another. Nothing in the blocks is sized by the action count, so a trained module
+    runs on games of any size. Not equivariant to *swapping the players*, for one reason: the
+    reference's final norm is per player, so the player index reaches the output there and nowhere
+    else.
 
     Two players only -- ``embed_joint_actions`` builds the grid from the two axes of the payoff
     tensor. (The reference is n-player; generalizing means broadcasting each player's embedding along
     its own axis of an n-dimensional grid.)
 
     Args:
-        dim: hidden dimension of the action embeddings.
-        n_heads: number of attention heads.
-        n_layers: number of refinement blocks.
-        dim_ff: feed-forward dimension in each attention stage.
-        dropout: dropout rate.
+        dim: hidden dimension of the action embeddings, the paper's ``D``.
+        n_heads: number of attention heads, the paper's ``H``.
+        n_layers: number of refinement blocks, the paper's ``K``.
+        dim_ff: feed-forward dimension in each attention stage. The reference fixes it at ``4 * dim``.
+        dropout: dropout rate. The reference has none.
         n_feats: per-action feature width. Read only when ``partially_amortized``.
-        n_self_attend_per_block: number of ``a2a`` layers per block.
+        n_self_attend_per_block: number of ``a2a`` layers per block, the paper's ``A``.
         partially_amortized: add a projection of the per-action features to the seed embedding. The
             reference has no counterpart for it, so it is off by default and the fully amortized
             backbone is exactly the reference's.
+        dim_qkv: hidden dimension of every attention's projections. Independent of ``dim``: the paper
+            runs 128 against action embeddings of 32, 64 and 128. Defaults to ``dim``.
+        n_players: number of players, needed up front only because the final norms are per player.
     """
 
     def __init__(
-        self, dim, n_heads, n_layers, dim_ff, dropout, n_feats=0, n_self_attend_per_block=1, partially_amortized=False
+        self,
+        dim,
+        n_heads,
+        n_layers,
+        dim_ff,
+        dropout,
+        n_feats=0,
+        n_self_attend_per_block=1,
+        partially_amortized=False,
+        dim_qkv=None,
+        n_players=2,
     ):
         super().__init__()
 
@@ -193,11 +192,13 @@ class NfgTransformerBackbone(torch.nn.Module):
         # point has to reach the tokens somehow, and the seed is the only place it fits.
         self.feature_embedding = torch.nn.Linear(n_feats, dim) if partially_amortized else None
         self.blocks = torch.nn.ModuleList(
-            NfgTransformerBlock(dim, n_heads, dim_ff, dropout, n_self_attend_per_block) for _ in range(n_layers)
+            NfgTransformerBlock(dim, dim_qkv or dim, n_heads, dim_ff, dropout, n_self_attend_per_block)
+            for _ in range(n_layers)
         )
-        # norm_first leaves the residual stream unnormalized at the end, so the backbone owns a final
-        # norm rather than handing the readout an unbounded embedding
-        self.norm = torch.nn.LayerNorm(dim)
+        # Pre-norm blocks leave the residual stream unnormalized at the end, so the backbone owns a
+        # final norm rather than handing the readout an unbounded embedding. One per player, as in the
+        # reference -- the only parameter in the encoder that a player index selects.
+        self.norms = torch.nn.ModuleList(rms_norm(dim) for _ in range(n_players))
 
     def forward(self, payoffs, feats=None):
         """Per-action embedding ``[B, P, T, dim]``.
@@ -213,4 +214,4 @@ class NfgTransformerBackbone(torch.nn.Module):
 
         for block in self.blocks:
             embedding = block(payoffs, embedding)
-        return self.norm(embedding)
+        return torch.stack([norm(embedding[:, player]) for player, norm in enumerate(self.norms)], dim=1)
