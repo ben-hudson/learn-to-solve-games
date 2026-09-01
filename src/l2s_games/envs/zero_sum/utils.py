@@ -40,6 +40,28 @@ def straight_through_projection(strategies):
     return soft + (simplex_projection(strategies) - soft).detach()
 
 
+def natural_map(operator, strategies, step_size=1.0):
+    """The natural map residual ``z - project(z + h operator(z))`` (actions on the last dim).
+
+    The other standard VI stationarity measure alongside ``dist_to_normal_cone``, and zero on
+    exactly the same set: it is the displacement one projected ascent step of size ``h`` would
+    make, so it vanishes iff ``strategies`` is a fixed point of those dynamics. Both absorb the
+    simplex boundary the same way -- a profile pinned against a face the field only pushes it off
+    of is stationary, and scores zero on both.
+
+    They differ in how they grow away from that set. The cone distance is homogeneous in the
+    operator, so it is unbounded; this is a displacement in strategy space, so it is capped by the
+    simplex diameter. ``norm / h`` is non-increasing in ``h``, equal to the cone distance in the
+    limit and below it everywhere else: at a vertex the field pushes clean across, it is already
+    pegged at the diameter and stops responding to the operator's magnitude entirely. So it is the
+    bounded, outlier-tolerant reading of the same stationarity -- a handful of badly-wrong
+    instances cannot dominate a batch mean of it, where they can dominate the cone distance's.
+
+    Only comparable across runs at a fixed ``h``.
+    """
+    return strategies - simplex_projection(strategies + step_size * operator)
+
+
 def dist_to_normal_cone(operator, strategies):
     """Euclidean distance from ``operator`` to the normal cone of the probability simplex at
     ``strategies`` (actions on the last dim): the VI stationarity residual, zero exactly where

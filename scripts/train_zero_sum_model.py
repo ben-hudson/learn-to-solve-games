@@ -82,6 +82,14 @@ def get_config():
     )
     parser.add_argument("--logger", choices=["wandb", "csv"], default="wandb")
     parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--natural_map_step",
+        type=float,
+        default=1.0,
+        help="lookahead of the val/natural_map metric: the distance the predicted profile is "
+        "moved by one projected ascent step on the true operator, which is zero exactly where "
+        "val/residual is. Runs are only comparable on it at a shared value.",
+    )
     parser.add_argument("--n_heads", type=int, default=8, help="attention heads in each attention layer.")
     parser.add_argument("--n_layers", type=int, default=6, help="layers in the backbone.")
     parser.add_argument(
@@ -234,6 +242,7 @@ if __name__ == "__main__":
         start_factor=config.start_factor,
         warmup_epochs=config.warmup_epochs,
         cosine_annealing=bool(config.cosine_annealing),
+        natural_map_step=config.natural_map_step,
     )
     backbone, readout = build_backbone(config, sample)
     if config.amortization == "full":
