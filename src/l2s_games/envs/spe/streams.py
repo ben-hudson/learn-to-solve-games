@@ -10,8 +10,6 @@ from torch.utils.data import IterableDataset
 from l2s_games.algorithms import ExtraGradient
 from l2s_games.envs.spe.utils import dist_to_normal_cone
 
-from .game import SpatialPriceEquilibrium
-
 
 def solve_instance(instance):
     algorithm = ExtraGradient(2e-2, lambda flow: -instance.operator(flow), torch.relu)
