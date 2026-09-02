@@ -3,7 +3,7 @@ import torch
 
 from torch.utils.data import DataLoader
 from l2s_games.algorithms import ExtraGradient, SimpleProjection
-from l2s_games.envs.spe import dist_to_normal_cone, SpatialPriceEquilibrium
+from l2s_games.envs.spe import dist_to_normal_cone, FlowSPE
 from l2s_games.envs.spe.streams import EquilibriumStream
 
 
@@ -11,18 +11,18 @@ from l2s_games.envs.spe.streams import EquilibriumStream
 def random_spe():
     # weak symmetric coupling (scale) with strong rotation (kappa): plain projection fails
     # on more than half of these instances while extragradient still converges
-    return SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=6.0, eps=0.1, delta=0.05, scale=0.4)
+    return FlowSPE.random_bipartite(n_supply=3, n_demand=4, kappa=6.0, eps=0.1, delta=0.05, scale=0.4)
 
 
 @pytest.fixture
 def random_spe_list():
     return [
-        SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=6.0, eps=0.1, delta=0.05, scale=0.4)
+        FlowSPE.random_bipartite(n_supply=3, n_demand=4, kappa=6.0, eps=0.1, delta=0.05, scale=0.4)
         for _ in range(5)
     ]
 
 
-def operator_jacobian(spe: SpatialPriceEquilibrium):
+def operator_jacobian(spe: FlowSPE):
     # the operator is affine, so its Jacobian at any point is M
     def flat_operator(x):
         return spe.operator(x.view(spe.n_supply, spe.n_demand)).view(-1)
@@ -30,7 +30,7 @@ def operator_jacobian(spe: SpatialPriceEquilibrium):
     return torch.autograd.functional.jacobian(flat_operator, torch.rand(spe.n_supply * spe.n_demand))
 
 
-def test_operator_matches_closed_form(random_spe: SpatialPriceEquilibrium):
+def test_operator_matches_closed_form(random_spe: FlowSPE):
     # F(x) = Mx + b with M = R^T P R + C^T Q C + diag(δ) and b = R^T p + c − C^T q,
     # where R and C are the row-sum and column-sum matrices on flattened x
     row_sum = torch.eye(random_spe.n_supply).repeat_interleave(random_spe.n_demand, dim=1)
@@ -47,24 +47,24 @@ def test_operator_matches_closed_form(random_spe: SpatialPriceEquilibrium):
     assert torch.allclose(b, expected_b, atol=1e-5)
 
 
-def test_operator_is_monotone(random_spe: SpatialPriceEquilibrium):
+def test_operator_is_monotone(random_spe: FlowSPE):
     M = operator_jacobian(random_spe)
     symmetric_part_eigenvalues = torch.linalg.eigvalsh((M + M.T) / 2)
     assert (symmetric_part_eigenvalues > 0).all()
 
 
 def test_zero_kappa_gives_potential_instance():
-    spe = SpatialPriceEquilibrium.random_bipartite(n_supply=3, n_demand=4, kappa=0.0, eps=0.1, delta=0.05)
+    spe = FlowSPE.random_bipartite(n_supply=3, n_demand=4, kappa=0.0, eps=0.1, delta=0.05)
     M = operator_jacobian(spe)
     assert torch.allclose(M, M.T, atol=1e-5)
 
 
-def test_positive_kappa_gives_non_potential_instance(random_spe: SpatialPriceEquilibrium):
+def test_positive_kappa_gives_non_potential_instance(random_spe: FlowSPE):
     M = operator_jacobian(random_spe)
     assert not torch.allclose(M, M.T, atol=1e-5)
 
 
-def test_extragradient_converges_to_normal_cone(random_spe: SpatialPriceEquilibrium):
+def test_extragradient_converges_to_normal_cone(random_spe: FlowSPE):
     # the operator is descent-convention, so the algorithm ascends its negation; relu projects
     # onto the nonnegative orthant. Larger steps exceed 1/L on some instances, and the weak
     # monotonicity (small delta) of the rotation-dominant instances needs the longer run.
@@ -94,14 +94,14 @@ def test_projection_fails_on_non_potential_instances(random_spe_list):
     assert failures >= 1
 
 
-def test_normal_cone_dist_nonzero_off_equilibrium(random_spe: SpatialPriceEquilibrium):
+def test_normal_cone_dist_nonzero_off_equilibrium(random_spe: FlowSPE):
     shipments = torch.rand(random_spe.n_supply, random_spe.n_demand)
     dist = dist_to_normal_cone(-random_spe.operator(shipments), shipments)
     assert (dist > 0.0).all()
 
 
-def test_dict_round_trip(random_spe: SpatialPriceEquilibrium):
-    restored = SpatialPriceEquilibrium.from_dict(random_spe.to_dict())
+def test_dict_round_trip(random_spe: FlowSPE):
+    restored = FlowSPE.from_dict(random_spe.to_dict())
 
     assert torch.equal(restored.P, random_spe.P)
     assert torch.equal(restored.Q, random_spe.Q)
@@ -112,7 +112,7 @@ def test_dict_round_trip(random_spe: SpatialPriceEquilibrium):
 
 
 def test_batched_operator_matches_per_instance(random_spe_list):
-    batched = SpatialPriceEquilibrium.from_dict(torch.stack([spe.to_dict() for spe in random_spe_list]))
+    batched = FlowSPE.from_dict(torch.stack([spe.to_dict() for spe in random_spe_list]))
 
     points = torch.rand(len(random_spe_list), batched.n_supply, batched.n_demand)
     expected = torch.stack([spe.operator(point) for spe, point in zip(random_spe_list, points)])
