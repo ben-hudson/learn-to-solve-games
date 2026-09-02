@@ -5,7 +5,7 @@ from l2s_games.algorithms import Optimistic
 from l2s_games.envs.zero_sum.game import operator
 
 from .losses import NashAprLoss, NormHuberLoss, NormLoss
-from .utils import dist_to_normal_cone, simplex_projection
+from .utils import dist_to_normal_cone, natural_map, simplex_projection
 
 
 class AmortizedModel(L.LightningModule):
@@ -16,20 +16,32 @@ class AmortizedModel(L.LightningModule):
         n_actions,
         feat_mean,
         feat_scale,
+        readout=None,
         lr=1e-3,
         start_factor=0.01,
         warmup_epochs=10,
         cosine_annealing=False,
+        natural_map_step=1.0,
         **kwargs,
     ):
         super().__init__(**kwargs)
 
         self.backbone = backbone
-        self.readout = torch.nn.Linear(dim, n_actions)
+        # the readout has to match what the backbone embeds: a graph backbone gives one embedding
+        # per player, off which every action's logit is read at once, while an action-token backbone
+        # gives one per action and wants an `ActionReadout` scoring them one at a time
+        self.readout = torch.nn.Linear(dim, n_actions) if readout is None else readout
         # fitted normalization stats as buffers: they move to the model's device with the
         # module and serialize into checkpoints
         self.register_buffer("feat_mean", torch.as_tensor(feat_mean, dtype=torch.float32))
         self.register_buffer("feat_scale", torch.as_tensor(feat_scale, dtype=torch.float32))
+        # scored at validation for every model, whether or not it is the training objective:
+        # nfg_transformer's NE objective (its `equilibria.nash_approx`) is this same quantity, so
+        # logging it always makes our runs comparable to theirs and to each other
+        self.nash_apr = NashAprLoss()
+        # the lookahead of val/natural_map's projected ascent step; only comparable across runs
+        # when it is held fixed
+        self.natural_map_step = natural_map_step
         self.lr = lr
         self.start_factor = start_factor
         self.warmup_epochs = warmup_epochs
@@ -74,6 +86,18 @@ class AmortizedModel(L.LightningModule):
         op = operator(batch["A"], batch["B"], strategies)
         residual = dist_to_normal_cone(op, strategies)
         self.log("val/residual", residual.norm(dim=-1).mean())
+        # the same stationarity, read in strategy units instead: how far one projected ascent step
+        # would move the predicted profile. Zero on exactly the set val/residual is, but capped by
+        # the simplex diameter rather than homogeneous in the operator, so instances the model gets
+        # grossly wrong are compressed here and dominate the mean there -- the gap between the two
+        # curves tracks how much of val/residual is coming from that tail.
+        displacement = natural_map(op, strategies, self.natural_map_step)
+        # over actions then players, the same nesting val/residual's two norms make
+        self.log("val/natural_map", torch.linalg.vector_norm(displacement, dim=(-2, -1)).mean())
+        # the deviation gain of the predicted profile: also zero exactly at a Nash equilibrium, but
+        # in payoff units rather than the residual's operator-distance units, and the metric
+        # nfg_transformer reports. Redundant with val/loss only when NashAprLoss is the objective.
+        self.log("val/nash_apr", self.nash_apr(strategies, batch["A"], batch["B"]))
         return strategies
 
 
@@ -183,6 +207,12 @@ class SolutionModel(AmortizedModel):
     Trained self-supervised on the Nash approximation loss (Duan et al. 2023, Algorithm 1): the
     predicted profile is scored by how much any player gains by deviating, so no solver labels
     are needed and equilibrium non-uniqueness is a non-issue.
+
+    Unlike ``FieldModel``, the payoffs reach the network at their raw scale: ``sample_normalized``
+    already centers each instance and puts it at unit variance, so the fitted ``feat_mean`` /
+    ``feat_scale`` would only add a second, global affine on top -- one the network sees but the
+    loss and ``val/residual``, both scored on raw A and B, do not. nfg_transformer's NE objective
+    reads and scores the same payoffs, and now so does this.
     """
 
     def __init__(
@@ -217,13 +247,6 @@ class SolutionModel(AmortizedModel):
         # always needs the exact projection, since Optimistic's convergence assumes a true
         # projection.
         self.projection = projection
-
-    def on_after_batch_transfer(self, batch, dataloader_idx):
-        # normalize only the payoff features fed to the network. A and B are left at their raw
-        # scale, so everything scored against them -- the loss and the val/residual -- is
-        # reported in ground-truth payoff units, matching FieldModel.validation_step.
-        batch["payoffs"] = self.normalize_feats(batch["payoffs"])
-        return batch
 
     def predict_strategies(self, batch):
         # one embedding per player node; the projection puts each player's readout on the simplex,

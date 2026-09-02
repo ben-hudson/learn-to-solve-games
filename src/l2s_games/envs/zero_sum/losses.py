@@ -1,5 +1,6 @@
 import torch
 
+from l2s_games import losses
 from l2s_games.envs.zero_sum.game import operator
 
 from .utils import simplex_projection
@@ -60,76 +61,34 @@ class NashAprLoss(torch.nn.Module):
         return torch.maximum(gain_1, gain_2).mean()
 
 
-class PotentialLoss(torch.nn.Module):
-    def __init__(self):
-        super().__init__()
+def ascent_field(A, B, strategies):
+    """The bimatrix ascent field in the one-argument form ``l2s_games.losses`` takes."""
+    return operator(A, B, strategies)
+
+
+class PotentialLoss(losses.PotentialLoss):
+    """The shared field surrogate, bound to the bimatrix operator.
+
+    The forward value is the squared field norm, which a zero-sum game does *not* drive to zero (at
+    an interior equilibrium the field is a nonzero constant vector, normal to the simplex), so it is
+    not monotone over training and ``val/residual`` is the metric to read.
+    """
 
     def forward(self, strategies: torch.Tensor, A, B):
-        operator = PotentialGradient.apply(strategies, A, B)
-        return operator.sum(dim=-1).mean()
+        return super().forward(lambda iterate: ascent_field(A, B, iterate), strategies)
 
 
-class PotentialGradient(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, strategies, A, B):
-        op = operator(A, B, strategies)
-        ctx.save_for_backward(op)
-        return op.square()
+class EGLoss(losses.EGLoss):
+    """The shared extragradient surrogate, bound to the bimatrix operator and the simplex.
 
-    @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):
-        (op,) = ctx.saved_tensors
-        # one gradient per forward input, positionally: (strategies, A, B). Returning ``-op``
-        # for the profile makes the optimizer's descent step move it *along* the field --
-        # ``z <- z + lr * op(z)``, the ascent convention every dynamic in ``algorithms`` follows.
-        # The payoffs are data, so they get no gradient.
-        return -op * grad_loss, None, None
-
-
-class EGLoss(torch.nn.Module):
-    """Extragradient surrogate: reports the squared operator norm at the *lookahead* point, and
-    hands back the field there as the descent direction, Korpelevich-style.
-
-    The backward substitutes the field itself for the true Jacobian-vector product, which turns
-    ``z <- z - lr * dL/dz`` into ``z <- z + lr * op(z_half)`` (``algorithms.ExtraGradient``),
-    pushed back through the network. ``step_size`` is the fixed lookahead distance ``h`` in
-    ``z_half = project(z + h * op(z))``; it is independent of the optimizer's learning rate, which
-    only scales how far the update follows the lookahead field. The forward value is only what
-    that surrogate is reported as: like ``PotentialLoss`` it is the squared field norm, which a
-    zero-sum game does *not* drive to zero (at an interior equilibrium the field is a nonzero
-    constant vector, normal to the simplex), so it is not monotone over training and
-    ``val/residual`` is the metric to read.
-
-    ``project`` controls whether the lookahead point is projected back onto the simplex, as the
-    textbook constrained form does; turning it off queries the field off the feasible set.
+    Korpelevich's iteration projects the lookahead too, so the field is never queried off the
+    simplex -- the contract ``algorithms.ExtraGradient`` keeps. ``project=False`` drops it, leaving
+    the half-step wherever plain extrapolation puts it. The reported value carries the same caveat
+    as ``PotentialLoss``'s.
     """
 
     def __init__(self, step_size: float, project: bool = True):
-        super().__init__()
-        self.step_size = step_size
-        self.project = project
+        super().__init__(step_size, simplex_projection if project else losses.no_projection)
 
     def forward(self, strategies: torch.Tensor, A, B):
-        operator = EGGradient.apply(strategies, A, B, self.step_size, self.project)
-        return operator.sum(dim=-1).mean()
-
-
-class EGGradient(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, strategies, A, B, step_size, project):
-        # Korpelevich's iteration projects the lookahead too, so the field is never queried off the
-        # simplex -- the contract ``algorithms.ExtraGradient`` keeps. ``project=False`` drops it,
-        # leaving the half-step wherever plain extrapolation puts it.
-        strategies_half = strategies + step_size * operator(A, B, strategies)
-        if project:
-            strategies_half = simplex_projection(strategies_half)
-        op = operator(A, B, strategies_half)
-        ctx.save_for_backward(op)
-        return op.square()
-
-    @staticmethod
-    def backward(ctx, grad_loss: torch.Tensor):
-        (op,) = ctx.saved_tensors
-        # one gradient per forward input, positionally: (strategies, A, B, step_size, project). See
-        # ``PotentialGradient.backward`` for the sign; everything else here is a constant.
-        return -op * grad_loss, None, None, None, None
+        return super().forward(lambda iterate: ascent_field(A, B, iterate), strategies)
