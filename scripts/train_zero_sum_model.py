@@ -230,7 +230,12 @@ if __name__ == "__main__":
     val_loader = DataLoader(val_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
     train_dataset = OperatorStream(
-        sample, sample_domain, n_instances=512, n_points_per_instance=16, quiet=True, transform=transforms
+        sample,
+        sample_domain,
+        n_instances=config.n_instances,
+        n_points_per_instance=16,
+        quiet=True,
+        transform=transforms,
     )
     train_loader = DataLoader(train_dataset, batch_size=config.batch_size, collate_fn=torch.stack)
 
