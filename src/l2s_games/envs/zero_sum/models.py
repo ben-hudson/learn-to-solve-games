@@ -1,6 +1,7 @@
 import lightning as L
 import torch
 
+from cooper.optim import ExtragradientOptimizer
 from l2s_games.algorithms import Optimistic
 from l2s_games.envs.zero_sum.game import operator
 
@@ -17,10 +18,12 @@ class AmortizedModel(L.LightningModule):
         feat_mean,
         feat_scale,
         readout=None,
+        optimizer=torch.optim.Adam,
         lr=1e-3,
         start_factor=0.01,
         warmup_epochs=10,
         cosine_annealing=False,
+        gradient_clip_val=0,
         natural_map_step=1.0,
         **kwargs,
     ):
@@ -42,20 +45,27 @@ class AmortizedModel(L.LightningModule):
         # the lookahead of val/natural_map's projected ascent step; only comparable across runs
         # when it is held fixed
         self.natural_map_step = natural_map_step
+        self.optimizer = optimizer
         self.lr = lr
         self.start_factor = start_factor
         self.warmup_epochs = warmup_epochs
         self.cosine_annealing = cosine_annealing
+        self.gradient_clip_val = gradient_clip_val
+        # an extrapolation optimizer needs two forward/backward passes per iteration -- one at the
+        # current parameters and one at the lookahead point -- which automatic optimization, with
+        # its single backward per batch, cannot express. Taking the loop over means this module
+        # also owns the scheduler stepping and the gradient clipping Lightning would have done.
+        self.automatic_optimization = not issubclass(optimizer, ExtragradientOptimizer)
 
     def normalize_feats(self, feats: torch.Tensor):
         return (feats - self.feat_mean) / self.feat_scale
 
     def configure_optimizers(self):
-        # Adam with linear warmup then optional cosine annealing (ported from train_field_gnn.py):
-        # warmup ramps from lr*start_factor up to lr over warmup_epochs, then cosine decays to ~0
-        # over the rest. Requires warmup_epochs < trainer.max_epochs (else the cosine T_max is
+        # linear warmup then optional cosine annealing (ported from train_field_gnn.py): warmup
+        # ramps from lr*start_factor up to lr over warmup_epochs, then cosine decays to ~0 over
+        # the rest. Requires warmup_epochs < trainer.max_epochs (else the cosine T_max is
         # non-positive).
-        optim = torch.optim.Adam(self.parameters(), lr=self.lr)
+        optim = self.optimizer(self.parameters(), lr=self.lr)
         warmup = torch.optim.lr_scheduler.LinearLR(
             optim, start_factor=self.start_factor, total_iters=self.warmup_epochs
         )
@@ -75,6 +85,56 @@ class AmortizedModel(L.LightningModule):
         to a fixed point, ``SolutionModel`` reads a profile straight off the payoffs.
         """
         raise NotImplementedError
+
+    def compute_loss(self, batch):
+        """The training objective on ``batch``, as a scalar.
+
+        The other thing the two amortizations disagree on: ``FieldModel`` scores its field against
+        the sampled operator values, ``SolutionModel`` scores its profile against the payoffs.
+        """
+        raise NotImplementedError
+
+    def backward_pass(self, optimizer, batch):
+        """Fill ``.grad`` with the gradient of the loss at the current parameters, and return it.
+
+        Clips as the trainer would: Lightning refuses to clip under manual optimization, so the
+        ``--gradient_clip_val`` the automatic path gets from the trainer is applied here instead.
+        """
+        optimizer.zero_grad()
+        loss = self.compute_loss(batch)
+        self.manual_backward(loss)
+        if self.gradient_clip_val:
+            self.clip_gradients(optimizer, gradient_clip_val=self.gradient_clip_val)
+        return loss
+
+    def extragradient_step(self, batch):
+        """One extragradient iteration, returning the loss at the parameters it started from.
+
+        The extrapolation step saves the current parameters and moves to a lookahead point; the
+        update step then applies the gradient measured *there* to the saved parameters. Both passes
+        read the same batch, so the lookahead measures curvature rather than sampling noise.
+        """
+        optimizer = self.optimizers()
+        loss = self.backward_pass(optimizer, batch)
+        # Lightning's wrapper forwards step() but knows nothing of extrapolation()
+        optimizer.optimizer.extrapolation()
+
+        self.backward_pass(optimizer, batch)
+        optimizer.step()
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        loss = self.compute_loss(batch) if self.automatic_optimization else self.extragradient_step(batch)
+        # epoch-level, matching the val metrics: an epoch is only a handful of steps, so the
+        # per-step default is noisy and CSVLogger's 100-step flush would drop it
+        self.log("train/loss", loss, on_step=False, on_epoch=True)
+        return loss
+
+    def on_train_epoch_end(self):
+        # the schedulers are configured on an epoch interval either way, but under manual
+        # optimization Lightning steps neither them nor the optimizer
+        if not self.automatic_optimization:
+            self.lr_schedulers().step()
 
     def validation_step(self, batch, batch_idx):
         # stationarity of the predicted profile under the true operator: zero exactly at a Nash
@@ -145,12 +205,8 @@ class FieldModel(AmortizedModel):
         feats = torch.cat([point, payoffs], dim=-1)
         return self.readout(self.backbone(feats, in_degree, out_degree, spd)), target
 
-    def training_step(self, batch, batch_idx):
-        loss = self.loss(*self.predict_field(batch))
-        # epoch-level, matching SolutionModel and the val metrics: an epoch is only a handful of
-        # steps, so the per-step default is noisy and CSVLogger's 100-step flush would drop it
-        self.log("train/loss", loss, on_step=False, on_epoch=True)
-        return loss
+    def compute_loss(self, batch):
+        return self.loss(*self.predict_field(batch))
 
     def predict_strategies(self, batch):
         # the learned field stands in for the true operator: one Optimistic rollout per game,
@@ -233,10 +289,8 @@ class SolutionModel(AmortizedModel):
         embedding = self.backbone(batch["payoffs"], batch["in_degree"], batch["out_degree"], batch["spd"])
         return self.projection(self.logit_norm(self.readout(embedding)))
 
-    def training_step(self, batch, batch_idx):
-        loss = self.loss(self.predict_strategies(batch), batch["A"], batch["B"])
-        self.log("train/loss", loss, on_step=False, on_epoch=True)
-        return loss
+    def compute_loss(self, batch):
+        return self.loss(self.predict_strategies(batch), batch["A"], batch["B"])
 
     def validation_step(self, batch, batch_idx):
         # the base step already predicted the profile; reuse it rather than paying a second forward

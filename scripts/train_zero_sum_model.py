@@ -4,6 +4,7 @@ import os
 import torch
 import wandb
 
+from cooper.optim import ExtraAdam, ExtragradientOptimizer, ExtraSGD
 from l2s_games.envs.spe.streams import OperatorStream
 from l2s_games.envs.traffic.datasets import GraphToTensorDict
 from l2s_games.envs.zero_sum import (
@@ -27,6 +28,21 @@ from sklearn.preprocessing import StandardScaler
 from torch_geometric.transforms import Compose
 from torch.utils.data import random_split, DataLoader
 from functools import partial
+
+
+def build_optimizer(name):
+    """The optimizer class named by --optimizer.
+
+    The 'extra_' variants are ``ExtragradientOptimizer``\\s, which the caller can test for: they
+    split an iteration into an extrapolation and an update, so the model drives its own
+    optimization loop and the trainer must leave the gradient clipping to it.
+    """
+    return {
+        "adam": torch.optim.Adam,
+        "sgd": torch.optim.SGD,
+        "extra_adam": ExtraAdam,
+        "extra_sgd": ExtraSGD,
+    }[name]
 
 
 def get_config():
@@ -98,6 +114,22 @@ def get_config():
         "--dim. Defaults to --dim; the paper's models use 128 at every --dim. Ignored unless "
         "--backbone=nfg_transformer.",
     )
+    parser.add_argument(
+        "--optimizer",
+        type=str,
+        choices=["adam", "sgd", "extra_adam", "extra_sgd"],
+        default="adam",
+        help="the 'extra_' variants add an extrapolation step: each iteration measures the "
+        "gradient at a lookahead point and applies it back at the current parameters, damping the "
+        "rotational dynamics descent spirals under. Their lookahead lives in parameter space, "
+        "unlike EGLoss's, which lives in strategy space, and its distance is the learning rate "
+        "rather than a knob of its own -- so it anneals away with the schedule. They only apply to "
+        "PotentialLoss, whose backward is a surrogate rather than a true gradient and so leaves a "
+        "field that can rotate, hence the --amortization=full --fully_amortized_loss=potential "
+        "requirement. They pay two forward/backward passes per iteration, so compare each against "
+        "its plain counterpart at matched compute rather than matched epochs. Neither SGD variant "
+        "is given momentum, and both want a far larger --lr than the Adam variants.",
+    )
     parser.add_argument("--n_heads", type=int, default=8, help="attention heads in each attention layer.")
     parser.add_argument("--n_layers", type=int, default=6, help="layers in the backbone.")
     parser.add_argument(
@@ -140,6 +172,12 @@ def get_config():
     parser.add_argument("--n_actions", type=int, default=3)
 
     config = parser.parse_args()
+    is_potential_loss = config.amortization == "full" and config.fully_amortized_loss == "potential"
+    if issubclass(build_optimizer(config.optimizer), ExtragradientOptimizer) and not is_potential_loss:
+        parser.error(
+            f"--optimizer={config.optimizer} extrapolates, so it only applies to "
+            "--amortization=full --fully_amortized_loss=potential"
+        )
     if config.seed is None:
         config.seed = torch.randint(0, 2**31 - 1, (1,)).item()
     return config
@@ -251,11 +289,14 @@ if __name__ == "__main__":
 
     sample = dataset[0]
     dim = config.dim
+    optimizer = build_optimizer(config.optimizer)
     optimizer_kwargs = dict(
+        optimizer=optimizer,
         lr=config.lr,
         start_factor=config.start_factor,
         warmup_epochs=config.warmup_epochs,
         cosine_annealing=bool(config.cosine_annealing),
+        gradient_clip_val=config.gradient_clip_val,
         natural_map_step=config.natural_map_step,
     )
     backbone, readout = build_backbone(config, sample)
@@ -320,7 +361,11 @@ if __name__ == "__main__":
         fast_dev_run=config.debug,
         enable_checkpointing=logger is not None,
         callbacks=callbacks,
-        gradient_clip_val=config.gradient_clip_val or None,
+        # the extragradient optimizers drive their own optimization loop, which Lightning will not
+        # clip for; the model applies --gradient_clip_val itself there
+        gradient_clip_val=None
+        if issubclass(optimizer, ExtragradientOptimizer)
+        else (config.gradient_clip_val or None),
         check_val_every_n_epoch=config.val_every_n_epochs,
     )
     trainer.fit(model, train_loader, val_loader)
