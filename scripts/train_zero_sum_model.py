@@ -302,7 +302,7 @@ if __name__ == "__main__":
     # Debug runs disable checkpointing, and Lightning rejects a ModelCheckpoint when it's off.
     callbacks = [
         EarlyStopping(
-            monitor="val/residual",
+            monitor="val/nash_apr",
             mode="min",
             patience=max(1, config.patience_epochs // config.val_every_n_epochs),
             check_finite=False,
@@ -311,7 +311,7 @@ if __name__ == "__main__":
     ]
     if not config.debug:
         callbacks.append(
-            ModelCheckpoint(monitor="val/residual", mode="min", save_top_k=1, save_last=True, filename="best")
+            ModelCheckpoint(monitor="val/nash_apr", mode="min", save_top_k=1, save_last=True, filename="best")
         )
     trainer = L.Trainer(
         max_epochs=config.epochs,
