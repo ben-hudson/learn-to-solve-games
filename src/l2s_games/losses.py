@@ -82,13 +82,15 @@ class EGGradient(torch.autograd.Function):
     @staticmethod
     def forward(ctx, iterate, field_fn, step_size, project_fn):
         lookahead = project_fn(iterate + step_size * field_fn(iterate))
-        field = field_fn(lookahead)
-        ctx.save_for_backward(field)
-        return field.square()
+        next_iterate = project_fn(iterate + step_size * field_fn(lookahead))
+        # field = field_fn(lookahead)
+        diff = iterate - next_iterate
+        ctx.save_for_backward(diff)
+        return diff.square()
 
     @staticmethod
     def backward(ctx, grad_loss):
-        (field,) = ctx.saved_tensors
+        (diff,) = ctx.saved_tensors
         # positionally: (iterate, field_fn, step_size, project_fn). See ``PotentialGradient``
         # for the sign; everything else here is a constant.
-        return -field * grad_loss, None, None, None
+        return diff * grad_loss, None, None, None
